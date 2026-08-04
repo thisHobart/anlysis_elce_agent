@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from langgraph.checkpoint.memory import InMemorySaver
 
 from app.config import get_settings
 from app.graph.workflow import build_workflow
@@ -12,7 +13,7 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.workflow = build_workflow()
+    app.state.workflow = build_workflow(checkpointer=InMemorySaver())
     yield
 
 
@@ -32,11 +33,21 @@ def health() -> dict[str, str]:
 
 
 @app.post("/v1/query", response_model=QueryResponse)
-def query(request: QueryRequest) -> QueryResponse:
-    result = app.state.workflow.invoke(request.model_dump())
+async def query(request: QueryRequest) -> QueryResponse:
+    graph_input = request.model_dump(exclude={"session_id"})
+    graph_input["trace"] = []
+    result = await app.state.workflow.ainvoke(
+        graph_input,
+        config={"configurable": {"thread_id": request.session_id}},
+    )
     return QueryResponse(
+        session_id=request.session_id,
         answer=result["answer"],
+        intent=result.get("intent"),
         route=result["route"],
+        faq_id=result.get("faq_id"),
+        classification_source=result.get("classification_source", "rules"),
+        compose_source=result.get("compose_source", "fixed"),
         data=result.get("data", {}),
         screen_action=result.get("screen_action"),
         validation_errors=result.get("validation_errors", []),

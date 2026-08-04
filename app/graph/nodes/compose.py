@@ -1,14 +1,75 @@
+from typing import Any
+
+from langchain_core.messages import AIMessage
+
+from app.config import get_settings
+from app.graph.message_utils import history_for_llm
 from app.graph.state import AgentState
-from app.services.template_service import render_data_answer
+from app.services.faq_service import FAQService
+from app.services.llm import AgentLLM, LLMServiceError, get_llm_service
+from app.services.template_service import render_data_answer, render_faq_template
+
+FAQ = FAQService()
 
 
-def compose(state: AgentState) -> dict:
+FIXED_FALLBACKS = {
+    "knowledge": "知识库服务暂未接入，请稍后再试。",
+    "data": "实时数据查询暂未接入，目前无法提供准确数值。",
+    "direct": "当前请求暂时无法处理。",
+    "screen_action": "大屏联动功能暂未启用。",
+    "chitchat": "您好，我是虚拟电厂数字人助手。",
+    "out_of_scope": "抱歉，我只能协助处理虚拟电厂相关问题。",
+}
+
+
+def _fallback_answer(state: AgentState, entry: dict[str, Any] | None) -> tuple[str, str]:
     if state.get("validation_errors"):
-        answer = "请求未通过安全校验：" + " ".join(state["validation_errors"])
-    elif state.get("route") == "faq":
-        answer = state.get("data", {}).get("faq_answer", "未找到相关 FAQ。")
-    elif state.get("route") == "knowledge":
-        answer = state.get("data", {}).get("knowledge", "未找到相关知识。")
+        return "请求未通过安全校验：" + " ".join(state["validation_errors"]), "fixed"
+    if entry:
+        return render_faq_template(entry["template"], state.get("data", {})), "template"
+    route = state.get("route")
+    if route in FIXED_FALLBACKS:
+        return FIXED_FALLBACKS[route], "fixed"
+    return render_data_answer(state.get("data", {})), "fixed"
+
+
+def compose(state: AgentState, llm_service: AgentLLM | None = None) -> dict:
+    """P3 composer: every normal answer uses the LLM, with deterministic P2 fallback."""
+    entry = FAQ.get(state.get("faq_id")) if state.get("faq_id") else None
+    service = llm_service or get_llm_service()
+    source = "fixed"
+    trace_marker = "composed:fixed"
+
+    if service.enabled:
+        payload = {
+            "question": state["question"],
+            "intent": state.get("intent"),
+            "route": state.get("route"),
+            "faq_id": state.get("faq_id"),
+            "faq_template": entry.get("template") if entry else None,
+            "data_requirements": entry.get("data_requirements", []) if entry else [],
+            "data": state.get("data", {}),
+            "entities": state.get("entities", {}),
+            "context": state.get("context", {}),
+            "history": history_for_llm(state, get_settings().llm_history_messages),
+            "validation_errors": state.get("validation_errors", []),
+            "fallback": state.get("fallback", False),
+            "fallback_reason": state.get("fallback_reason"),
+        }
+        try:
+            answer = service.compose(payload=payload)
+            source = "llm"
+            trace_marker = "composed:llm"
+        except LLMServiceError:
+            answer, source = _fallback_answer(state, entry)
+            trace_marker = f"composed:{source}:fallback"
     else:
-        answer = render_data_answer(state.get("data", {}))
-    return {"answer": answer, "trace": [*state.get("trace", []), "composed"]}
+        answer, source = _fallback_answer(state, entry)
+        trace_marker = f"composed:{source}"
+
+    return {
+        "answer": answer,
+        "messages": [AIMessage(content=answer)],
+        "compose_source": source,
+        "trace": [*state.get("trace", []), trace_marker],
+    }

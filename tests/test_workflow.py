@@ -11,7 +11,10 @@ def test_workflow_queries_station_and_emits_action():
     result = build_workflow().invoke(
         {"question": "查询电站状态", "role": "operator", "params": {"station_id": "station-01"}, "request_action": True}
     )
-    assert result["data"]["station_id"] == "station-01"
+    assert result["route"] == "data"
+    assert result["data"] == {}
+    assert result["fallback"] is True
+    assert result["fallback_reason"] == "data_query_not_connected"
     assert result["screen_action"] == {"type": "highlight_station", "target": "station-01"}
 
 

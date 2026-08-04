@@ -12,8 +12,9 @@ def infer_tool(question: str, params: dict) -> str:
 
 def validate(state: AgentState) -> dict:
     params = state.get("params", {})
-    tool_name = infer_tool(state["question"], params)
-    errors = validate_tool_request(tool_name, state.get("role", "viewer"), params)
+    route = state.get("route")
+    tool_name = infer_tool(state["question"], params) if route == "data" else None
+    errors = validate_tool_request(tool_name, state.get("role", "viewer"), params) if tool_name else []
     return {
         "tool_name": tool_name,
         "validation_errors": errors,

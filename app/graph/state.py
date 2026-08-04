@@ -1,4 +1,9 @@
-from typing import Any, Literal, TypedDict
+from typing import Annotated, Any, TypedDict
+
+from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
+
+from app.schemas.llm import ClassificationSource, ComposeSource, Intent, Route
 
 
 class AgentState(TypedDict, total=False):
@@ -9,8 +14,17 @@ class AgentState(TypedDict, total=False):
     role: str
     params: dict[str, Any]
     request_action: bool
-    route: Literal["faq", "knowledge", "data"]
-    tool_name: str
+    messages: Annotated[list[AnyMessage], add_messages]
+    context: dict[str, Any]
+    intent: Intent | None
+    route: Route | None
+    faq_id: str | None
+    entities: dict[str, Any]
+    classification_source: ClassificationSource
+    compose_source: ComposeSource
+    fallback: bool
+    fallback_reason: str | None
+    tool_name: str | None
     validation_errors: list[str]
     data: dict[str, Any]
     answer: str

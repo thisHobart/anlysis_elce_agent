@@ -1,20 +1,43 @@
 from app.graph.state import AgentState
 from app.services.faq_service import FAQService
-from app.services.vpp_tools import VPPTools
 
 FAQ = FAQService()
-TOOLS = VPPTools()
-
-
 def query_data(state: AgentState) -> dict:
-    if state.get("route") == "faq":
-        match = FAQ.match(state["question"])
-        return {"data": {"faq_answer": match.answer if match else ""}, "trace": [*state.get("trace", []), "faq:matched"]}
-    if state.get("route") == "knowledge":
-        return {"data": {"knowledge": "知识库连接点已预留；请接入现有 RAG 检索器。"}, "trace": [*state.get("trace", []), "knowledge:placeholder"]}
+    """P3 placeholder routing; real API, DB and RAG execution are intentionally deferred."""
+    route = state.get("route")
+    trace = state.get("trace", [])
     if state.get("validation_errors"):
-        return {"data": {}, "trace": [*state.get("trace", []), "query:blocked"]}
-    return {
-        "data": TOOLS.execute(state["tool_name"], state.get("params", {})),
-        "trace": [*state.get("trace", []), f"tool:{state['tool_name']}"],
-    }
+        return {
+            "data": {},
+            "fallback": True,
+            "fallback_reason": "validation_failed",
+            "trace": [*trace, "query:blocked"],
+        }
+    if route == "faq":
+        entry = FAQ.get(state.get("faq_id")) if state.get("faq_id") else None
+        needs_data = bool(
+            entry
+            and any(
+                requirement.get("source") != "static" and requirement.get("variable") not in {None, "none"}
+                for requirement in entry.get("data_requirements", [])
+            )
+        )
+        update = {"data": {}, "trace": [*trace, f"faq:{state.get('faq_id')}"]}
+        if needs_data:
+            update.update({"fallback": True, "fallback_reason": "faq_data_not_connected"})
+        return update
+    if route == "knowledge":
+        return {
+            "data": {},
+            "fallback": True,
+            "fallback_reason": "knowledge_not_connected",
+            "trace": [*trace, "knowledge:placeholder"],
+        }
+    if route == "data":
+        return {
+            "data": {},
+            "fallback": True,
+            "fallback_reason": "data_query_not_connected",
+            "trace": [*trace, "data:placeholder"],
+        }
+    return {"data": {}, "trace": [*trace, f"query:skipped:{route}"]}
