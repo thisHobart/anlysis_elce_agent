@@ -1,7 +1,22 @@
 import re
 from typing import Any
 
+# P2/P3 placeholder tools (to be replaced by real VPP tools in P5)
 ALLOWED_TOOLS = {"get_station_status", "get_aggregate_metrics", "get_device_detail"}
+
+# P5 real database commands (from vpp_db.py)
+ALLOWED_DB_COMMANDS = {
+    "vpp-overview",
+    "device-online",
+    "active-gaps",
+    "weekly-response",
+    "cumulative",
+    "carbon",
+    "anomaly-devices",
+    "low-response",
+    "exec",  # Custom SQL with validation
+}
+
 ALLOWED_ACTIONS = {"highlight_station", "open_station_panel", "show_metric"}
 ROLE_TOOL_ALLOWLIST = {
     "viewer": {"get_station_status", "get_aggregate_metrics"},

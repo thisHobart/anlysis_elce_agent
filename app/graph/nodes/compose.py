@@ -21,12 +21,31 @@ FIXED_FALLBACKS = {
     "out_of_scope": "抱歉，我只能协助处理虚拟电厂相关问题。",
 }
 
+# Fallback reasons that indicate data sources are not connected
+NOT_CONNECTED_REASONS = {
+    "knowledge_not_connected",
+    "data_query_not_connected",
+    "faq_data_not_connected",
+}
+
+# Routes that should always use fixed messages (safety-critical boundaries)
+FIXED_MESSAGE_ROUTES = {"out_of_scope"}
+
 
 def _fallback_answer(state: AgentState, entry: dict[str, Any] | None) -> tuple[str, str]:
+    """Generate a safe fallback answer when LLM is unavailable or must not be used."""
     if state.get("validation_errors"):
         return "请求未通过安全校验：" + " ".join(state["validation_errors"]), "fixed"
+
+    # Check if this is a not-connected scenario
+    fallback_reason = state.get("fallback_reason")
+    if fallback_reason == "faq_data_not_connected" and entry:
+        faq_id = state.get("faq_id", "")
+        return f"FAQ {faq_id} 需要实时数据，但数据源暂未接入。请稍后再试。", "fixed"
+
     if entry:
         return render_faq_template(entry["template"], state.get("data", {})), "template"
+
     route = state.get("route")
     if route in FIXED_FALLBACKS:
         return FIXED_FALLBACKS[route], "fixed"
@@ -34,13 +53,26 @@ def _fallback_answer(state: AgentState, entry: dict[str, Any] | None) -> tuple[s
 
 
 def compose(state: AgentState, llm_service: AgentLLM | None = None) -> dict:
-    """P3 composer: every normal answer uses the LLM, with deterministic P2 fallback."""
+    """P3 composer: LLM for normal paths, but FORCED fallback when data sources are not connected.
+
+    Security: When knowledge/data/faq_data are marked as not connected via fallback_reason,
+    we MUST NOT invoke the LLM. The LLM could hallucinate plausible-sounding business facts
+    from its general knowledge, which is unacceptable for a VPP production system.
+    """
     entry = FAQ.get(state.get("faq_id")) if state.get("faq_id") else None
     service = llm_service or get_llm_service()
     source = "fixed"
     trace_marker = "composed:fixed"
 
-    if service.enabled:
+    # FORCED fallback: data sources not connected OR safety-critical routes → never call LLM
+    fallback_reason = state.get("fallback_reason")
+    route = state.get("route")
+    must_use_fixed = fallback_reason in NOT_CONNECTED_REASONS or route in FIXED_MESSAGE_ROUTES
+
+    if must_use_fixed or not service.enabled:
+        answer, source = _fallback_answer(state, entry)
+        trace_marker = f"composed:{source}:forced" if must_use_fixed else f"composed:{source}"
+    else:
         payload = {
             "question": state["question"],
             "intent": state.get("intent"),
@@ -54,7 +86,7 @@ def compose(state: AgentState, llm_service: AgentLLM | None = None) -> dict:
             "history": history_for_llm(state, get_settings().llm_history_messages),
             "validation_errors": state.get("validation_errors", []),
             "fallback": state.get("fallback", False),
-            "fallback_reason": state.get("fallback_reason"),
+            "fallback_reason": fallback_reason,
         }
         try:
             answer = service.compose(payload=payload)
@@ -63,9 +95,6 @@ def compose(state: AgentState, llm_service: AgentLLM | None = None) -> dict:
         except LLMServiceError:
             answer, source = _fallback_answer(state, entry)
             trace_marker = f"composed:{source}:fallback"
-    else:
-        answer, source = _fallback_answer(state, entry)
-        trace_marker = f"composed:{source}"
 
     return {
         "answer": answer,

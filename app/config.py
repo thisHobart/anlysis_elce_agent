@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     llm_max_retries: int = 1
     llm_structured_mode: Literal["json_prompt", "native"] = "json_prompt"
     llm_history_messages: int = 8
+    db_host: str = "db.example.invalid"
+    db_port: int = 3306
+    db_user: str = "readonly_user"
+    db_password: SecretStr = SecretStr("")
+    db_name: str = "example_db"
+    db_charset: str = "utf8mb4"
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="VPP_", extra="ignore")
 
