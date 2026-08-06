@@ -189,7 +189,7 @@ FAQS: list[dict[str, Any]] = [
     {
         "faq_id": "FAQ-08",
         "category": "realtime",
-        "triggers": ["可调节容量", "当前可调容量", "削峰能力", "填谷能力", "可调能力"],
+        "triggers": ["总可调能力", "平台可调能力", "总可调节容量", "当前可调容量", "削峰能力", "填谷能力", "可调节容量", "当前可调节容量"],
         "template": "当前可调节容量为{{total_adjustable}}兆瓦，其中削峰能力{{peak_shaving}}兆瓦，填谷能力{{valley_filling}}兆瓦。",
         "data_requirements": [
             {"variable": "total_adjustable", "source": "api", "vpp_command": "realtime",
@@ -207,7 +207,7 @@ FAQS: list[dict[str, Any]] = [
     {
         "faq_id": "FAQ-09",
         "category": "realtime",
-        "triggers": ["企业实时负荷", "XX企业负荷", "企业负荷多少", "负载是多少"],
+        "triggers": ["企业实时负荷", "XX企业负荷", "企业负荷多少", "负载是多少", "实时负荷", "负荷是多少", "的实时负荷", "负荷多少"],
         "template": "{{enterprise_name}}当前实时负荷为{{load}}千瓦，占其可调能力的{{ratio}}%。",
         "data_requirements": [
             {"variable": "enterprise_name", "source": "static", "description": "从用户问题中提取的企业名称"},
@@ -313,7 +313,7 @@ FAQS: list[dict[str, Any]] = [
     {
         "faq_id": "FAQ-15",
         "category": "realtime",
-        "triggers": ["企业可调能力", "企业的可调能力", "可调能力是多少", "XX可调能力"],
+        "triggers": ["企业可调能力", "企业的可调能力", "XX可调能力", "可调能力怎么样", "的可调能力"],
         "template": (
             "{{enterprise_name}}当前可调能力为{{adjustable}}兆瓦，其中削峰能力{{peak}}兆瓦，"
             "填谷能力{{valley}}兆瓦。该企业保供等级为{{level}}。"

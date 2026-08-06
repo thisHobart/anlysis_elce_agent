@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     db_password: SecretStr = SecretStr("")
     db_name: str = "example_db"
     db_charset: str = "utf8mb4"
+    # P6 知识检索配置
+    qdrant_host: str = "localhost"
+    qdrant_port: int = 6333
+    knowledge_collection: str = "vpp_knowledge"
+    knowledge_top_k: int = 3
+    knowledge_model_path: str = "BAAI/bge-small-zh-v1.5"
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="VPP_", extra="ignore")
 

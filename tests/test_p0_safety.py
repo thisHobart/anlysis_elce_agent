@@ -56,23 +56,27 @@ class FakeLLM:
 
 def test_knowledge_not_connected_blocks_llm():
     """When knowledge base is not connected, must return fixed message, not LLM hallucination."""
+    import unittest.mock as mock
+
     fake_llm = FakeLLM()
     workflow = build_workflow(llm_service=fake_llm)
 
-    result = workflow.invoke(
-        {
-            "question": "请解释一下 VPP 的工作原理",
-            "role": "viewer",
-            "params": {},
-            "request_action": False,
-            "trace": [],
-        }
-    )
+    # Mock knowledge service as unavailable during query execution
+    with mock.patch("app.graph.nodes.query_data.is_available", return_value=False):
+        result = workflow.invoke(
+            {
+                "question": "请解释一下 VPP 的工作原理",
+                "role": "viewer",
+                "params": {},
+                "request_action": False,
+                "trace": [],
+            }
+        )
 
     assert result["route"] == "knowledge"
-    assert result["fallback_reason"] == "knowledge_not_connected"
+    assert result["fallback_reason"] == "knowledge_not_available"
     assert result["compose_source"] == "fixed"
-    assert "知识库服务暂未接入" in result["answer"]
+    assert "知识库" in result["answer"] and "不可用" in result["answer"]
     assert "[HALLUCINATION]" not in result["answer"]
     assert "composed:fixed:forced" in result["trace"]
     # Verify LLM compose was NOT called

@@ -13,7 +13,7 @@ FAQ = FAQService()
 
 
 FIXED_FALLBACKS = {
-    "knowledge": "知识库服务暂未接入，请稍后再试。",
+    "knowledge": "知识库检索结果为空或服务不可用，请换个问题试试。",
     "data": "实时数据查询暂未接入，目前无法提供准确数值。",
     "direct": "当前请求暂时无法处理。",
     "screen_action": "大屏联动功能暂未启用。",
@@ -21,11 +21,18 @@ FIXED_FALLBACKS = {
     "out_of_scope": "抱歉，我只能协助处理虚拟电厂相关问题。",
 }
 
-# Fallback reasons that indicate data sources are not connected
+# Fallback reasons that indicate data sources are not connected or unavailable
 NOT_CONNECTED_REASONS = {
-    "knowledge_not_connected",
     "data_query_not_connected",
     "faq_data_not_connected",
+    "knowledge_not_available",  # P6: Qdrant 不可用
+}
+
+# Fallback reasons where LLM can still be used (has data, just failed or empty)
+ALLOW_LLM_REASONS = {
+    "knowledge_search_failed",  # 检索失败但服务可用
+    "knowledge_search_error",   # 检索错误但服务可用
+    "knowledge_no_question",    # 没有问题文本
 }
 
 # Routes that should always use fixed messages (safety-critical boundaries)
@@ -53,11 +60,14 @@ def _fallback_answer(state: AgentState, entry: dict[str, Any] | None) -> tuple[s
 
 
 def compose(state: AgentState, llm_service: AgentLLM | None = None) -> dict:
-    """P3 composer: LLM for normal paths, but FORCED fallback when data sources are not connected.
+    """P6 composer: LLM for normal paths + knowledge route, FORCED fallback when data sources not connected.
 
     Security: When knowledge/data/faq_data are marked as not connected via fallback_reason,
     we MUST NOT invoke the LLM. The LLM could hallucinate plausible-sounding business facts
     from its general knowledge, which is unacceptable for a VPP production system.
+
+    P6 Knowledge: When knowledge route succeeds, LLM receives the XML-wrapped results
+    and generates answers based on retrieved documents.
     """
     entry = FAQ.get(state.get("faq_id")) if state.get("faq_id") else None
     service = llm_service or get_llm_service()
