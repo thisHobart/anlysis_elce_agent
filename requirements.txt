@@ -1,0 +1,19 @@
+# Runtime dependencies
+fastapi>=0.115,<1.0
+langchain-openai>=0.3,<2.0
+langgraph>=0.2,<2.0
+pydantic-settings>=2.6,<3.0
+pymysql>=1.1,<2.0
+uvicorn[standard]>=0.32,<1.0
+
+# Knowledge search / RAG and indexing tools
+qdrant-client>=1.12,<2.0
+sentence-transformers>=3.0,<4.0
+pypdf>=5.1,<6.0
+
+# Development, tests, live API checks, and examples
+httpx>=0.28,<1.0
+pytest>=8.3,<9.0
+ruff>=0.8,<1.0
+requests>=2.32,<3.0
+numpy>=1.26,<3.0
