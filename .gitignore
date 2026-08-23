@@ -13,13 +13,13 @@ htmlcov/
 .venv/
 venv/
 env/
+.env
 ENV/
 build/
 dist/
 *.egg-info/
 
 # Local configuration and secrets
-app/.env
 .env.*
 !.env.example
 
