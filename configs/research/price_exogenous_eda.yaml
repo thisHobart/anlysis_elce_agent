@@ -1,0 +1,136 @@
+study:
+  name: rt_price_exogenous_eda
+  market: source_market_unspecified
+  timezone: Asia/Shanghai
+  frequency: 15min
+  start_time: null
+  end_time: null
+
+target:
+  name: rt_price
+  path: ../../data/target_rt_price.csv
+  timestamp_column: datetime
+  value_column: rt_node_price_2B
+  unit: unknown
+  aggregation: mean
+  availability_type: observed_only
+
+exogenous:
+  - name: actual_load
+    path: ../../data/feature_actuals.csv
+    timestamp_column: datetime
+    value_column: actual_load
+    unit: unknown
+    aggregation: mean
+    availability_type: observed_only
+
+  - name: actual_new_energy_0
+    path: ../../data/feature_actuals.csv
+    timestamp_column: datetime
+    value_column: act_new_energy_type_0
+    unit: unknown
+    aggregation: mean
+    availability_type: observed_only
+
+  - name: actual_new_energy_2
+    path: ../../data/feature_actuals.csv
+    timestamp_column: datetime
+    value_column: act_new_energy_type_2
+    unit: unknown
+    aggregation: mean
+    availability_type: observed_only
+
+  - name: actual_new_energy_4
+    path: ../../data/feature_actuals.csv
+    timestamp_column: datetime
+    value_column: act_new_energy_type_4
+    unit: unknown
+    aggregation: mean
+    availability_type: observed_only
+
+  - name: actual_new_energy_12
+    path: ../../data/feature_actuals.csv
+    timestamp_column: datetime
+    value_column: act_new_energy_type_12
+    unit: unknown
+    aggregation: mean
+    availability_type: observed_only
+
+  - name: actual_generation_1
+    path: ../../data/feature_actuals.csv
+    timestamp_column: datetime
+    value_column: act_gen_type_1
+    unit: unknown
+    aggregation: mean
+    availability_type: observed_only
+
+  - name: system_reserve_2
+    path: ../../data/feature_actuals.csv
+    timestamp_column: datetime
+    value_column: sys_reserve_type_2
+    unit: unknown
+    aggregation: mean
+    availability_type: observed_only
+
+  - name: system_reserve_3
+    path: ../../data/feature_actuals.csv
+    timestamp_column: datetime
+    value_column: sys_reserve_type_3
+    unit: unknown
+    aggregation: mean
+    availability_type: observed_only
+
+  - name: forecast_total_generation
+    path: ../../data/feature_forecasts.csv
+    timestamp_column: datetime
+    value_column: fcst_total_gen
+    unit: unknown
+    aggregation: mean
+    availability_type: forecast
+
+  - name: forecast_non_market
+    path: ../../data/feature_forecasts.csv
+    timestamp_column: datetime
+    value_column: fcst_non_market
+    unit: unknown
+    aggregation: mean
+    availability_type: forecast
+
+  - name: forecast_new_energy_4
+    path: ../../data/feature_forecasts.csv
+    timestamp_column: datetime
+    value_column: fcst_new_energy_type_4
+    unit: unknown
+    aggregation: mean
+    availability_type: forecast
+
+  - name: forecast_new_energy_13
+    path: ../../data/feature_forecasts.csv
+    timestamp_column: datetime
+    value_column: fcst_new_energy_type_13
+    unit: unknown
+    aggregation: mean
+    availability_type: forecast
+
+  - name: forecast_new_energy_14
+    path: ../../data/feature_forecasts.csv
+    timestamp_column: datetime
+    value_column: fcst_new_energy_type_14
+    unit: unknown
+    aggregation: mean
+    availability_type: forecast
+
+  - name: forecast_water
+    path: ../../data/feature_forecasts.csv
+    timestamp_column: datetime
+    value_column: fcst_water
+    unit: unknown
+    aggregation: mean
+    availability_type: forecast
+
+analysis:
+  max_lag: 96
+  min_relationship_observations: 48
+  outlier_iqr_multiplier: 1.5
+  spike_iqr_multiplier: 3.0
+  output_directory: ../../artifacts/research

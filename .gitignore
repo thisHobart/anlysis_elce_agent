@@ -8,7 +8,7 @@ __pycache__/
 .coverage
 coverage.xml
 htmlcov/
-
+/data/
 # Virtual environments and packaging artifacts
 .venv/
 venv/
@@ -29,7 +29,8 @@ dist/
 *.iml
 .DS_Store
 Thumbs.db
-
+.superdesign
 # Runtime files
 *.log
 logs/
+artifacts/
