@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from app.config import get_settings
@@ -38,6 +39,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _progress(value: int, message: str) -> None:
     print(json.dumps({"progress": value, "message": message}, ensure_ascii=True), flush=True)
+
+
+def enabled_function_names(plan: dict[str, Any]) -> list[str]:
+    """Return the current function identifiers recorded by an executable plan."""
+
+    return [str(step["function"]) for step in plan["steps"] if step["enabled"]]
 
 
 def main() -> int:
@@ -102,7 +109,7 @@ def main() -> int:
         "skill": {"name": plan["skill_name"], "version": plan["skill_version"]},
         "plan_id": plan["plan_id"],
         "plan_revision": plan["revision"],
-        "enabled_functions": [step["tool"] for step in plan["steps"] if step["enabled"]],
+        "enabled_functions": enabled_function_names(plan),
         "selected_variables": plan["selected_variables"],
         "run_id": latest["run_id"],
         "episode_id": values["loop_cursor"]["episode_id"],
