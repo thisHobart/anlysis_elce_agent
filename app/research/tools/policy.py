@@ -13,8 +13,8 @@ class ToolPermissionError(PermissionError):
 
 @dataclass(frozen=True)
 class ToolPolicy:
-    allowed_tools: frozenset[str]
+    allowed_functions: frozenset[str]
 
     def authorize(self, call: ToolCall) -> None:
-        if call.name not in self.allowed_tools:
+        if call.name not in self.allowed_functions:
             raise ToolPermissionError(f"当前 Skill 未授权工具：{call.name}")

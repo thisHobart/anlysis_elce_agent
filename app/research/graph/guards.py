@@ -17,7 +17,7 @@ from app.research.agent.schemas import EDAPlan
 from app.research.data.loader import ResearchDataError
 from app.research.graph.contracts import AuthorizationEnvelope, LoopBudget
 from app.research.schemas.feedback import FeedbackPacket, FeedbackSource
-from app.research.tools.catalog import TOOL_CATALOG
+from app.research.tools.catalog import FUNCTION_CATALOG
 
 
 def canonical_hash(value: Any) -> str:
@@ -80,23 +80,23 @@ def authorization_envelope(
         skill_name=plan.skill_name,
         skill_version=plan.skill_version,
         data_fingerprint=plan.data_fingerprint,
-        functions=[step.tool for step in plan.enabled_steps],
+        functions=[step.function for step in plan.enabled_steps],
         variables=list(plan.selected_variables),
         max_lag_by_function={
-            step.tool: int(step.parameters["max_lag"])
+            step.function: int(step.parameters["max_lag"])
             for step in plan.enabled_steps
             if step.parameters.get("max_lag") is not None
         },
         segment_parameters_by_function={
-            step.tool: {
+            step.function: {
                 "comparison_id": step.parameters.get("comparison_id"),
                 "segments": step.parameters.get("segments"),
             }
             for step in plan.enabled_steps
-            if TOOL_CATALOG[step.tool].uses_segments
+            if FUNCTION_CATALOG[step.function].uses_segments
         },
         approved_parameters_by_function={
-            step.tool: dict(step.parameters)
+            step.function: dict(step.parameters)
             for step in plan.enabled_steps
         },
     )
@@ -112,7 +112,7 @@ def validate_automatic_revision(plan: EDAPlan, envelope: AuthorizationEnvelope) 
         violations.append("研究问题发生变化")
     if plan.data_fingerprint != envelope.data_fingerprint:
         violations.append("数据指纹发生变化")
-    enabled = {step.tool for step in plan.enabled_steps}
+    enabled = {step.function for step in plan.enabled_steps}
     if not enabled.issubset(envelope.functions):
         violations.append("新增了未审批研究函数")
     if len(plan.enabled_steps) > envelope.max_steps:
@@ -120,26 +120,26 @@ def validate_automatic_revision(plan: EDAPlan, envelope: AuthorizationEnvelope) 
     if not set(plan.selected_variables).issubset(envelope.variables):
         violations.append("新增了未审批变量")
     for step in plan.enabled_steps:
-        approved_parameters = envelope.approved_parameters_by_function.get(step.tool)
+        approved_parameters = envelope.approved_parameters_by_function.get(step.function)
         if approved_parameters is None:
-            violations.append(f"{step.tool} 缺少原审批参数")
+            violations.append(f"{step.function} 缺少原审批参数")
             continue
         if step.parameters.get("max_lag") is not None and int(step.parameters["max_lag"]) > envelope.max_lag_by_function.get(
-            step.tool, -1
+            step.function, -1
         ):
-            violations.append(f"{step.tool} 扩大了最大滞后范围")
-        if TOOL_CATALOG[step.tool].uses_segments:
+            violations.append(f"{step.function} 扩大了最大滞后范围")
+        if FUNCTION_CATALOG[step.function].uses_segments:
             current = {
                 "comparison_id": step.parameters.get("comparison_id"),
                 "segments": step.parameters.get("segments"),
             }
-            if current != envelope.segment_parameters_by_function.get(step.tool):
-                violations.append(f"{step.tool} 改变了未重新审批的分段定义")
+            if current != envelope.segment_parameters_by_function.get(step.function):
+                violations.append(f"{step.function} 改变了未重新审批的分段定义")
         for key, value in step.parameters.items():
             if key in {"variables", "max_lag", "segments", "comparison_id"}:
                 continue
             if value != approved_parameters.get(key):
-                violations.append(f"{step.tool} 改变了未重新审批的参数 {key}")
+                violations.append(f"{step.function} 改变了未重新审批的参数 {key}")
     if not violations:
         return None
     unique_violations = list(dict.fromkeys(violations))
@@ -152,7 +152,7 @@ def validate_automatic_revision(plan: EDAPlan, envelope: AuthorizationEnvelope) 
             "plan_id": plan.plan_id,
             "revision": plan.revision,
             "violations": unique_violations,
-            "functions": [step.tool for step in plan.enabled_steps],
+            "functions": [step.function for step in plan.enabled_steps],
             "variables": list(plan.selected_variables),
         },
         expected={

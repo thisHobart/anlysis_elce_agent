@@ -7,13 +7,13 @@
 | 变更 | 影响 |
 |---|---|
 | 研究函数从 18 个扩展到 30 个（新增平稳性、趋势季节分解、偏自相关、尖峰状态、持续曲线、方差稳定、朴素基线、VIF、驱动平稳性、互信息、Granger 前置性、滚动稳定性） | 计划、执行、评估和报告全部涉及；新增 statsmodels 运行依赖 |
-| 内置 Skill 从 1 个变为 2 个；`price-exogenous-eda` 升到 `3.0.0`，协议升到 `electricity-price-evidence-ladder@2.0.0`；新增 `price-forecastability-audit@1.0.0` | 旧方案的 Skill/协议版本不再匹配，必须重新规划 |
+| 内置 Skill 从 1 个变为 2 个；`price-exogenous-eda` 升到 `3.2.0`，协议升到 `electricity-price-evidence-ladder@2.2.0`；新增 `price-forecastability-audit@1.2.0` | 旧方案的 Skill/协议版本不再匹配，必须重新规划 |
 | Agent 主报告从 `report.md` 改为自包含 `report.html`，图表从 matplotlib PNG 改为内联 SVG | 产物清单、`report_path` 与"查看完整报告"入口变化 |
 | 对话中新增可展开的研究过程卡；循环事件统一经 `narration.py` 翻译为用户语言 | 桌面时间线、会话投影与运行记录展示变化 |
 | 桌面文案整体改写为面向非开发用户的表述 | 界面文本断言与用户验收话术变化 |
 | PyInstaller 现在打包 `app/research/skills/` 下全部内置 Skill，并显式收集 statsmodels 数据 | EXE 体积与内置资源清单变化 |
 
-自动化回归当前为 **`142 passed`**，覆盖持久化恢复、审批真实性、非法 action、异常终态、单次执行快照、跨修订结果复用、A→B→A 收敛、分段比较、Iteration 上限、Episode 隔离、旧 schema 隔离、事件有界化、用户目录、真实函数时间场景，以及本次新增的 30 函数全量执行、结构诊断逐项断言、叙述层翻译、双 Skill 发现、HTML 报告章节与 SVG 产物、研究过程可见性与重启恢复。
+自动化回归当前为 **`173 passed`**，覆盖持久化恢复、审批真实性、非法 action、异常终态、单次执行快照、跨修订结果复用、A→B→A 收敛、分段比较、Iteration 上限、Episode 隔离、旧 schema 隔离、事件有界化、用户目录、真实函数时间场景，以及 30 函数全量执行、结构诊断逐项断言、叙述层翻译、双 Skill 发现、HTML 报告章节与 SVG 产物、研究过程可见性、三类数据文件直入和重启恢复。
 
 自动测试替身只用于边界回归，不作为真实 Agent 完成证明。
 
@@ -41,8 +41,8 @@ $env:QT_QPA_PLATFORM="offscreen"
 |---|---|
 | 统一连续对话 | PySide6 真实验收完成讨论、规划、修订、执行和追问 |
 | 所有研究判断调用模型 | `ModelResearchDialogue` 和 `ModelEDAPlanner` 无本地规划回退；模型中断测试明确停止 |
-| Skill 选择 | LangGraph `resolve_skill`；内置 `price-exogenous-eda@3.0.0` 与 `price-forecastability-audit@1.0.0` |
-| 领域研究协议 | 本地 `electricity-price-evidence-ladder@2.0.0` 与 `price-forecastability-ladder@1.0.0`；计划和 manifest 记录协议版本，编译器按协议排序 |
+| Skill 选择 | LangGraph `resolve_skill`；内置 `price-exogenous-eda@3.2.0` 与 `price-forecastability-audit@1.2.0` |
+| 领域研究协议 | 本地 `electricity-price-evidence-ladder@2.2.0` 与 `price-forecastability-ladder@1.2.0`；计划和 manifest 记录协议版本，编译器按协议排序 |
 | 研究函数覆盖度 | 30 个原子函数按五个阶段分组，全量执行回归通过 |
 | 统计实现可信 | ADF/KPSS/MSTL/PACF/Ljung-Box 直接调用 statsmodels，不自行重写 |
 | 分段比较 | 峰谷、季节和时间范围通过单次 `segments` 调用进入同一 summary 与确定性评估 |
@@ -68,7 +68,7 @@ $env:QT_QPA_PLATFORM="offscreen"
 
 - 模型：`gpt-5.6-luna`
 - 结构化输出：固定使用 Function Calling
-- 数据配置：`configs/research/price_exogenous_eda.yaml`
+- 数据输入：目标电价、实际外生变量、预测外生变量三类 CSV/Parquet 文件
 - 真实持久化循环：`agent-20260824T000748386127Z-c79e3779ae0c`
 - 真实桌面循环：`agent-20260824T001319972586Z-8d4d83e1bf2d`
 - 更早的真实持久化循环：`phase1-real-cb0e83d02c1b`，规划提示词 `eda-plan-v5`，对话提示词 `research-dialogue-v2`

@@ -60,7 +60,7 @@ def build_agent_eda_report(
     ]
     for step in plan.steps:
         lines.append(
-            f"| {'是' if step.enabled else '否'} | {step.title} | `{step.tool}` | `{step.tool_version}` | "
+            f"| {'是' if step.enabled else '否'} | {step.title} | `{step.function}` | `{step.function_version}` | "
             f"{step.rationale} | "
             f"`{step.parameters}` |"
         )
@@ -128,11 +128,20 @@ def build_agent_eda_report(
             if key in figure_names:
                 lines.extend(["", f"![{title}](figures/{key}.svg)"])
 
-    exogenous = summary.get("exogenous")
-    if exogenous:
+    exogenous = summary.get("exogenous") or {}
+    profiles = exogenous.get("series") or {}
+    collinearity = exogenous.get("strong_collinearity_pairs")
+    driver_stationarity = exogenous.get("driver_stationarity") or {}
+    if profiles or collinearity is not None or driver_stationarity:
+        # A plan may enable any single driver function, so each line must stand on its own.
         lines.extend(["", "## 外生变量画像", ""])
-        lines.append(f"- 已分析变量数：**{len(exogenous['series'])}**。")
-        lines.append(f"- 强共线性变量对：**{len(exogenous['strong_collinearity_pairs'])}**。")
+        if profiles:
+            lines.append(f"- 已分析变量数：**{len(profiles)}**。")
+        if collinearity is not None:
+            lines.append(f"- 强共线性变量对：**{len(collinearity)}**。")
+        if driver_stationarity:
+            non_stationary = driver_stationarity.get("non_stationary_variables") or []
+            lines.append(f"- 自身非平稳的变量数：**{len(non_stationary)}**。")
 
     relationships = summary.get("relationships", {}).get("series", {})
     if relationships:

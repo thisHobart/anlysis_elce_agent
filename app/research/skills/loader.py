@@ -74,9 +74,9 @@ def load_skill(path: str | Path, *, source: Literal["builtin", "external"]) -> S
         raise SkillLoadError(f"{skill_path} 的 metadata 必须是对象")
     raw_allowed = frontmatter.get("allowed-tools", "")
     if isinstance(raw_allowed, str):
-        allowed_tools = raw_allowed.split()
+        allowed_functions = raw_allowed.split()
     elif isinstance(raw_allowed, list) and all(isinstance(item, str) for item in raw_allowed):
-        allowed_tools = raw_allowed
+        allowed_functions = raw_allowed
     else:
         raise SkillLoadError(f"{skill_path} 的 allowed-tools 必须是字符串或字符串列表")
     try:
@@ -85,7 +85,7 @@ def load_skill(path: str | Path, *, source: Literal["builtin", "external"]) -> S
             description=description,
             version=str(raw_metadata.get("version", "unversioned")),
             domain=str(raw_metadata.get("domain", "general")),
-            allowed_tools=expand_legacy_function_permissions(allowed_tools),
+            allowed_functions=expand_legacy_function_permissions(allowed_functions),
             instructions=instructions,
             metadata=raw_metadata,
             research_protocol=_load_research_protocol(skill_path, raw_metadata),

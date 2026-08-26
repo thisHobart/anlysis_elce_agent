@@ -6,13 +6,14 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.research.tools.catalog import LEGACY_METHOD_TO_FUNCTION, TOOL_CATALOG, ResearchFunctionName
+from app.research.agent.schemas import rename_legacy_step_keys
+from app.research.tools.catalog import FUNCTION_CATALOG, LEGACY_METHOD_TO_FUNCTION, ResearchFunctionName
 
 
 class DraftStep(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    tool: ResearchFunctionName
+    function: ResearchFunctionName
     enabled: bool = True
     rationale: str = Field(min_length=1)
     parameters: dict[str, Any] = Field(
@@ -48,22 +49,23 @@ class EDAPlanDraft(BaseModel):
             return value
         selected_variables = list(dict.fromkeys(value.get("selected_variables") or []))
         migrated: list[dict[str, Any]] = []
-        for step in value["steps"]:
-            if not isinstance(step, dict) or step.get("tool") not in {
+        for raw_step in value["steps"]:
+            step = rename_legacy_step_keys(raw_step)
+            if not isinstance(step, dict) or step.get("function") not in {
                 "price_profile",
                 "exogenous_profile",
                 "relationship_analysis",
             }:
                 migrated.append(step)
                 continue
-            legacy_tool = str(step["tool"])
+            legacy_tool = str(step["function"])
             parameters = dict(step.get("parameters") or {})
             methods = parameters.pop("methods", [])
             for method in methods:
                 function_name = LEGACY_METHOD_TO_FUNCTION.get((legacy_tool, str(method)))
                 if function_name is None:
                     raise ValueError(f"旧方案包含未注册方法：{legacy_tool}.{method}")
-                spec = TOOL_CATALOG[function_name]
+                spec = FUNCTION_CATALOG[function_name]
                 function_parameters: dict[str, Any] = {}
                 if spec.uses_variables:
                     function_parameters["variables"] = parameters.get("variables", selected_variables)
@@ -71,7 +73,7 @@ class EDAPlanDraft(BaseModel):
                     function_parameters["max_lag"] = parameters["max_lag"]
                 migrated.append(
                     {
-                        "tool": function_name,
+                        "function": function_name,
                         "enabled": bool(step.get("enabled", True)),
                         "rationale": step.get("rationale") or spec.description,
                         "parameters": function_parameters,

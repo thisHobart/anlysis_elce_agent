@@ -7,11 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from app.desktop.input_config import build_session_study_config
+from app.desktop.input_config import build_runtime_study
 from app.desktop.session import ResearchSession, SessionInputFile
 from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
 from app.research.agent.subagents.eda import EDASubagent
-from app.research.application.coordinator import ResearchCoordinator
+from app.research.application.coordinator import GRAPH_SCHEMA_VERSION, ResearchCoordinator
 from app.research.application.execution import EDAExecutionService
 from app.research.graph.contracts import LoopCursor
 from app.research.graph.guards import canonical_hash
@@ -43,7 +43,7 @@ class Planner:
             "selected_variables": [],
             "steps": [
                 {
-                    "tool": "price_descriptive_distribution",
+                    "function": "price_descriptive_distribution",
                     "rationale": "检查电价分布。",
                     "parameters": {},
                 }
@@ -77,18 +77,18 @@ def test_runtime_writes_use_configured_user_directories():
     assert default_research_output_directory().name == "research-output"
 
 
-def test_desktop_yaml_config_uses_runtime_output_directory(synthetic_study: Path, tmp_path: Path):
+def test_desktop_inferred_study_uses_runtime_output_directory(synthetic_study: Path, tmp_path: Path):
+    source = load_study_config(synthetic_study)
     session = ResearchSession(
         inputs={
-            "config": SessionInputFile(role="config", label="研究配置", path=str(synthetic_study)),
-            "target": SessionInputFile(role="target", label="目标电价"),
+            "target": SessionInputFile(role="target", label="目标电价", path=str(source.target.path)),
             "actuals": SessionInputFile(role="actuals", label="实际外生变量"),
             "forecasts": SessionInputFile(role="forecasts", label="预测外生变量"),
         }
     )
     output_directory = tmp_path / "runtime-research"
 
-    config = build_session_study_config(session, output_directory=output_directory)
+    config = build_runtime_study(session, output_directory=output_directory)
 
     assert config.analysis.output_directory == output_directory.resolve()
 
@@ -190,6 +190,6 @@ def test_old_sqlite_schema_is_safe_to_open_and_backed_up_before_restart(
         message="接受",
         study_config=config,
     )
-    assert restarted.values["graph_schema_version"] == 8
+    assert restarted.values["graph_schema_version"] == GRAPH_SCHEMA_VERSION
     assert list((tmp_path / "checkpoint_backups").rglob("*.json"))
     coordinator.close()

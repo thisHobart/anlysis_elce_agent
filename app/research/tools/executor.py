@@ -7,13 +7,26 @@ import json
 from datetime import UTC, datetime
 from time import perf_counter
 
-from app.research.tools.contracts import ToolCall, ToolContext, ToolResult
+from app.research.tools.contracts import ToolCall, ToolContext, ToolOutput, ToolResult
 from app.research.tools.policy import ToolPolicy
 from app.research.tools.registry import ToolRegistry, ToolRegistryError
 
 
 class ToolExecutionError(RuntimeError):
     """A controlled tool call failed validation or execution."""
+
+
+def output_fingerprint(output: ToolOutput) -> str:
+    """Hash one tool output; the single rule used to write and to re-check output_hash."""
+
+    payload = json.dumps(
+        output.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 class ToolExecutor:
@@ -42,13 +55,6 @@ class ToolExecutor:
             wall_finished = datetime.now(UTC).isoformat()
         except (TypeError, ValueError) as exc:
             raise ToolExecutionError(f"工具 {call.name} 调用失败：{exc}") from exc
-        output_payload = json.dumps(
-            output.model_dump(mode="json"),
-            ensure_ascii=False,
-            sort_keys=True,
-            allow_nan=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
         return ToolResult(
             call=call,
             status="completed",
@@ -59,5 +65,5 @@ class ToolExecutor:
             provider=spec.provider,
             tool_version=spec.version,
             data_fingerprint=data_fingerprint,
-            output_hash=hashlib.sha256(output_payload).hexdigest(),
+            output_hash=output_fingerprint(output),
         )

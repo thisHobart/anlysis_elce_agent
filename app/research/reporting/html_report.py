@@ -11,7 +11,7 @@ from app.research.reporting.report_charts import FIGURE_TITLES
 from app.research.reporting.svg_charts import format_number
 from app.research.schemas.results import DataQualityReport
 from app.research.schemas.study import StudyConfig
-from app.research.tools.catalog import STAGE_TITLES, TOOL_CATALOG
+from app.research.tools.catalog import FUNCTION_CATALOG, STAGE_TITLES
 
 DECISION_LABELS = {
     "accept": ("研究已收敛", "ok"),
@@ -253,11 +253,11 @@ def _conclusion_section(evaluation: AgentEvaluation) -> str:
 def _plan_section(plan: EDAPlan) -> str:
     grouped: dict[str, list[Any]] = {}
     for step in plan.enabled_steps:
-        grouped.setdefault(TOOL_CATALOG[step.tool].stage, []).append(step)
+        grouped.setdefault(FUNCTION_CATALOG[step.function].stage, []).append(step)
     body = ""
     for stage, steps in grouped.items():
         rows = [
-            [escape(step.title), escape(TOOL_CATALOG[step.tool].answers), escape(step.rationale)]
+            [escape(step.title), escape(FUNCTION_CATALOG[step.function].answers), escape(step.rationale)]
             for step in steps
         ]
         body += f"<h3>{escape(STAGE_TITLES.get(stage, stage))}</h3>" + _table(
@@ -541,7 +541,7 @@ def _technical_details(plan: EDAPlan, evaluation: AgentEvaluation, config: Study
         ["时区 / 采样频率", f"{escape(config.study.timezone)} / {escape(config.study.frequency)}"],
     ]
     function_rows = [
-        [escape(step.title), f"<code>{escape(step.tool)}</code>", f"<code>{escape(step.tool_version)}</code>",
+        [escape(step.title), f"<code>{escape(step.function)}</code>", f"<code>{escape(step.function_version)}</code>",
          f"<code>{escape(str(step.parameters))}</code>"]
         for step in plan.enabled_steps
     ]

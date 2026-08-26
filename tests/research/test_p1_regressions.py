@@ -46,7 +46,7 @@ class Planner:
             "selected_variables": [],
             "steps": [
                 {
-                    "tool": "price_descriptive_distribution",
+                    "function": "price_descriptive_distribution",
                     "rationale": "检查分布。",
                     "parameters": {},
                 }
@@ -101,7 +101,7 @@ def test_authorization_envelope_blocks_question_and_unapproved_parameter_changes
 
     changed_steps = [
         step.model_copy(update={"parameters": {"unexpected_threshold": 99}})
-        if step.tool == "price_descriptive_distribution"
+        if step.function == "price_descriptive_distribution"
         else step
         for step in plan.steps
     ]
@@ -174,7 +174,7 @@ def test_a_b_a_evidence_cycle_stops_on_membership_not_only_adjacent(
                 "selected_variables": [],
                 "steps": [
                     {
-                        "tool": "price_lag_autocorrelation",
+                        "function": "price_lag_autocorrelation",
                         "rationale": "制造 A-B-A 工具证据。",
                         "parameters": {"max_lag": max_lag},
                     }
@@ -284,7 +284,7 @@ def test_episode_goal_remains_stable_while_latest_turn_changes(synthetic_study: 
                 return DialogueDecision(
                     intent="revise_plan",
                     response="已修订。",
-                    enabled_tools=["price_descriptive_distribution"],
+                    enabled_functions=["price_descriptive_distribution"],
                     selected_variables=[],
                 )
             return super().decide(**kwargs)

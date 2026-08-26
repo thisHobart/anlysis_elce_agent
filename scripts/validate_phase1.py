@@ -9,17 +9,16 @@ from uuid import uuid4
 
 from app.config import get_settings
 from app.research.application.coordinator import ResearchCoordinator
-from app.research.schemas.study import load_study_config
+from app.research.data.inference import infer_study_context
 
 
 def build_parser() -> argparse.ArgumentParser:
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description="Validate the real persistent Phase 1 Agent loop.")
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=root / "configs" / "research" / "price_exogenous_eda.yaml",
-    )
+    parser.add_argument("--target", type=Path, default=root / "data" / "target_rt_price.csv")
+    parser.add_argument("--actuals", type=Path, default=root / "data" / "feature_actuals.csv")
+    parser.add_argument("--forecasts", type=Path, default=root / "data" / "feature_forecasts.csv")
+    parser.add_argument("--output", type=Path, default=root / "artifacts" / "research")
     parser.add_argument(
         "--question",
         default=(
@@ -47,7 +46,12 @@ def main() -> int:
     if not settings.llm_base_url or not settings.llm_model:
         raise SystemExit("Real model Base URL and model name are required.")
 
-    config = load_study_config(args.config)
+    config = infer_study_context(
+        target_path=args.target,
+        actuals_path=args.actuals,
+        forecasts_path=args.forecasts,
+        output_directory=args.output,
+    )
     coordinator = ResearchCoordinator()
     thread_id = f"phase1-real-{uuid4().hex[:12]}"
     approval = coordinator.submit_user_message(

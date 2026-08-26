@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.research.tools.catalog import TOOL_CATALOG
+from app.research.tools.catalog import FUNCTION_CATALOG
 
 
 class ResearchProtocolStage(BaseModel):
@@ -26,7 +26,7 @@ class ResearchProtocolStage(BaseModel):
     def validate_functions(self) -> ResearchProtocolStage:
         if len(self.functions) != len(set(self.functions)):
             raise ValueError(f"研究协议阶段 {self.stage_id} 包含重复函数")
-        unknown = sorted(set(self.functions).difference(TOOL_CATALOG))
+        unknown = sorted(set(self.functions).difference(FUNCTION_CATALOG))
         if unknown:
             raise ValueError(f"研究协议阶段 {self.stage_id} 包含未知函数：{', '.join(unknown)}")
         unmatched_rules = sorted(set(self.function_rules).difference(self.functions))
@@ -83,7 +83,7 @@ class SkillDefinition(BaseModel):
     description: str = Field(min_length=1, max_length=1024)
     version: str = Field(default="unversioned", min_length=1)
     domain: str = Field(default="general", min_length=1)
-    allowed_tools: list[str] = Field(default_factory=list)
+    allowed_functions: list[str] = Field(default_factory=list)
     instructions: str = Field(min_length=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
     research_protocol: ResearchProtocol | None = None
@@ -95,7 +95,7 @@ class SkillDefinition(BaseModel):
         if self.research_protocol is None:
             return self
         protocol_functions = set(self.research_protocol.function_order)
-        allowed = set(self.allowed_tools)
+        allowed = set(self.allowed_functions)
         if protocol_functions != allowed:
             missing = sorted(allowed.difference(protocol_functions))
             extra = sorted(protocol_functions.difference(allowed))
@@ -123,7 +123,7 @@ class SkillDefinition(BaseModel):
             "description": self.description,
             "version": self.version,
             "domain": self.domain,
-            "allowed_tools": self.allowed_tools,
+            "allowed_functions": self.allowed_functions,
             "instructions": self.instructions,
             "source": self.source,
         }

@@ -7,17 +7,17 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.config import Settings
+from app.config import Settings, get_settings
 from app.llm.factory import build_model_gateway
 from app.llm.gateway import ModelConfigurationError, ModelGateway, ModelGatewayError, ModelResponseError
 from app.research.agent.errors import ResearchModelUnavailableError, ResearchPlanValidationError
 from app.research.agent.schemas import ConversationMessage, EDAPlan, EDAToolName
 from app.research.schemas.study import StudyConfig
-from app.research.tools.catalog import TOOL_CATALOG, tool_metadata
+from app.research.tools.catalog import FUNCTION_CATALOG, function_metadata
 from app.research.tools.contracts import SegmentDefinition
 
 DialogueIntent = Literal["discussion", "new_plan", "revise_plan", "explain_result", "execute_plan"]
-TOOL_METADATA = tool_metadata()
+FUNCTION_METADATA = function_metadata()
 DIALOGUE_PROMPT_VERSION = "research-dialogue-v4"
 
 DIALOGUE_SYSTEM_PROMPT = """你负责一个离线、只读的电价与外生变量探索性数据分析对话。
@@ -54,7 +54,7 @@ class DialogueDecision(BaseModel):
     skill_name: str | None = None
     objective: str | None = None
     hypotheses: list[str] | None = None
-    enabled_tools: list[EDAToolName] | None = None
+    enabled_functions: list[EDAToolName] | None = None
     selected_variables: list[str] | None = None
     max_lag: int | None = Field(default=None, ge=0)
     comparison_id: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]{0,31}$")
@@ -114,6 +114,7 @@ class ModelResearchDialogue:
         gateway: ModelGateway | None = None,
     ) -> None:
         self.gateway = gateway or build_model_gateway(settings)
+        self.history_messages = (settings or get_settings()).llm_history_messages
 
     @property
     def enabled(self) -> bool:
@@ -157,7 +158,9 @@ class ModelResearchDialogue:
             "question": question,
             "session_status": status,
             "has_executable_data": config is not None,
-            "conversation_history": [item.model_dump(mode="json") for item in history[-12:]],
+            "conversation_history": [
+                item.model_dump(mode="json") for item in history[-self.history_messages :]
+            ],
             "current_plan": plan.model_dump(mode="json") if plan is not None else None,
             "study": {
                 "name": config.study.name if config is not None else None,
@@ -179,10 +182,10 @@ class ModelResearchDialogue:
             "allowed_functions": {
                 function_name: {
                     "description": metadata[1],
-                    "display_name": TOOL_CATALOG[function_name].title,
-                    "version": TOOL_CATALOG[function_name].version,
+                    "display_name": FUNCTION_CATALOG[function_name].title,
+                    "version": FUNCTION_CATALOG[function_name].version,
                 }
-                for function_name, metadata in TOOL_METADATA.items()
+                for function_name, metadata in FUNCTION_METADATA.items()
             },
             "intent_rules": {
                 "discussion": "方法讨论或当前方案说明，返回文字解释",
@@ -225,6 +228,27 @@ class MainResearchAgent:
             raise ResearchModelUnavailableError("大模型尚未配置，无法开始研究对话。")
         return self.model_dialogue.decide(**kwargs), "llm"
 
+    @staticmethod
+    def _revised_agenda(plan: EDAPlan, revised: EDAPlan, decision: DialogueDecision) -> list[str]:
+        """Rebuild the agenda from the revision itself, once every requested step is in the plan."""
+
+        from app.research.planning.compiler import FUNCTION_AGENDA_HYPOTHESES
+
+        generated = set(FUNCTION_AGENDA_HYPOTHESES.values())
+        enabled_agenda = {
+            FUNCTION_AGENDA_HYPOTHESES[step.function]
+            for step in revised.enabled_steps
+            if step.function in FUNCTION_AGENDA_HYPOTHESES
+        }
+        baseline = decision.hypotheses if decision.hypotheses is not None else plan.hypotheses
+        kept = [item for item in baseline if item not in generated or item in enabled_agenda]
+        added = [
+            hypothesis
+            for hypothesis in FUNCTION_AGENDA_HYPOTHESES.values()
+            if hypothesis in enabled_agenda and hypothesis not in kept
+        ]
+        return list(dict.fromkeys([*kept, *added]))
+
     def revise_plan(
         self,
         *,
@@ -236,7 +260,7 @@ class MainResearchAgent:
         changed_fields = (
             decision.objective,
             decision.hypotheses,
-            decision.enabled_tools,
+            decision.enabled_functions,
             decision.selected_variables,
             decision.max_lag,
             decision.comparison_id,
@@ -245,17 +269,17 @@ class MainResearchAgent:
         if all(value is None for value in changed_fields):
             raise ResearchPlanValidationError("大模型将回合标记为方案修订，但没有返回任何修改内容。")
 
-        current_enabled = {step.tool for step in plan.enabled_steps if step.tool != "data_quality"}
-        if decision.enabled_tools is None:
-            enabled_tools = current_enabled
+        current_enabled = {step.function for step in plan.enabled_steps if step.function != "data_quality"}
+        if decision.enabled_functions is None:
+            enabled_functions = current_enabled
         else:
-            enabled_tools = set(decision.enabled_tools).difference({"data_quality"})
-            unknown_functions = sorted(enabled_tools.difference(TOOL_CATALOG))
+            enabled_functions = set(decision.enabled_functions).difference({"data_quality"})
+            unknown_functions = sorted(enabled_functions.difference(FUNCTION_CATALOG))
             if unknown_functions:
                 raise ResearchPlanValidationError(f"大模型修订包含未知研究函数：{', '.join(unknown_functions)}")
             if plan.research_protocol_function_order:
                 outside_protocol = sorted(
-                    enabled_tools.difference(plan.research_protocol_function_order)
+                    enabled_functions.difference(plan.research_protocol_function_order)
                 )
                 if outside_protocol:
                     raise ResearchPlanValidationError(
@@ -272,7 +296,7 @@ class MainResearchAgent:
         if unknown_variables:
             raise ResearchPlanValidationError(f"大模型修订包含未知变量：{', '.join(unknown_variables)}")
 
-        if any(TOOL_CATALOG[name].uses_variables for name in enabled_tools) and not selected_variables:
+        if any(FUNCTION_CATALOG[name].uses_variables for name in enabled_functions) and not selected_variables:
             raise ResearchPlanValidationError("修订方案启用了外生变量分析，但没有选择变量")
 
         current_lag = next(
@@ -287,7 +311,7 @@ class MainResearchAgent:
         if maximum is not None and max_lag > maximum:
             raise ResearchPlanValidationError(f"最大滞后不能超过 {maximum} 个间隔")
 
-        enabled_step_ids = {step.step_id for step in plan.steps if step.tool in enabled_tools}
+        enabled_step_ids = {step.step_id for step in plan.steps if step.function in enabled_functions}
         revised = plan.adjusted(
             enabled_step_ids=enabled_step_ids,
             selected_variables=selected_variables,
@@ -297,36 +321,11 @@ class MainResearchAgent:
         ).model_copy(
             update={
                 "objective": decision.objective or plan.objective,
-                "hypotheses": decision.hypotheses if decision.hypotheses is not None else plan.hypotheses,
                 "planner": "llm",
                 "planning_model": getattr(self.model_dialogue, "model_name", plan.planning_model),
             }
         )
-        from app.research.planning.compiler import FUNCTION_AGENDA_HYPOTHESES
-
-        enabled_agenda_hypotheses = {
-            FUNCTION_AGENDA_HYPOTHESES[step.tool]
-            for step in revised.enabled_steps
-            if step.tool in FUNCTION_AGENDA_HYPOTHESES
-        }
-        revised = revised.model_copy(
-            update={
-                "hypotheses": [
-                    *[
-                        hypothesis
-                        for hypothesis in plan.hypotheses
-                        if hypothesis not in FUNCTION_AGENDA_HYPOTHESES.values()
-                        or hypothesis in enabled_agenda_hypotheses
-                    ],
-                    *[
-                        hypothesis
-                        for hypothesis in FUNCTION_AGENDA_HYPOTHESES.values()
-                        if hypothesis in enabled_agenda_hypotheses and hypothesis not in plan.hypotheses
-                    ],
-                ]
-            }
-        )
-        segment_steps = [step for step in revised.steps if TOOL_CATALOG[step.tool].uses_segments]
+        segment_steps = [step for step in revised.steps if FUNCTION_CATALOG[step.function].uses_segments]
         existing_segments = next((step.parameters.get("segments") for step in segment_steps), None)
         existing_comparison_id = next(
             (step.parameters.get("comparison_id") for step in segment_steps),
@@ -338,7 +337,7 @@ class MainResearchAgent:
             else existing_segments
         )
         comparison_id = decision.comparison_id or existing_comparison_id
-        if any(TOOL_CATALOG[name].uses_segments for name in enabled_tools) and (
+        if any(FUNCTION_CATALOG[name].uses_segments for name in enabled_functions) and (
             not segments or not comparison_id
         ):
             raise ResearchPlanValidationError("分段比较修订必须提供 comparison_id 和至少两个 segments")
@@ -355,14 +354,14 @@ class MainResearchAgent:
                                 }
                             }
                         )
-                        if TOOL_CATALOG[step.tool].uses_segments
+                        if FUNCTION_CATALOG[step.function].uses_segments
                         else step
                         for step in revised.steps
                     ]
                 }
             )
-        existing_functions = {step.tool for step in revised.steps}
-        missing_functions = [name for name in enabled_tools if name not in existing_functions]
+        existing_functions = {step.function for step in revised.steps}
+        missing_functions = [name for name in enabled_functions if name not in existing_functions]
         if missing_functions:
             from app.research.planning.compiler import compile_function_step
             from app.research.planning.contracts import DraftStep
@@ -370,7 +369,7 @@ class MainResearchAgent:
             extra_steps = list(revised.steps)
             for function_name in missing_functions:
                 parameters: dict[str, Any] = {}
-                spec = TOOL_CATALOG[function_name]
+                spec = FUNCTION_CATALOG[function_name]
                 if spec.uses_variables:
                     parameters["variables"] = selected_variables
                 if spec.uses_max_lag:
@@ -382,7 +381,7 @@ class MainResearchAgent:
                     compile_function_step(
                         len(extra_steps) + 1,
                         DraftStep(
-                            tool=function_name,
+                            function=function_name,
                             enabled=True,
                             rationale=spec.description,
                             parameters=parameters,
@@ -392,6 +391,7 @@ class MainResearchAgent:
                     )
                 )
             revised = revised.model_copy(update={"steps": extra_steps})
+        revised = revised.model_copy(update={"hypotheses": self._revised_agenda(plan, revised, decision)})
         revised = revised.ordered_by_research_protocol()
         enabled_titles = "、".join(step.title for step in revised.enabled_steps)
         variable_text = "、".join(revised.selected_variables) if revised.selected_variables else "无"

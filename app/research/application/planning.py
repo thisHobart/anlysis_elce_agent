@@ -58,7 +58,7 @@ def resolve_config(*, config_path: str | Path | None, study_config: StudyConfig 
     if study_config is not None:
         return study_config
     if config_path is None:
-        raise ValueError("a research configuration is required")
+        raise ValueError("a runtime study context is required")
     return load_study_config(config_path)
 
 
@@ -112,7 +112,7 @@ class EDAPlanningService:
         revision_context: dict[str, Any] | None = None,
     ) -> ResearchProposal:
         callback = progress or noop_progress
-        callback(5, "读取研究配置")
+        callback(5, "解析数据字段与时间轴")
         config = resolve_config(config_path=config_path, study_config=study_config)
         callback(20, "加载并对齐数据")
         prepared = prepare_research_data(config)

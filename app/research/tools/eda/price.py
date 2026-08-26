@@ -49,6 +49,7 @@ def _rolling_profiles(values: pd.Series, frequency: str) -> dict[str, Any]:
             "latest_std": _number(rolling_std.dropna().iloc[-1]) if rolling_std.notna().any() else None,
             "minimum_mean": _number(rolling_mean.min()),
             "maximum_mean": _number(rolling_mean.max()),
+            "minimum_std": _number(rolling_std.min()),
             "maximum_std": _number(rolling_std.max()),
         }
     return profiles

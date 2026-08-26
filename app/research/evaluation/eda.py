@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 from typing import Any
 
 from app.research.agent.schemas import AgendaScope, AgentEvaluation, EDAPlan, EvaluationCheck, HypothesisAssessment
 from app.research.schemas.feedback import FeedbackPacket
 from app.research.schemas.results import DataQualityReport
-from app.research.tools.catalog import TOOL_CATALOG
+from app.research.tools.catalog import FUNCTION_CATALOG
 
 
 def _fmt(value: float | None) -> str:
@@ -41,21 +42,126 @@ def _contains_any(value: str, terms: tuple[str, ...]) -> bool:
     return any(term.casefold() in normalized for term in terms)
 
 
+SEASONAL_STRENGTH_THRESHOLD = 0.3
+"""Below this an MSTL/STL seasonal component is not a stable periodic structure."""
+
+CALENDAR_EFFECT_THRESHOLD = 0.06
+"""Conventional medium effect size for eta squared, used to read one calendar grouping."""
+
+
+def _group_variance_share(rows: Any) -> float | None:
+    """Return eta squared for one calendar grouping, from the group summary rows themselves."""
+
+    usable = [
+        row
+        for row in (rows or [])
+        if isinstance(row, dict) and row.get("mean") is not None and row.get("observations")
+    ]
+    if len(usable) < 2:
+        return None
+    total = sum(int(row["observations"]) for row in usable)
+    grand_mean = sum(float(row["mean"]) * int(row["observations"]) for row in usable) / total
+    between = sum(int(row["observations"]) * (float(row["mean"]) - grand_mean) ** 2 for row in usable)
+    within = sum(
+        max(int(row["observations"]) - 1, 0) * float(row["std"]) ** 2
+        for row in usable
+        if row.get("std") is not None
+    )
+    spread = between + within
+    return between / spread if spread > 0 else None
+
+
+def _truncated_lag_scans(relationships: dict[str, Any]) -> tuple[list[str], int | None]:
+    """Find variables whose lag scan ran past the point where pairs remain, and the last usable lag."""
+
+    truncated: list[str] = []
+    usable_ceiling: int | None = None
+    for name, result in relationships.items():
+        profile = result.get("lag_profile") or []
+        usable = [int(row["lag"]) for row in profile if row.get("correlation") is not None]
+        starved = [row for row in profile if row.get("correlation") is None]
+        if not usable or not starved:
+            continue
+        truncated.append(name)
+        ceiling = max(usable)
+        usable_ceiling = ceiling if usable_ceiling is None else min(usable_ceiling, ceiling)
+    return truncated, usable_ceiling
+
+
+def _variables_without_relationship_evidence(relationships: dict[str, Any]) -> list[str]:
+    """Find selected variables that produced no usable correlation at any lag."""
+
+    empty: list[str] = []
+    for name, result in relationships.items():
+        contemporaneous = result.get("contemporaneous") or {}
+        if any(item.get("correlation") is not None for item in contemporaneous.values()):
+            continue
+        profile = result.get("lag_profile") or []
+        if any(row.get("correlation") is not None for row in profile):
+            continue
+        if not contemporaneous and not profile:
+            continue
+        empty.append(name)
+    return empty
+
+
+DISTRIBUTION_SKEW_THRESHOLD = 0.5
+"""Absolute skewness above which a price distribution is meaningfully asymmetric."""
+
+DISTRIBUTION_KURTOSIS_THRESHOLD = 1.0
+"""Excess kurtosis above which the tails are heavier than a normal reference."""
+
+VOLATILITY_REGIME_RATIO = 2.0
+"""Ratio between the widest and narrowest rolling window that marks a volatility regime."""
+
+MINIMUM_DRIVER_COVERAGE = 0.9
+"""Coverage below which a driver cannot carry its share of a relationship analysis."""
+
+
+def _drifting_variables(series: dict[str, Any]) -> list[str] | None:
+    """Return drivers whose whole-sample drift exceeds one of their own standard deviations."""
+
+    drifting: list[str] = []
+    judged = False
+    for name, item in series.items():
+        slope = item.get("trend_slope_per_interval")
+        observations = item.get("observations")
+        dispersion = item.get("std")
+        if slope is None or not observations or not dispersion:
+            continue
+        judged = True
+        if abs(float(slope)) * int(observations) >= float(dispersion):
+            drifting.append(name)
+    return drifting if judged else None
+
+
+def _is_monotonic(rows: list[dict[str, Any]]) -> bool:
+    """Check whether bucketed target means move in one direction across feature quartiles."""
+
+    means = [row["target_mean"] for row in rows if row.get("target_mean") is not None]
+    if len(means) < 3:
+        return True
+    steps = list(itertools.pairwise(means))
+    ascending = all(later >= earlier for earlier, later in steps)
+    descending = all(later <= earlier for earlier, later in steps)
+    return ascending or descending
+
+
 def _missing_scope(
-    required_tools: tuple[str, ...],
-    enabled_tools: set[str],
+    required_functions: tuple[str, ...],
+    enabled_functions: set[str],
     *,
     approval_message: str,
     data_message: str,
 ) -> tuple[AgendaScope, str]:
-    if not any(tool in enabled_tools for tool in required_tools):
+    if not any(name in enabled_functions for name in required_functions):
         return "needs_approval", approval_message
     return "needs_data", data_message
 
 
 def _grouped_relationship_assessment(
     relationships: dict[str, Any],
-    enabled_tools: set[str],
+    enabled_functions: set[str],
     *,
     group_key: str,
     item_id: str,
@@ -73,7 +179,7 @@ def _grouped_relationship_assessment(
     if not spreads:
         scope, remediation = _missing_scope(
             (function_name,),
-            enabled_tools,
+            enabled_functions,
             approval_message=f"需要批准加入分{label}关系函数后才能验证该假设。",
             data_message=f"已启用分{label}关系函数，但分组样本不足以形成可比证据。",
         )
@@ -89,20 +195,45 @@ def _grouped_relationship_assessment(
     )
 
 
+def _driver_stationarity_assessment(
+    exogenous: dict[str, Any],
+    enabled_functions: set[str],
+) -> tuple[str, str, str, AgendaScope, str | None]:
+    """Judge driver stationarity from the drivers' own tests, never from the target's."""
+
+    driver_stationarity = exogenous.get("driver_stationarity")
+    if not driver_stationarity:
+        scope, remediation = _missing_scope(
+            ("exogenous_stationarity_tests",),
+            enabled_functions,
+            approval_message="需要批准加入驱动平稳性检验后才能验证该假设。",
+            data_message="已启用驱动平稳性检验，但有效样本不足。",
+        )
+        return "exogenous.stationarity", "not_tested", "本轮未执行驱动平稳性检验。", scope, remediation
+    non_stationary = driver_stationarity.get("non_stationary_variables") or []
+    status = "candidate_support" if non_stationary else "not_supported"
+    return (
+        "exogenous.stationarity",
+        status,
+        f"{len(non_stationary)} 个驱动变量被判定为非平稳。",
+        "inherent",
+        None,
+    )
+
 def _advanced_assessment(
     hypothesis: str,
     *,
     price: dict[str, Any],
     exogenous: dict[str, Any],
     relationships: dict[str, Any],
-    enabled_tools: set[str],
+    enabled_functions: set[str],
 ) -> tuple[str, str, str, AgendaScope, str | None] | None:
     """Assess hypotheses generated by the structural, driver, and dependence functions."""
 
     if _contains_any(hypothesis, ("关系可能存在时段差异", "分小时关系")):
         return _grouped_relationship_assessment(
             relationships,
-            enabled_tools,
+            enabled_functions,
             group_key="by_hour",
             item_id="relationships.by_hour",
             function_name="relationship_pearson_by_hour",
@@ -111,39 +242,169 @@ def _advanced_assessment(
     if _contains_any(hypothesis, ("关系可能存在月份结构", "分月份关系")):
         return _grouped_relationship_assessment(
             relationships,
-            enabled_tools,
+            enabled_functions,
             group_key="by_month",
             item_id="relationships.by_month",
             function_name="relationship_pearson_by_month",
             label="月份",
         )
+    if _contains_any(hypothesis, ("偏斜", "分布形态", "偏度", "峰度")):
+        distribution = price.get("distribution")
+        if not distribution:
+            scope, remediation = _missing_scope(
+                ("price_descriptive_distribution",),
+                enabled_functions,
+                approval_message="需要批准加入电价分布画像后才能验证该假设。",
+                data_message="已启用电价分布画像，但当前没有可用分布证据。",
+            )
+            return "price.distribution", "not_tested", "本轮未执行电价分布画像。", scope, remediation
+        skewness = distribution.get("skewness")
+        kurtosis = distribution.get("kurtosis")
+        skewed = skewness is not None and abs(float(skewness)) >= DISTRIBUTION_SKEW_THRESHOLD
+        heavy = kurtosis is not None and float(kurtosis) >= DISTRIBUTION_KURTOSIS_THRESHOLD
+        return (
+            "price.distribution",
+            "candidate_support" if skewed or heavy else "not_supported",
+            f"偏度为 {_fmt(skewness)}，超额峰度为 {_fmt(kurtosis)}。",
+            "inherent",
+            None,
+        )
+    if _contains_any(hypothesis, ("波动可能分阶段", "波动聚集", "方差随时间", "波动状态")):
+        volatility = price.get("volatility")
+        rolling = price.get("rolling_statistics") or {}
+        one_day = rolling.get("one_day") or {}
+        if not volatility or one_day.get("maximum_std") is None:
+            scope, remediation = _missing_scope(
+                ("price_rolling_mean_std",),
+                enabled_functions,
+                approval_message="需要批准加入电价滚动波动函数后才能验证该假设。",
+                data_message="已启用滚动波动函数，但可用滚动窗口不足。",
+            )
+            return "price.volatility", "not_tested", "本轮未执行电价滚动波动分析。", scope, remediation
+        lowest = one_day.get("minimum_std")
+        if not lowest:
+            return (
+                "price.volatility",
+                "inconclusive",
+                "滚动窗口未给出可比较的最低波动水平。",
+                "needs_data",
+                "需要更长或缺口更少的目标序列才能比较波动状态。",
+            )
+        ratio = float(one_day["maximum_std"]) / float(lowest)
+        return (
+            "price.volatility",
+            "candidate_support" if ratio >= VOLATILITY_REGIME_RATIO else "not_supported",
+            f"一天窗口内最高与最低滚动标准差之比为 {ratio:.2f}。",
+            "inherent",
+            None,
+        )
+    if _contains_any(hypothesis, ("覆盖率可能不足", "变量覆盖", "样本覆盖")):
+        profiles = exogenous.get("series") or {}
+        if not profiles:
+            scope, remediation = _missing_scope(
+                ("exogenous_descriptive_distribution",),
+                enabled_functions,
+                approval_message="需要批准加入影响因素分布画像后才能验证该假设。",
+                data_message="已启用影响因素分布画像，但当前没有可用画像证据。",
+            )
+            return "exogenous.coverage", "not_tested", "本轮未执行影响因素分布画像。", scope, remediation
+        sparse = [
+            name
+            for name, item in profiles.items()
+            if item.get("coverage_rate") is not None
+            and float(item["coverage_rate"]) < MINIMUM_DRIVER_COVERAGE
+        ]
+        return (
+            "exogenous.coverage",
+            "candidate_support" if sparse else "not_supported",
+            (
+                f"{'、'.join(sparse)} 的覆盖率低于 {MINIMUM_DRIVER_COVERAGE:.0%}。"
+                if sparse
+                else f"全部 {len(profiles)} 个变量的覆盖率都不低于 {MINIMUM_DRIVER_COVERAGE:.0%}。"
+            ),
+            "inherent",
+            None,
+        )
+    if _contains_any(hypothesis, ("长期漂移", "变量趋势", "驱动漂移")):
+        trends = exogenous.get("series") or {}
+        drifting = _drifting_variables(trends)
+        if drifting is None:
+            scope, remediation = _missing_scope(
+                ("exogenous_linear_index_trend", "exogenous_descriptive_distribution"),
+                enabled_functions,
+                approval_message="需要批准加入影响因素漂移与分布画像后才能验证该假设。",
+                data_message="已启用漂移分析，但缺少判断漂移量级所需的离散程度。",
+            )
+            return "exogenous.trend", "not_tested", "本轮没有可判断漂移量级的证据。", scope, remediation
+        return (
+            "exogenous.trend",
+            "candidate_support" if drifting else "not_supported",
+            (
+                f"{'、'.join(drifting)} 的全期漂移超过自身一个标准差。"
+                if drifting
+                else "各变量的全期漂移都在自身一个标准差以内。"
+            ),
+            "inherent",
+            None,
+        )
+    if _contains_any(hypothesis, ("响应可能不是单调", "分位响应", "响应形状")):
+        responses = {
+            name: result["feature_quantile_response"]
+            for name, result in relationships.get("series", {}).items()
+            if result.get("feature_quantile_response")
+        }
+        if not responses:
+            scope, remediation = _missing_scope(
+                ("relationship_feature_quartile_response",),
+                enabled_functions,
+                approval_message="需要批准加入分位响应函数后才能验证该假设。",
+                data_message="已启用分位响应函数，但分位样本不足以形成响应曲线。",
+            )
+            return "relationships.quantile_response", "not_tested", "本轮没有可用分位响应证据。", scope, remediation
+        non_monotonic = [name for name, rows in responses.items() if not _is_monotonic(rows)]
+        return (
+            "relationships.quantile_response",
+            "candidate_support" if non_monotonic else "not_supported",
+            (
+                f"{'、'.join(non_monotonic)} 的分位响应不是单调的。"
+                if non_monotonic
+                else f"全部 {len(responses)} 个变量的分位响应保持单调。"
+            ),
+            "inherent",
+            None,
+        )
+    if _contains_any(hypothesis, ("自身非平稳", "驱动非平稳", "共同趋势")):
+        return _driver_stationarity_assessment(exogenous, enabled_functions)
     if _contains_any(hypothesis, ("平稳", "差分", "去趋势", "单位根", "稳定水平")):
         stationarity = price.get("stationarity")
         if not stationarity:
             scope, remediation = _missing_scope(
                 ("price_stationarity_tests",),
-                enabled_tools,
+                enabled_functions,
                 approval_message="需要批准加入电价平稳性检验后才能验证该假设。",
                 data_message="已启用平稳性检验，但有效样本不足以完成 ADF/KPSS。",
             )
             return "price.stationarity", "not_tested", "本轮未执行平稳性检验。", scope, remediation
         verdict = str(stationarity.get("verdict", "inconclusive"))
         status = "candidate_support" if verdict in {"unit_root", "trend_or_break_suspected"} else "not_supported"
+        scope = "inherent"
+        remediation = None
         if verdict == "inconclusive":
-            status = "inconclusive"
+            status, scope = "inconclusive", "needs_data"
+            remediation = "ADF 与 KPSS 均未给出明确结论，需要更长样本或噪声更低的目标序列后重新检验。"
         return (
             "price.stationarity",
             status,
             f"ADF/KPSS 结论为 {verdict}，建议变换：{stationarity.get('recommended_transform')}。",
-            "inherent",
-            None,
+            scope,
+            remediation,
         )
     if _contains_any(hypothesis, ("季节成分", "趋势成分", "成分分解", "残差占比")):
         decomposition = price.get("decomposition")
         if not decomposition:
             scope, remediation = _missing_scope(
                 ("price_seasonal_decomposition",),
-                enabled_tools,
+                enabled_functions,
                 approval_message="需要批准加入趋势季节分解后才能验证该假设。",
                 data_message="已启用趋势季节分解，但样本不足两个完整日周期。",
             )
@@ -166,7 +427,7 @@ def _advanced_assessment(
         if not memory:
             scope, remediation = _missing_scope(
                 ("price_partial_autocorrelation",),
-                enabled_tools,
+                enabled_functions,
                 approval_message="需要批准加入偏自相关分析后才能验证该假设。",
                 data_message="已启用偏自相关分析，但有效样本不足。",
             )
@@ -185,7 +446,7 @@ def _advanced_assessment(
         if not regime:
             scope, remediation = _missing_scope(
                 ("price_spike_regime_profile",),
-                enabled_tools,
+                enabled_functions,
                 approval_message="需要批准加入尖峰状态画像后才能验证该假设。",
                 data_message="已启用尖峰状态画像，但当前没有可用状态证据。",
             )
@@ -207,7 +468,7 @@ def _advanced_assessment(
         if not curve:
             scope, remediation = _missing_scope(
                 ("price_duration_curve",),
-                enabled_tools,
+                enabled_functions,
                 approval_message="需要批准加入电价持续曲线后才能验证该假设。",
                 data_message="已启用电价持续曲线，但当前没有可用证据。",
             )
@@ -229,7 +490,7 @@ def _advanced_assessment(
         if not stabilization:
             scope, remediation = _missing_scope(
                 ("price_variance_stabilization_check",),
-                enabled_tools,
+                enabled_functions,
                 approval_message="需要批准加入方差稳定检查后才能验证该假设。",
                 data_message="已启用方差稳定检查，但当前没有可用证据。",
             )
@@ -252,7 +513,7 @@ def _advanced_assessment(
         if not baselines:
             scope, remediation = _missing_scope(
                 ("price_naive_baseline_benchmark",),
-                enabled_tools,
+                enabled_functions,
                 approval_message="需要批准加入朴素基线基准后才能验证该假设。",
                 data_message="已启用朴素基线基准，但有效样本不足。",
             )
@@ -269,7 +530,7 @@ def _advanced_assessment(
         if not multicollinearity:
             scope, remediation = _missing_scope(
                 ("exogenous_variance_inflation",),
-                enabled_tools,
+                enabled_functions,
                 approval_message="需要批准加入 VIF 共线性分析后才能验证该假设。",
                 data_message="已启用 VIF 共线性分析，但完整样本不足。",
             )
@@ -284,31 +545,12 @@ def _advanced_assessment(
             "inherent",
             None,
         )
-    if _contains_any(hypothesis, ("驱动变量可能自身非平稳", "共同趋势", "驱动非平稳")):
-        driver_stationarity = exogenous.get("driver_stationarity")
-        if not driver_stationarity:
-            scope, remediation = _missing_scope(
-                ("exogenous_stationarity_tests",),
-                enabled_tools,
-                approval_message="需要批准加入驱动平稳性检验后才能验证该假设。",
-                data_message="已启用驱动平稳性检验，但有效样本不足。",
-            )
-            return "exogenous.stationarity", "not_tested", "本轮未执行驱动平稳性检验。", scope, remediation
-        non_stationary = driver_stationarity.get("non_stationary_variables") or []
-        status = "candidate_support" if non_stationary else "not_supported"
-        return (
-            "exogenous.stationarity",
-            status,
-            f"{len(non_stationary)} 个驱动变量被判定为非平稳。",
-            "inherent",
-            None,
-        )
     if _contains_any(hypothesis, ("非线性依赖", "互信息")):
         information = relationships.get("mutual_information")
         if not information:
             scope, remediation = _missing_scope(
                 ("relationship_mutual_information_scan",),
-                enabled_tools,
+                enabled_functions,
                 approval_message="需要批准加入互信息扫描后才能验证该假设。",
                 data_message="已启用互信息扫描，但成对有效样本不足。",
             )
@@ -327,7 +569,7 @@ def _advanced_assessment(
         if not precedence:
             scope, remediation = _missing_scope(
                 ("relationship_granger_causality_scan",),
-                enabled_tools,
+                enabled_functions,
                 approval_message="需要批准加入前置性检验后才能验证该假设。",
                 data_message="已启用前置性检验，但样本不足以拟合受限与非受限回归。",
             )
@@ -346,7 +588,7 @@ def _advanced_assessment(
         if not stability:
             scope, remediation = _missing_scope(
                 ("relationship_rolling_correlation_stability",),
-                enabled_tools,
+                enabled_functions,
                 approval_message="需要批准加入关系稳定性分析后才能验证该假设。",
                 data_message="已启用关系稳定性分析，但可用滚动窗口不足。",
             )
@@ -369,7 +611,7 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
     exogenous = summary.get("exogenous", {})
     relationships = summary.get("relationships", {}).get("series", {})
     comparisons = summary.get("comparisons", {})
-    enabled_tools = {step.tool for step in plan.enabled_steps}
+    enabled_functions = {step.function for step in plan.enabled_steps}
     for hypothesis in plan.hypotheses:
         item_id = ""
         scope: AgendaScope = "inherent"
@@ -379,7 +621,7 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
             price=price,
             exogenous=exogenous,
             relationships=summary.get("relationships", {}),
-            enabled_tools=enabled_tools,
+            enabled_functions=enabled_functions,
         )
         if advanced is not None:
             item_id, status, evidence, scope, remediation = advanced
@@ -390,7 +632,7 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
                 status, evidence = "not_tested", "本轮未执行电价极端值方法。"
                 scope, remediation = _missing_scope(
                     ("price_tukey_outer_fence",),
-                    enabled_tools,
+                    enabled_functions,
                     approval_message="需要批准加入电价极端值函数后才能验证该假设。",
                     data_message="已启用电价极端值函数，但当前没有可用极端值证据。",
                 )
@@ -406,7 +648,7 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
                 status, evidence = "not_tested", "本轮没有可用自相关结果。"
                 scope, remediation = _missing_scope(
                     ("price_lag_autocorrelation",),
-                    enabled_tools,
+                    enabled_functions,
                     approval_message="需要批准加入电价自相关函数后才能验证该假设。",
                     data_message="已启用电价自相关函数，但当前有效样本不足以形成自相关证据。",
                 )
@@ -423,19 +665,42 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
                 status, evidence = "not_tested", "本轮未执行季节性方法。"
                 scope, remediation = _missing_scope(
                     ("price_calendar_group_profile",),
-                    enabled_tools,
+                    enabled_functions,
                     approval_message="需要批准加入日历分组函数后才能验证该假设。",
                     data_message="已启用日历分组函数，但当前没有足够季节分组证据。",
                 )
             else:
                 hour_means = [row.get("mean") for row in seasonality.get("hour_of_day", []) if row.get("mean") is not None]
                 spread = max(hour_means) - min(hour_means) if hour_means else None
-                status = "inconclusive"
-                evidence = (
-                    f"小时均值最大差为 {spread:.3f}，仍需季节显著性和跨时期稳定性检验。"
-                    if spread is not None
-                    else "季节分组样本不足。"
-                )
+                strengths = [
+                    value
+                    for value in ((price.get("decomposition") or {}).get("seasonal_strength") or {}).values()
+                    if value is not None
+                ]
+                spread_text = f"小时均值最大差为 {spread:.3f}；" if spread is not None else ""
+                shares = {
+                    label: share
+                    for label in ("hour_of_day", "day_of_week", "month")
+                    if (share := _group_variance_share(seasonality.get(label))) is not None
+                }
+                if strengths:
+                    strongest = max(strengths)
+                    status = "candidate_support" if strongest >= SEASONAL_STRENGTH_THRESHOLD else "not_supported"
+                    evidence = f"{spread_text}最强季节成分强度为 {strongest:.3f}。"
+                elif shares:
+                    label, widest = max(shares.items(), key=lambda item: item[1])
+                    status = (
+                        "candidate_support" if widest >= CALENDAR_EFFECT_THRESHOLD else "not_supported"
+                    )
+                    evidence = f"{spread_text}{label} 分组解释了 {widest:.1%} 的电价方差。"
+                else:
+                    status, evidence = "not_tested", "季节分组样本不足。"
+                    scope, remediation = _missing_scope(
+                        ("price_calendar_group_profile",),
+                        enabled_functions,
+                        approval_message="需要批准加入日历分组函数后才能验证该假设。",
+                        data_message="已启用日历分组函数，但当前分组样本不足。",
+                    )
         elif _contains_any(hypothesis, ("共线性", "变量冗余", "驱动冗余", "高度相关变量")):
             item_id = "exogenous.collinearity"
             pairs = exogenous.get("strong_collinearity_pairs")
@@ -443,7 +708,7 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
                 status, evidence = "not_tested", "本轮未执行共线性方法。"
                 scope, remediation = _missing_scope(
                     ("exogenous_pearson_collinearity",),
-                    enabled_tools,
+                    enabled_functions,
                     approval_message="需要批准加入外生变量共线性函数后才能验证该假设。",
                     data_message="已启用共线性函数，但当前没有可用变量冗余证据。",
                 )
@@ -460,12 +725,13 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
             if not tested:
                 scope, remediation = _missing_scope(
                     ("exogenous_iqr_outliers",),
-                    enabled_tools,
+                    enabled_functions,
                     approval_message="需要批准加入外生变量异常值函数后才能验证该假设。",
                     data_message="已启用变量异常值函数，但当前没有可用异常值证据。",
                 )
         elif _contains_any(hypothesis, ("同期线性", "同期关系", "同期相关", "线性关系", "单调关系")):
-            item_id = "relationships.contemporaneous"
+            monotonic = _contains_any(hypothesis, ("单调关系",))
+            item_id = "relationships.monotonic" if monotonic else "relationships.contemporaneous"
             coefficients = [
                 abs(float(metric["correlation"]))
                 for result in relationships.values()
@@ -477,7 +743,7 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
                 status, evidence = "not_tested", "本轮没有可用同期关系结果。"
                 scope, remediation = _missing_scope(
                     ("relationship_scipy_pearson_pairwise", "relationship_scipy_spearman_pairwise"),
-                    enabled_tools,
+                    enabled_functions,
                     approval_message="需要批准加入同期关系函数后才能验证该假设。",
                     data_message="已启用同期关系函数，但当前有效样本不足以形成同期关系证据。",
                 )
@@ -496,7 +762,7 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
                 status, evidence = "not_tested", "本轮没有可用滞后扫描结果。"
                 scope, remediation = _missing_scope(
                     ("relationship_pearson_positive_lead_scan",),
-                    enabled_tools,
+                    enabled_functions,
                     approval_message="需要批准加入领先滞后扫描函数后才能验证该假设。",
                     data_message="已启用领先滞后扫描函数，但当前没有足够关系证据。",
                 )
@@ -508,7 +774,7 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
             ("峰段", "谷段", "夏季", "冬季", "事件前", "事件后", "分段", "分段差异", "时段差异"),
         ):
             prefer_relationship = _contains_any(hypothesis, ("关系差异",))
-            item_id = "comparisons.segments"
+            item_id = "comparisons.relationship_segments" if prefer_relationship else "comparisons.price_segments"
             price_contrasts = [
                 row
                 for comparison in comparisons.get("price", {}).values()
@@ -543,13 +809,15 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
                 status, evidence = "not_tested", "本轮没有可比较的分段证据。"
                 scope, remediation = _missing_scope(
                     ("price_segment_distribution_comparison", "relationship_pearson_segment_comparison"),
-                    enabled_tools,
+                    enabled_functions,
                     approval_message="需要批准加入分段比较函数并明确分段定义后才能验证该假设。",
                     data_message="已启用分段比较函数，但当前分段样本不足或没有可比较证据。",
                 )
         else:
             item_id = f"hypothesis:{hashlib.sha256(hypothesis.encode('utf-8')).hexdigest()[:12]}"
             status, evidence = "not_tested", "假设措辞未匹配预定义的确定性验收规则，本轮未验证该假设。"
+            scope = "needs_restatement"
+            remediation = "请把该假设改写为可由已授权函数验证的表述，或明确确认不再追踪它。"
         assessments.append(
             HypothesisAssessment(
                 item_id=item_id,
@@ -609,7 +877,7 @@ def evaluate_agent_run(
             )
         )
 
-    uses_exogenous = any(step.enabled and TOOL_CATALOG[step.tool].uses_variables for step in plan.steps)
+    uses_exogenous = any(step.enabled and FUNCTION_CATALOG[step.function].uses_variables for step in plan.steps)
     in_scope_series = {summary["study"]["target"]}
     if uses_exogenous:
         in_scope_series.update(plan.selected_variables)
@@ -654,7 +922,7 @@ def evaluate_agent_run(
     missing_sections = sorted({
         section
         for step in plan.enabled_steps
-        if (section := TOOL_CATALOG[step.tool].result_key) != "data_quality" and section not in summary
+        if (section := FUNCTION_CATALOG[step.function].result_key) != "data_quality" and section not in summary
     })
     checks.append(
         EvaluationCheck(
@@ -834,6 +1102,37 @@ def evaluate_agent_run(
                 scope="inherent",
             )
         )
+        truncated, usable_ceiling = _truncated_lag_scans(relationships)
+        if truncated and usable_ceiling is not None:
+            checks.append(
+                EvaluationCheck(
+                    name="滞后扫描样本",
+                    status="warning",
+                    message=(
+                        f"{len(truncated)} 个变量的滞后扫描超出了成对样本能支撑的范围："
+                        f"{'、'.join(truncated[:4])}。"
+                    ),
+                    scope="within_envelope",
+                    remediation=f"把 max_lag 收缩到 {usable_ceiling} 个间隔后重新执行，不要新增函数或变量。",
+                )
+            )
+        without_evidence = _variables_without_relationship_evidence(relationships)
+        if without_evidence and len(without_evidence) < len(relationships):
+            checks.append(
+                EvaluationCheck(
+                    name="变量关系证据",
+                    status="warning",
+                    message=(
+                        f"{len(without_evidence)} 个变量在任何滞后上都没有形成可用关系证据："
+                        f"{'、'.join(without_evidence[:4])}。"
+                    ),
+                    scope="within_envelope",
+                    remediation=(
+                        f"从 selected_variables 中移除 {'、'.join(without_evidence)} 后重新执行，"
+                        "不要新增函数或变量。"
+                    ),
+                )
+            )
         relationship_methods = set(summary.get("relationships", {}).get("methods", []))
         if relationship_methods.intersection({"pearson", "spearman", "lag_scan"}):
             checks.append(
@@ -968,6 +1267,12 @@ def evaluate_agent_run(
         item.hypothesis for item in hypothesis_assessments
         if hypothesis_is_open(item) and item.scope == "needs_data"
     ]
+    needs_restatement_items = [
+        check.name for check in checks if check_is_open(check) and check.scope == "needs_restatement"
+    ] + [
+        item.hypothesis for item in hypothesis_assessments
+        if hypothesis_is_open(item) and item.scope == "needs_restatement"
+    ]
     resolved_hypotheses = sum(
         item.status in {"candidate_support", "not_supported"} for item in hypothesis_assessments
     )
@@ -989,13 +1294,28 @@ def evaluate_agent_run(
             parts.append(
                 f"{len(needs_data_items)} 项需要补充或修复数据：{'、'.join(needs_data_items[:3])}"
             )
+        if needs_restatement_items:
+            parts.append(
+                f"{len(needs_restatement_items)} 项假设无法用已授权函数验证，需要改写或确认不再追踪："
+                f"{'、'.join(needs_restatement_items[:3])}"
+            )
         decision_text = "；".join(parts) + "。"
     else:
         decision = "accept"
-        decision_text = (
-            f"本轮研究已收敛：{resolved_hypotheses} 条假设都得到了明确结论；"
-            "剩余内容属于方法本身的限制，已在下方逐条列出。"
-        )
+        unsettled = [
+            item for item in hypothesis_assessments if item.status in {"not_tested", "inconclusive"}
+        ]
+        total_hypotheses = len(hypothesis_assessments)
+        if unsettled:
+            decision_text = (
+                f"本轮计划内的分析已全部完成：{total_hypotheses} 条假设中 {resolved_hypotheses} 条得到明确结论，"
+                f"{len(unsettled)} 条受方法本身限制无法在本轮判定，已在下方逐条列出。"
+            )
+        else:
+            decision_text = (
+                f"本轮研究已收敛：{total_hypotheses} 条假设全部得到明确结论；"
+                "剩余内容属于方法本身的限制，已在下方逐条列出。"
+            )
 
     agenda_payload = [
         {
@@ -1023,6 +1343,7 @@ def evaluate_agent_run(
             "within_envelope": "在原审批范围内修订 variables 或收缩 max_lag。",
             "needs_approval": "请用户明确批准新增函数、变量或分段范围后开启新的研究 Episode。",
             "needs_data": "请补充或修复数据后重新开始研究。",
+            "needs_restatement": "请把该假设改写为可由已授权函数验证的表述，或确认不再追踪它。",
             "inherent": "作为方法论限制记录，不驱动自动修订。",
         }[scope]
 

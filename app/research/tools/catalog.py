@@ -46,7 +46,7 @@ ResearchStage = Literal[
     "forecast_readiness",
 ]
 
-FUNCTION_CATALOG_VERSION = "eda-functions-v4"
+FUNCTION_CATALOG_VERSION = "eda-functions-v5"
 
 STAGE_TITLES: dict[str, str] = {
     "data_readiness": "数据体检",
@@ -81,7 +81,7 @@ class ResearchFunctionSpec:
     planning_guidance: str = "每个计划最多调用一次。"
 
 
-TOOL_CATALOG: dict[str, ResearchFunctionSpec] = {
+FUNCTION_CATALOG: dict[str, ResearchFunctionSpec] = {
     "data_quality": ResearchFunctionSpec(
         key="data_quality",
         title="数据质量与时间对齐",
@@ -109,6 +109,7 @@ TOOL_CATALOG: dict[str, ResearchFunctionSpec] = {
         result_key="price",
         stage="target_structure",
         evidence_field="volatility",
+        version="1.1.0",
         answers="电价的波动是稳定的，还是分阶段忽大忽小。",
         batch_parameter="内置一天、七天窗口",
         planning_guidance="一次调用已返回一天和七天滚动窗口；不要按窗口重复调用。",
@@ -232,6 +233,7 @@ TOOL_CATALOG: dict[str, ResearchFunctionSpec] = {
         ),
         category="price",
         result_key="comparisons",
+        evidence_field="price",
         stage="target_structure",
         answers="峰段谷段、不同季节或事件前后的价格差异有多大。",
         uses_segments=True,
@@ -447,6 +449,7 @@ TOOL_CATALOG: dict[str, ResearchFunctionSpec] = {
         ),
         category="relationship",
         result_key="comparisons",
+        evidence_field="relationships",
         stage="relationship_evidence",
         answers="在你指定的几个时段里，同一个因素的影响差多少。",
         uses_variables=True,
@@ -498,28 +501,28 @@ FUNCTION_TO_ANALYSIS_METHOD: dict[str, str] = {
 }
 
 
-def tool_metadata() -> dict[str, tuple[str, str]]:
+def function_metadata() -> dict[str, tuple[str, str]]:
     """Compatibility name for callers that consume function title/description metadata."""
 
-    return {key: (spec.title, spec.description) for key, spec in TOOL_CATALOG.items()}
+    return {key: (spec.title, spec.description) for key, spec in FUNCTION_CATALOG.items()}
 
 
 def optional_function_names() -> tuple[str, ...]:
-    return tuple(name for name in TOOL_CATALOG if name != "data_quality")
+    return tuple(name for name in FUNCTION_CATALOG if name != "data_quality")
 
 
 def functions_using_variables() -> frozenset[str]:
-    return frozenset(name for name, spec in TOOL_CATALOG.items() if spec.uses_variables)
+    return frozenset(name for name, spec in FUNCTION_CATALOG.items() if spec.uses_variables)
 
 
 def functions_using_max_lag() -> frozenset[str]:
-    return frozenset(name for name, spec in TOOL_CATALOG.items() if spec.uses_max_lag)
+    return frozenset(name for name, spec in FUNCTION_CATALOG.items() if spec.uses_max_lag)
 
 
 def stage_of(function_name: str) -> ResearchStage:
     """Return the research stage a function belongs to, for grouping in UI and reports."""
 
-    spec = TOOL_CATALOG.get(function_name)
+    spec = FUNCTION_CATALOG.get(function_name)
     return spec.stage if spec is not None else "target_structure"
 
 
@@ -537,5 +540,5 @@ def expand_legacy_function_permissions(names: list[str]) -> list[str]:
         if category is None:
             expanded.append(name)
             continue
-        expanded.extend(function_name for function_name, spec in TOOL_CATALOG.items() if spec.category == category)
+        expanded.extend(function_name for function_name, spec in FUNCTION_CATALOG.items() if spec.category == category)
     return list(dict.fromkeys(expanded))

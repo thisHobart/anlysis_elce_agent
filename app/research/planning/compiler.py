@@ -12,9 +12,14 @@ from app.research.agent.schemas import EDAPlan, EDAPlanStep
 from app.research.planning.contracts import DraftStep, EDAPlanDraft
 from app.research.schemas.study import StudyConfig
 from app.research.skills.contracts import SkillDefinition
-from app.research.tools.catalog import TOOL_CATALOG
+from app.research.tools.catalog import FUNCTION_CATALOG
 
 FUNCTION_AGENDA_HYPOTHESES: dict[str, str] = {
+    "price_descriptive_distribution": "电价分布可能明显偏斜或存在厚尾。",
+    "price_rolling_mean_std": "电价波动可能分阶段变化，而不是全期稳定。",
+    "exogenous_descriptive_distribution": "所选外生变量的覆盖率可能不足以支撑关系分析。",
+    "exogenous_linear_index_trend": "部分外生变量可能存在长期漂移。",
+    "relationship_feature_quartile_response": "电价对变量水平的响应可能不是单调的。",
     "price_tukey_outer_fence": "电价可能存在尖峰或极端值。",
     "price_calendar_group_profile": "电价可能存在日内或季节结构。",
     "price_lag_autocorrelation": "电价可能存在自相关或持续性。",
@@ -81,7 +86,7 @@ def compile_function_parameters(
 ) -> dict[str, Any]:
     """Fill trusted arguments and reject parameters unrelated to one atomic function."""
 
-    spec = TOOL_CATALOG[function_name]
+    spec = FUNCTION_CATALOG[function_name]
     supplied = dict(parameters)
     compiled: dict[str, Any] = {}
 
@@ -142,9 +147,9 @@ def compile_function_step(
     selected_variables: list[str],
     config: StudyConfig,
 ) -> EDAPlanStep:
-    catalog = TOOL_CATALOG[draft.tool]
+    catalog = FUNCTION_CATALOG[draft.function]
     parameters = compile_function_parameters(
-        draft.tool,
+        draft.function,
         draft.parameters,
         selected_variables=selected_variables,
         config=config,
@@ -152,13 +157,13 @@ def compile_function_step(
     )
     return EDAPlanStep(
         step_id=f"S{number}",
-        tool=draft.tool,
+        function=draft.function,
         title=catalog.title,
         description=catalog.description,
         rationale=draft.rationale,
         enabled=draft.enabled,
         parameters=parameters,
-        tool_version=catalog.version,
+        function_version=catalog.version,
     )
 
 
@@ -180,15 +185,15 @@ class EDAPlanCompiler:
         if unknown_variables:
             raise ResearchPlanValidationError(f"大模型选择了未知变量：{', '.join(unknown_variables)}")
         selected = list(dict.fromkeys(draft.selected_variables))
-        functions = [step.tool for step in draft.steps]
+        functions = [step.function for step in draft.steps]
         if "data_quality" in functions:
             raise ResearchPlanValidationError("data_quality 由编译器添加，模型不应直接选择")
-        disallowed = sorted(set(functions).difference(skill.allowed_tools))
+        disallowed = sorted(set(functions).difference(skill.allowed_functions))
         if disallowed:
             raise ResearchPlanValidationError(f"Skill {skill.name} 未授权函数：{', '.join(disallowed)}")
         if len(functions) != len(set(functions)):
             duplicate = next(name for name in functions if functions.count(name) > 1)
-            spec = TOOL_CATALOG[duplicate]
+            spec = FUNCTION_CATALOG[duplicate]
             recommendation = spec.planning_guidance
             if spec.uses_max_lag:
                 recommendation = "请合并为一次调用，并用最大的 max_lag 覆盖完整滞后范围。"
@@ -198,20 +203,20 @@ class EDAPlanCompiler:
                 recommendation = "请合并为一次调用，并在 variables 中列出全部变量。"
             raise DuplicateResearchFunctionError(duplicate, recommendation)
         ordered_names = skill.order_function_names(functions)
-        draft_by_function = {step.tool: step for step in draft.steps}
+        draft_by_function = {step.function: step for step in draft.steps}
         ordered_draft_steps = [draft_by_function[name] for name in ordered_names]
 
-        quality_catalog = TOOL_CATALOG["data_quality"]
+        quality_catalog = FUNCTION_CATALOG["data_quality"]
         steps = [
             EDAPlanStep(
                 step_id="S1",
-                tool="data_quality",
+                function="data_quality",
                 title=quality_catalog.title,
                 description=quality_catalog.description,
                 rationale="任何研究结论都必须先通过确定性数据质量和时间对齐门禁。",
                 enabled=True,
                 required=True,
-                tool_version=quality_catalog.version,
+                function_version=quality_catalog.version,
             )
         ]
         steps.extend(

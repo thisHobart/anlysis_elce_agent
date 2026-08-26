@@ -11,7 +11,7 @@ from app.research.data.quality import build_quality_report
 from app.research.data.snapshot import input_file_manifest, study_fingerprint
 from app.research.reporting.artifacts import write_research_package
 from app.research.schemas.results import PipelineRunResult
-from app.research.schemas.study import StudyConfig, load_study_config
+from app.research.schemas.study import StudyConfig
 from app.research.tools.eda.exogenous import analyze_exogenous
 from app.research.tools.eda.price import analyze_price
 from app.research.tools.eda.relationships import analyze_relationships
@@ -70,14 +70,14 @@ def _build_summary(config: StudyConfig, aligned_frame) -> dict[str, Any]:
 
 
 def run_eda_pipeline(
-    config: StudyConfig | str | Path,
+    config: StudyConfig,
     *,
     output_directory: str | Path | None = None,
     run_id: str | None = None,
 ) -> PipelineRunResult:
     """Execute ingestion, alignment, checks, EDA, and artifact generation."""
 
-    resolved_config = load_study_config(config) if isinstance(config, (str, Path)) else config
+    resolved_config = config
     if output_directory is not None:
         output_path = Path(output_directory).resolve()
         resolved_config = resolved_config.model_copy(

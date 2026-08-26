@@ -20,7 +20,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from app.research.tools.catalog import STAGE_TITLES, TOOL_CATALOG
+from app.research.tools.catalog import FUNCTION_CATALOG, STAGE_TITLES
 
 STAGE_LABELS: dict[str, str] = {
     "setup": "准备",
@@ -125,7 +125,7 @@ def _duration(details: dict[str, Any]) -> str:
 def _method(function_name: str | None) -> str:
     """Return the registered technical description of one research function."""
 
-    spec = TOOL_CATALOG.get(function_name or "")
+    spec = FUNCTION_CATALOG.get(function_name or "")
     return spec.description.rstrip("。") if spec is not None else ""
 
 
@@ -134,7 +134,7 @@ def _queue_composition(functions: list[Any], total: Any) -> str:
 
     grouped: dict[str, int] = {}
     for function_name in functions:
-        spec = TOOL_CATALOG.get(str(function_name))
+        spec = FUNCTION_CATALOG.get(str(function_name))
         if spec is None:
             continue
         label = STAGE_TITLES.get(spec.stage, spec.stage)

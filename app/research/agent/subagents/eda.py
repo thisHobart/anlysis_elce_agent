@@ -7,9 +7,15 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from app.config import Settings
+from app.config import Settings, get_settings
 from app.llm.factory import build_model_gateway
-from app.llm.gateway import ModelConfigurationError, ModelGateway, ModelGatewayError, ModelResponseError
+from app.llm.gateway import (
+    ModelConfigurationError,
+    ModelGateway,
+    ModelGatewayError,
+    ModelResponseError,
+    ModelToolCall,
+)
 from app.research.agent.errors import ResearchModelUnavailableError, ResearchPlanValidationError
 from app.research.agent.schemas import EDAPlan
 from app.research.planning.compiler import EDAPlanCompiler, max_lag_limit
@@ -18,12 +24,49 @@ from app.research.schemas.feedback import FeedbackPacket
 from app.research.schemas.results import DataQualityReport
 from app.research.schemas.study import StudyConfig
 from app.research.skills.contracts import SkillDefinition
-from app.research.tools.catalog import TOOL_CATALOG, optional_function_names, tool_metadata
+from app.research.tools.catalog import FUNCTION_CATALOG, function_metadata, optional_function_names
 from app.research.tools.eda.functions import build_eda_tool_registry
 from app.research.tools.registry import ToolRegistry
 
-PLANNING_PROMPT_VERSION = "eda-plan-v9"
-TOOL_METADATA = tool_metadata()
+PLANNING_PROMPT_VERSION = "eda-plan-v10"
+
+AGENDA_FUNCTION_NAME = "declare_research_agenda"
+"""Planning-protocol call that carries the agenda; never registered, never executed."""
+
+AGENDA_FUNCTION_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": AGENDA_FUNCTION_NAME,
+        "description": (
+            "声明本轮研究议程。必须调用一次，与分析函数在同一次回复中一起返回。"
+            "这个调用不执行任何计算，只记录本轮要判定什么、要验证哪些假设。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "objective": {
+                    "type": "string",
+                    "description": "本轮研究要判定的问题，一句话，不要复述用户原话。",
+                },
+                "hypotheses": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "本轮要验证的假设。每条都必须能被同一次回复中选择的分析函数验证；"
+                        "无法验证的猜想不要写进来。"
+                    ),
+                },
+                "assumptions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "本轮依赖的前提，例如时区、市场产品或变量可获得性。",
+                },
+            },
+            "required": ["objective"],
+        },
+    },
+}
+FUNCTION_METADATA = function_metadata()
 OPTIONAL_FUNCTIONS = optional_function_names()
 
 PLANNING_SYSTEM_PROMPT = """你负责一个离线、只读的电价与外生变量探索性数据分析规划任务。
@@ -34,16 +77,39 @@ PLANNING_SYSTEM_PROMPT = """你负责一个离线、只读的电价与外生变�
 - 你只是受限函数选择器，不自行设计通用推理步骤；严格服从 active_skill.research_protocol 的阶段、函数规则和停止条件。
 - 每个函数名只对应一种确定性统计过程；只调用当前提供的函数，不生成 methods 参数。
 - 每个研究函数在一个计划中最多调用一次。多变量合并到 variables，多滞后用一个最大 max_lag，峰谷、季节或事件前后对比合并到一个 segments 集合。
-- segments 中的小时、月份和时间边界必须来自用户或研究配置的明确值；不得自行猜测市场峰谷时段、季节定义或政策事件日期。
+- segments 中的小时、月份和时间边界必须由用户明确给出；不得自行猜测市场峰谷时段、季节定义或政策事件日期。
 - 外生变量参数使用 variables 中的精确名称；目标序列是单独的 target，不放入 variables。
 - data_quality 由方案编译器作为必需步骤加入，不由模型调用。
 - 方案阶段只描述将要运行的本地确定性分析；统计量由工具生成，当前回复不做计算或因果判断。
+- 每次回复必须调用一次 declare_research_agenda，声明本轮目标、假设和前提；它不执行计算，只记录议程。
+- declare_research_agenda 中的每条假设都必须能被同一次回复选择的分析函数验证；写不出对应函数的猜想不要列入。
 - 只记录上下文能够支持的假设、限制和可获得性说明。
+- 只需要判断数据能不能用时，可以只调用 declare_research_agenda，不选任何分析函数；编译器会生成仅含数据体检的最小方案。
 - 优先选择最小函数集合；不要因为函数可用就全部调用。
 - 如果 revision_context 存在，必须把 current_plan 作为修订基线；只调整 allowed_changes 中允许的字段，其他字段保持不变。
 - 自动修订不得改变研究问题、Skill、数据指纹、分段定义或审批范围；无法在边界内修复时返回原方案边界内的最小变更。
 
-输出：只通过 Function Calling 返回一个或多个具体研究函数调用，不输出推理文本；程序只把调用编译为候选计划，不会立即执行。"""
+输出：只通过 Function Calling 返回 declare_research_agenda 以及本轮选择的研究函数调用，不输出推理文本；程序只把调用编译为候选计划，不会立即执行。"""
+
+
+def _agenda_text(agenda: ModelToolCall | None, field: str) -> str:
+    """Read one string field from the agenda call, tolerating a model that skipped it."""
+
+    if agenda is None:
+        return ""
+    value = agenda.arguments.get(field)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _agenda_list(agenda: ModelToolCall | None, field: str) -> list[str]:
+    """Read one string list from the agenda call, dropping blanks and duplicates."""
+
+    if agenda is None:
+        return []
+    values = agenda.arguments.get(field)
+    if not isinstance(values, list):
+        return []
+    return list(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
 
 
 class ModelEDAPlanner:
@@ -58,6 +124,7 @@ class ModelEDAPlanner:
     ) -> None:
         self.gateway = gateway or build_model_gateway(settings)
         self.tools = tools or build_eda_tool_registry()
+        self.history_messages = (settings or get_settings()).llm_history_messages
 
     @property
     def enabled(self) -> bool:
@@ -92,7 +159,7 @@ class ModelEDAPlanner:
         ]
         allowed_functions = [
             name
-            for name in (skill.allowed_tools if skill is not None else OPTIONAL_FUNCTIONS)
+            for name in (skill.allowed_functions if skill is not None else OPTIONAL_FUNCTIONS)
             if name != "data_quality"
         ]
         function_schemas = self.tools.function_schemas(allowed_functions)
@@ -108,7 +175,7 @@ class ModelEDAPlanner:
             "prompt_version": PLANNING_PROMPT_VERSION,
             "task_scope": "离线本地文件上的描述性 EDA；工具读取研究数据并返回结构化证据。",
             "question": question,
-            "conversation_history": (history or [])[-12:],
+            "conversation_history": (history or [])[-self.history_messages :],
             "active_skill": skill.prompt_context() if skill is not None else None,
             "validation_feedback": [item.model_dump(mode="json") for item in (feedback or [])],
             "revision_context": revision_context,
@@ -124,13 +191,13 @@ class ModelEDAPlanner:
             "quality_issues": [issue.model_dump(mode="json") for issue in quality.issues],
             "allowed_functions": {
                 function_name: {
-                    "display_name": TOOL_CATALOG[function_name].title,
-                    "description": TOOL_METADATA[function_name][1],
-                    "version": TOOL_CATALOG[function_name].version,
-                    "result_section": TOOL_CATALOG[function_name].result_key,
-                    "max_calls_per_plan": TOOL_CATALOG[function_name].max_calls_per_plan,
-                    "batch_parameter": TOOL_CATALOG[function_name].batch_parameter,
-                    "planning_guidance": TOOL_CATALOG[function_name].planning_guidance,
+                    "display_name": FUNCTION_CATALOG[function_name].title,
+                    "description": FUNCTION_METADATA[function_name][1],
+                    "version": FUNCTION_CATALOG[function_name].version,
+                    "result_section": FUNCTION_CATALOG[function_name].result_key,
+                    "max_calls_per_plan": FUNCTION_CATALOG[function_name].max_calls_per_plan,
+                    "batch_parameter": FUNCTION_CATALOG[function_name].batch_parameter,
+                    "planning_guidance": FUNCTION_CATALOG[function_name].planning_guidance,
                 }
                 for function_name in allowed_functions
             },
@@ -144,6 +211,8 @@ class ModelEDAPlanner:
                 "target_field": "separate_from_exogenous_variables",
                 "trusted_arguments": "compiler_injects_thresholds_and_minimum_observations",
                 "function_cardinality": "each_function_at_most_once_per_plan",
+                "research_agenda": "declare_research_agenda_once_alongside_analysis_functions",
+                "minimum_plan": "declare_research_agenda_alone_yields_a_data_quality_only_plan",
             },
             "output_schema": EDAPlanDraft.model_json_schema(),
         }
@@ -154,28 +223,30 @@ class ModelEDAPlanner:
         try:
             invoke_calls = getattr(self.gateway, "invoke_tool_calls", None)
             if callable(invoke_calls) and function_schemas:
-                calls = invoke_calls(messages=messages, tools=function_schemas)
+                calls = invoke_calls(messages=messages, tools=[*function_schemas, AGENDA_FUNCTION_SCHEMA])
+                agenda = next((call for call in calls if call.name == AGENDA_FUNCTION_NAME), None)
+                analysis_calls = [call for call in calls if call.name != AGENDA_FUNCTION_NAME]
                 selected_set = {
                     str(name)
-                    for call in calls
+                    for call in analysis_calls
                     for name in call.arguments.get("variables", [])
                     if isinstance(name, str)
                 }
                 selected_variables = [spec.name for spec in config.exogenous if spec.name in selected_set]
                 return EDAPlanDraft(
-                    objective=question.strip(),
-                    hypotheses=[],
+                    objective=_agenda_text(agenda, "objective") or question.strip(),
+                    hypotheses=_agenda_list(agenda, "hypotheses"),
                     selected_variables=selected_variables,
                     steps=[
                         {
-                            "tool": call.name,
+                            "function": call.name,
                             "enabled": True,
-                            "rationale": TOOL_CATALOG[call.name].description,
+                            "rationale": FUNCTION_CATALOG[call.name].description,
                             "parameters": call.arguments,
                         }
-                        for call in calls
+                        for call in analysis_calls
                     ],
-                    assumptions=[],
+                    assumptions=_agenda_list(agenda, "assumptions"),
                 )
             return self.gateway.invoke_structured(messages=messages, schema=EDAPlanDraft)
         except KeyError as exc:

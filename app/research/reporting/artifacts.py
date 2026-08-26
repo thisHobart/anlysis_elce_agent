@@ -115,7 +115,7 @@ def write_research_package(
     directory.mkdir(parents=True, exist_ok=False)
     figure_paths = render_eda_charts(aligned_frame, config, summary, directory / "figures")
 
-    _write_json(directory / "study_config.json", config.model_dump(mode="json"))
+    _write_json(directory / "study_context.json", config.model_dump(mode="json"))
     _write_json(directory / "data_quality.json", quality.model_dump(mode="json"))
     _write_json(directory / "eda_summary.json", summary)
     aligned_frame.reset_index().to_parquet(directory / "aligned_data.parquet", index=False)
@@ -184,7 +184,7 @@ def write_agent_research_package(
     figures = build_report_figures(aligned_frame, config, summary)
     figure_paths = _write_figures(directory / "figures", figures)
 
-    _write_json(directory / "study_config.json", config.model_dump(mode="json"))
+    _write_json(directory / "study_context.json", config.model_dump(mode="json"))
     _write_json(directory / "conversation.json", [item.model_dump(mode="json") for item in conversation])
     _write_json(directory / "research_plan.json", plan.model_dump(mode="json"))
     _write_json(directory / "execution_trace.json", execution_trace)
@@ -245,8 +245,8 @@ def write_agent_research_package(
                 if plan.research_protocol_id
                 else None
             ),
-            "approved_functions": [step.tool for step in plan.enabled_steps],
-            "function_versions": {step.tool: step.tool_version for step in plan.enabled_steps},
+            "approved_functions": [step.function for step in plan.enabled_steps],
+            "function_versions": {step.function: step.function_version for step in plan.enabled_steps},
         },
         "research_loop": loop_context,
         "git": {"commit": commit, "dirty": dirty},

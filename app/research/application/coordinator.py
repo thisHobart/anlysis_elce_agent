@@ -39,7 +39,7 @@ from app.research.skills.registry import SkillRegistry
 from app.research.tools.eda.functions import build_eda_tool_registry
 from app.research.tools.registry import ToolRegistry
 
-GRAPH_SCHEMA_VERSION = 8
+GRAPH_SCHEMA_VERSION = 9
 
 
 class ResearchCoordinator:
@@ -143,8 +143,6 @@ class ResearchCoordinator:
             "study_config": study_config.model_dump(mode="json") if study_config is not None else None,
             "data_profile": None,
             "quality_report": None,
-            "data_fingerprint": None,
-            "available_skills": [],
             "active_skill": None,
             "decision": None,
             "current_plan": None,
@@ -162,7 +160,6 @@ class ResearchCoordinator:
             "tool_result_cache": {},
             "tool_results": [],
             "pending_tool_result": None,
-            "tool_outcome": "",
             "evaluation": None,
             "eda_summary": None,
             "feedback_packets": [],
@@ -436,7 +433,6 @@ class ResearchCoordinator:
                         config,
                         {
                             "tool_records": records,
-                            "tool_outcome": "run",
                         },
                         as_node="mark_tool_running",
                     )

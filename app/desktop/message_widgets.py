@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.research.agent.schemas import AgentRunResult, EDAPlan
-from app.research.tools.catalog import STAGE_TITLES, TOOL_CATALOG
+from app.research.tools.catalog import FUNCTION_CATALOG, STAGE_TITLES
 
 STATUS_MARK = {
     "running": "◐",
@@ -94,7 +94,8 @@ class ThinkingStepRow(QWidget):
         self.title_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         headline.addWidget(self.title_label, 1)
         text.addLayout(headline)
-        self.detail_label = QLabel(detail)
+        # Parented on construction: setVisible on a parentless widget would flash it as a window.
+        self.detail_label = QLabel(detail, self)
         self.detail_label.setObjectName("stepDetail")
         self.detail_label.setWordWrap(True)
         self.detail_label.setVisible(bool(detail))
@@ -344,13 +345,13 @@ class PlanMessageWidget(QFrame):
 
         grouped: dict[str, list[Any]] = {}
         for step in plan.enabled_steps:
-            grouped.setdefault(TOOL_CATALOG[step.tool].stage, []).append(step)
+            grouped.setdefault(FUNCTION_CATALOG[step.function].stage, []).append(step)
         for stage, steps in grouped.items():
             group = QLabel(STAGE_TITLES.get(stage, stage))
             group.setObjectName("planStage")
             layout.addWidget(group)
             for step in steps:
-                row = QLabel(f"· {step.title}｜{TOOL_CATALOG[step.tool].answers}")
+                row = QLabel(f"· {step.title}｜{FUNCTION_CATALOG[step.function].answers}")
                 row.setObjectName("planStep")
                 row.setWordWrap(True)
                 row.setToolTip(f"{step.description}\n选择理由：{step.rationale}")

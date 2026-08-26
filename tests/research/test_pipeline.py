@@ -10,14 +10,16 @@ import pandas as pd
 from PIL import Image
 
 from app.research.cli import main
+from app.research.schemas.study import load_study_config
 from app.research.tools.eda.pipeline import run_eda_pipeline
 
 
 def test_pipeline_writes_complete_reproducible_package(synthetic_study: Path):
-    first = run_eda_pipeline(synthetic_study, run_id="test-run-one")
-    second = run_eda_pipeline(synthetic_study, run_id="test-run-two")
+    config = load_study_config(synthetic_study)
+    first = run_eda_pipeline(config, run_id="test-run-one")
+    second = run_eda_pipeline(config, run_id="test-run-two")
     expected = {
-        "study_config.json",
+        "study_context.json",
         "data_quality.json",
         "eda_summary.json",
         "aligned_data.parquet",
@@ -44,7 +46,19 @@ def test_pipeline_writes_complete_reproducible_package(synthetic_study: Path):
 
 
 def test_cli_runs_with_one_command_contract(synthetic_study: Path, capsys):
-    exit_code = main(["--config", str(synthetic_study), "--run-id", "cli-run"])
+    config = load_study_config(synthetic_study)
+    exit_code = main(
+        [
+            "--target",
+            str(config.target.path),
+            "--actuals",
+            str(config.exogenous[0].path),
+            "--output",
+            str(config.analysis.output_directory),
+            "--run-id",
+            "cli-run",
+        ]
+    )
     captured = capsys.readouterr()
     response = json.loads(captured.out)
     assert exit_code == 0

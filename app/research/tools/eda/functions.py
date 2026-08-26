@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from app.research.tools.catalog import FUNCTION_TO_ANALYSIS_METHOD, TOOL_CATALOG
+from app.research.tools.catalog import FUNCTION_CATALOG, FUNCTION_TO_ANALYSIS_METHOD
 from app.research.tools.contracts import (
     DataQualityArguments,
     ExogenousOutlierArguments,
@@ -361,10 +361,10 @@ def build_eda_tool_registry() -> ToolRegistry:
         [
             ToolSpec(
                 name=name,
-                version=TOOL_CATALOG[name].version,
-                description=f"{TOOL_CATALOG[name].description} {TOOL_CATALOG[name].planning_guidance}",
-                display_name=TOOL_CATALOG[name].title,
-                result_key=TOOL_CATALOG[name].result_key,
+                version=FUNCTION_CATALOG[name].version,
+                description=f"{FUNCTION_CATALOG[name].description} {FUNCTION_CATALOG[name].planning_guidance}",
+                display_name=FUNCTION_CATALOG[name].title,
+                result_key=FUNCTION_CATALOG[name].result_key,
                 arguments_model=arguments_model,
                 handler=handler,
             )

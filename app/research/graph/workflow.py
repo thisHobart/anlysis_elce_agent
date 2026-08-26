@@ -46,7 +46,7 @@ from app.research.schemas.study import StudyConfig
 from app.research.skills.contracts import SkillDefinition
 from app.research.skills.loader import SkillLoadError
 from app.research.skills.registry import SkillRegistry
-from app.research.tools.catalog import FUNCTION_CATALOG_VERSION, TOOL_CATALOG
+from app.research.tools.catalog import FUNCTION_CATALOG, FUNCTION_CATALOG_VERSION
 from app.research.tools.contracts import ToolCall, ToolResult
 from app.research.tools.executor import ToolExecutionError
 from app.research.tools.policy import ToolPermissionError
@@ -71,7 +71,7 @@ def _short(value: Any, limit: int = 56) -> str:
 
 
 def _function_label(function_name: str) -> str:
-    spec = TOOL_CATALOG.get(function_name)
+    spec = FUNCTION_CATALOG.get(function_name)
     return f"{spec.title} [{function_name}]" if spec is not None else function_name
 
 
@@ -344,8 +344,8 @@ def build_research_workflow(
             skill = skills.get(decision.skill_name)
             if skill.domain != "eda":
                 raise SkillLoadError(f"当前循环不支持 {skill.domain} Skill：{skill.name}")
-            tools.function_schemas(skill.allowed_tools)
-            if "data_quality" not in skill.allowed_tools:
+            tools.function_schemas(skill.allowed_functions)
+            if "data_quality" not in skill.allowed_functions:
                 raise SkillLoadError(f"EDA Skill 必须授权 data_quality：{skill.name}")
         except Exception as exc:  # noqa: BLE001 - converted into structured loop feedback
             packet = exception_feedback(exc, source="skill_validator", requires_user=True)
@@ -442,7 +442,7 @@ def build_research_workflow(
                 f"生成修订方案：{revised.plan_id} · v{revised.revision}",
                 trace_category="plan",
                 revision=revised.revision,
-                functions=[step.tool for step in revised.enabled_steps],
+                functions=[step.function for step in revised.enabled_steps],
             ),
         }
 
@@ -566,7 +566,6 @@ def build_research_workflow(
             "current_plan": proposal.plan.model_dump(mode="json"),
             "data_profile": proposal.data_profile.model_dump(mode="json"),
             "quality_report": proposal.quality_report.model_dump(mode="json"),
-            "data_fingerprint": proposal.plan.data_fingerprint,
             "plan_history": [*state.get("plan_history", []), proposal.plan.model_dump(mode="json")],
             "plan_fingerprints": [*state.get("plan_fingerprints", []), fingerprint],
             "budget": budget.model_dump(mode="json"),
@@ -575,7 +574,7 @@ def build_research_workflow(
                 f"生成候选方案：{proposal.plan.plan_id} · {_short(proposal.plan.objective, 42)}",
                 trace_category="plan",
                 plan_id=proposal.plan.plan_id,
-                functions=[step.tool for step in proposal.plan.enabled_steps],
+                functions=[step.function for step in proposal.plan.enabled_steps],
             ),
         }
 
@@ -591,7 +590,7 @@ def build_research_workflow(
                 source="plan_validator",
                 code="missing_plan_or_config",
                 severity="fatal",
-                message="计划或研究配置缺失。",
+                message="计划或运行数据契约缺失。",
                 requires_user=True,
             )
             return {
@@ -664,7 +663,7 @@ def build_research_workflow(
                 state,
                 f"方案校验通过：{plan.plan_id}",
                 trace_category="plan",
-                functions=[step.tool for step in plan.enabled_steps],
+                functions=[step.function for step in plan.enabled_steps],
             ),
         }
 
@@ -706,7 +705,6 @@ def build_research_workflow(
             "tool_result_cache": {},
             "tool_results": [],
             "pending_tool_result": None,
-            "tool_outcome": "",
             "evaluation": None,
             "eda_summary": None,
             "feedback_packets": [],
@@ -877,7 +875,7 @@ def build_research_workflow(
                 )
             compiled_queue = execution.compile_tool_queue(plan)
             expected_calls = [
-                (step.step_id, step.tool, step.tool_version)
+                (step.step_id, step.function, step.function_version)
                 for step in plan.enabled_steps
             ]
             actual_calls = [
@@ -929,7 +927,6 @@ def build_research_workflow(
             "tool_records": records,
             "tool_results": [],
             "pending_tool_result": None,
-            "tool_outcome": "",
             "events": _event(
                 state,
                 f"锁定函数队列：{plan.plan_id} · {len(queue)} 个调用",
@@ -948,7 +945,6 @@ def build_research_workflow(
         queue = state.get("tool_queue", [])
         if cursor >= len(queue):
             return {
-                "tool_outcome": "done",
                 "control": "evaluate",
                 "phase": "evaluating",
                 "pending_tool_result": None,
@@ -979,7 +975,6 @@ def build_research_workflow(
             return {
                 "tool_records": records,
                 "tool_results": results,
-                "tool_outcome": "reused",
                 "control": "advance",
                 "pending_tool_result": None,
                 "events": _event(
@@ -999,7 +994,6 @@ def build_research_workflow(
             packet = budget_feedback(budget, code="tool_retry_budget", message=f"工具 {call.name} 重试耗尽。")
             return {
                 "phase": "awaiting_user",
-                "tool_outcome": "need_user",
                 "control": "need_user",
                 "feedback_packets": _append_feedback(state, packet),
                 "pending_tool_result": None,
@@ -1018,7 +1012,6 @@ def build_research_workflow(
         return {
             "tool_records": records,
             "budget": budget.model_dump(mode="json"),
-            "tool_outcome": "run",
             "control": "run",
             "loop_cursor": _cursor(state).model_copy(
                 update={
@@ -1050,7 +1043,6 @@ def build_research_workflow(
             )
             return {
                 "phase": "failed",
-                "tool_outcome": "fail",
                 "control": "fail",
                 "feedback_packets": _append_feedback(state, packet),
                 "stop_reason": packet.message,
@@ -1127,7 +1119,6 @@ def build_research_workflow(
                 "phase": "failed" if outcome == "fail" else state.get("phase", "executing_tools"),
                 "control": outcome,
                 "tool_records": records,
-                "tool_outcome": outcome,
                 "feedback_packets": _append_feedback(state, packet),
                 "pending_tool_result": None,
                 "stop_reason": packet.message if outcome in {"need_user", "fail"} else None,
@@ -1145,7 +1136,6 @@ def build_research_workflow(
         return {
             "phase": "validating_result",
             "control": "validate",
-            "tool_outcome": "validate",
             "pending_tool_result": result.model_dump(mode="json"),
             "events": _event(
                 state,
@@ -1153,7 +1143,7 @@ def build_research_workflow(
                 trace_category="tool",
                 call_id=call.call_id,
                 duration_ms=result.duration_ms,
-                tool=call.name,
+                function=call.name,
             ),
         }
 
@@ -1182,7 +1172,6 @@ def build_research_workflow(
             return {
                 "phase": "planning",
                 "control": "revise",
-                "tool_outcome": "revise",
                 "tool_records": records,
                 "pending_tool_result": None,
                 "feedback_packets": _append_feedback(state, packet),
@@ -1214,7 +1203,6 @@ def build_research_workflow(
             "tool_result_cache": result_cache,
             "tool_results": [*state.get("tool_results", []), result.model_dump(mode="json")],
             "pending_tool_result": None,
-            "tool_outcome": "advance",
             "events": _event(
                 state,
                 f"函数结果校验通过：{_function_label(call.name)}",
@@ -1234,7 +1222,6 @@ def build_research_workflow(
             )
             return {
                 "phase": "failed",
-                "tool_outcome": "fail",
                 "control": "fail",
                 "feedback_packets": _append_feedback(state, packet),
                 "pending_tool_result": None,
@@ -1250,7 +1237,6 @@ def build_research_workflow(
     def advance_tool(state: ResearchLoopState) -> dict[str, Any]:
         return {
             "tool_cursor": int(state.get("tool_cursor", 0)) + 1,
-            "tool_outcome": "",
             "pending_tool_result": None,
         }
 
@@ -1361,8 +1347,8 @@ def build_research_workflow(
                 }
             )
             return {
-                "phase": "failed",
-                "control": "failed",
+                "phase": "awaiting_user",
+                "control": "finalization_error",
                 "feedback_packets": _append_feedback(state, packet),
                 "stop_reason": packet.message,
                 "user_interrupt_kind": "finalization_error",
@@ -1377,7 +1363,9 @@ def build_research_workflow(
 
     def route_evaluation(
         state: ResearchLoopState,
-    ) -> Literal["accept", "revise", "need_user", "reject", "failed", "invalid"]:
+    ) -> Literal["accept", "revise", "need_user", "reject", "failed", "finalization_error", "invalid"]:
+        if state.get("control") == "finalization_error":
+            return "finalization_error"
         if state.get("control") == "failed":
             return "failed"
         decision = (state.get("evaluation") or {}).get("decision")
@@ -1791,7 +1779,6 @@ def build_research_workflow(
             return {
                 "phase": "evaluating",
                 "control": "retry_finalize",
-                "tool_outcome": "retry_finalize",
                 "stop_reason": None,
                 "user_interrupt_kind": None,
             }
@@ -1799,7 +1786,6 @@ def build_research_workflow(
             return {
                 "phase": "evaluating" if state.get("latest_run") else "understanding",
                 "control": "explain" if state.get("latest_run") else "continue",
-                "tool_outcome": "",
                 "stop_reason": None,
                 "user_interrupt_kind": None,
             }
@@ -1844,7 +1830,10 @@ def build_research_workflow(
                     ConversationMessage(role="user", content=message).model_dump(mode="json"),
                 ][-MAX_GRAPH_MESSAGES:],
             }
-        return {"phase": "stopped", "control": "stop", "stop_reason": "用户停止研究循环。"}
+        # Stopping out of an error interrupt must keep the cause in the terminal record.
+        cause = state.get("stop_reason") if interrupt_kind in {"response_error", "finalization_error"} else None
+        reason = f"用户停止研究循环；原因：{cause}" if cause else "用户停止研究循环。"
+        return {"phase": "stopped", "control": "stop", "stop_reason": reason}
 
     def result_interrupt(state: ResearchLoopState) -> dict[str, Any]:
         payload = InterruptPayload(
@@ -2015,6 +2004,7 @@ def build_research_workflow(
             "need_user": "prepare_need_user",
             "reject": "prepare_rejected_result",
             "failed": "persist_failure",
+            "finalization_error": "user_interrupt",
             "invalid": "prepare_invalid_evaluation",
         },
     )

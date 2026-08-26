@@ -41,13 +41,15 @@ def main() -> int:
     acceptance_root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
     store = SessionStore(acceptance_root / f"desktop-sessions-{stamp}.json")
-    config_path = root / "configs" / "research" / "price_exogenous_eda.yaml"
     app = QApplication.instance() or QApplication([])
     app.setFont(QFont("Microsoft YaHei UI", 10))
     app.setStyleSheet(APP_STYLE)
-    window = MainWindow(config_path=config_path, session_store=store, plan_feedback_seconds=30)
+    window = MainWindow(session_store=store, plan_feedback_seconds=30)
     window.show()
     workspace = window.workspace
+    workspace.set_input_file("target", str(root / "data" / "target_rt_price.csv"))
+    workspace.set_input_file("actuals", str(root / "data" / "feature_actuals.csv"))
+    workspace.set_input_file("forecasts", str(root / "data" / "feature_forecasts.csv"))
     session_id = workspace.current_session.session_id
     try:
         workspace.submit_question(

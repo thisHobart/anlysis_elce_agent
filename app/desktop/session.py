@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from PySide6.QtCore import QStandardPaths
+
+from app.research.agent.schemas import rename_legacy_step_keys
+from app.research.tools.catalog import FUNCTION_CATALOG
 
 SessionStatus = Literal[
     "idle",
@@ -24,7 +28,7 @@ SessionStatus = Literal[
     "failed",
     "stopped",
 ]
-InputRole = Literal["config", "target", "actuals", "forecasts"]
+InputRole = Literal["target", "actuals", "forecasts"]
 InputStatus = Literal["empty", "selected", "loading", "ready", "warning", "failed", "changed"]
 MessageKind = Literal["text", "notice", "thinking", "tool", "plan", "result", "error"]
 TraceCategory = Literal["session", "user", "agent", "input", "plan", "tool", "evaluation", "artifact", "error"]
@@ -37,7 +41,7 @@ def utc_now() -> str:
 class VariableEvidence(BaseModel):
     """Variable-level readiness evidence displayed below one input file."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     name: str
     coverage_rate: float | None = None
@@ -48,7 +52,7 @@ class VariableEvidence(BaseModel):
 class SessionInputFile(BaseModel):
     """One user-managed file slot with a fixed analytical role."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     role: InputRole
     label: str
@@ -61,10 +65,6 @@ class SessionInputFile(BaseModel):
 
 def default_input_files() -> dict[InputRole, SessionInputFile]:
     return {
-        "config": SessionInputFile(
-            role="config",
-            label="研究配置",
-        ),
         "target": SessionInputFile(
             role="target",
             label="目标电价",
@@ -83,7 +83,7 @@ def default_input_files() -> dict[InputRole, SessionInputFile]:
 class SessionMessage(BaseModel):
     """One typed item in the continuous conversation timeline."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     message_id: str = Field(default_factory=lambda: uuid4().hex)
     role: Literal["user", "assistant", "system"]
@@ -96,7 +96,7 @@ class SessionMessage(BaseModel):
 class TraceEvent(BaseModel):
     """Observable Agent action; never stores hidden model reasoning."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     event_id: str = Field(default_factory=lambda: uuid4().hex)
     created_at: str = Field(default_factory=utc_now)
@@ -111,7 +111,7 @@ class TraceEvent(BaseModel):
 class SessionRunRecord(BaseModel):
     """Compact lineage for one completed plan execution in a conversation."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     run_id: str
     plan_id: str
@@ -123,12 +123,20 @@ class SessionRunRecord(BaseModel):
     evaluation: dict[str, Any] = Field(default_factory=dict)
 
 
+SESSION_SCHEMA_VERSION = 9
+"""Projection schema written by this build; bump it whenever stored sessions change shape."""
+
+
+class SessionMigrationError(ValueError):
+    """A stored session cannot be migrated onto the current projection schema."""
+
+
 class ResearchSession(BaseModel):
     """Single source of truth shared by history, conversation and context panes."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
-    schema_version: int = 7
+    schema_version: int = SESSION_SCHEMA_VERSION
     session_id: str = Field(default_factory=lambda: uuid4().hex)
     title: str = "新会话"
     status: SessionStatus = "idle"
@@ -152,9 +160,22 @@ class ResearchSession(BaseModel):
     graph_event_count: int = 0
     graph_event_sequence: int = 0
 
+    @field_validator("inputs", mode="before")
+    @classmethod
+    def discard_removed_input_roles(cls, value: Any) -> Any:
+        """Open older sessions after the retired YAML configuration slot is removed."""
+
+        if not isinstance(value, dict):
+            return value
+        current = default_input_files()
+        for role in current:
+            if role in value:
+                current[role] = value[role]
+        return current
+
     @property
     def can_analyze(self) -> bool:
-        return bool(self.inputs["target"].path or self.inputs["config"].path)
+        return bool(self.inputs["target"].path)
 
     def touch(self) -> None:
         self.updated_at = utc_now()
@@ -166,55 +187,222 @@ class ResearchSession(BaseModel):
         self.touch()
 
 
+def _carry_forward(session: ResearchSession) -> None:
+    """Migration step for revisions that only added optional fields with defaults."""
+
+
+def _stored_plans(session: ResearchSession) -> list[dict[str, Any]]:
+    """Return every plan payload a session keeps, in the conversation and in its state."""
+
+    plans = [session.current_plan] if isinstance(session.current_plan, dict) else []
+    plans.extend(
+        message.payload["plan"]
+        for message in session.messages
+        if message.kind == "plan" and isinstance(message.payload.get("plan"), dict)
+    )
+    return plans
+
+
+def _migrate_7_to_8(session: ResearchSession) -> None:
+    """A plan step's `tool` became `function`; rewrite the payloads written before that."""
+
+    for plan in _stored_plans(session):
+        steps = plan.get("steps")
+        if not isinstance(steps, list):
+            continue
+        plan["steps"] = [rename_legacy_step_keys(step) for step in steps]
+
+
+def _migrate_8_to_9(session: ResearchSession) -> None:
+    """Version the removal of the user-facing research-configuration file slot."""
+
+
+SESSION_MIGRATIONS: dict[int, Callable[[ResearchSession], None]] = {
+    **{version: _carry_forward for version in range(1, 7)},
+    7: _migrate_7_to_8,
+    8: _migrate_8_to_9,
+}
+
+
+STALE_PLAN_NOTICE = "这份分析方案是用旧版本的研究方法生成的，已经作废。重新提问一次，我会按当前版本给方案。"
+
+
+def _apply_session_invariants(
+    session: ResearchSession,
+    skill_versions: dict[str, str] | None = None,
+) -> None:
+    """Repair state that depends on the current catalog rather than on the schema version."""
+
+    if session.graph_event_sequence == 0 and session.graph_event_count:
+        session.graph_event_sequence = session.graph_event_count
+    if session.current_plan and not plan_is_executable(session.current_plan, skill_versions):
+        session.current_plan = None
+        session.plan_stale = True
+        session.status = "idle"
+    for message in session.messages:
+        stored_plan = message.payload.get("plan") if message.kind == "plan" else None
+        if isinstance(stored_plan, dict) and not plan_is_executable(stored_plan, skill_versions):
+            message.kind = "notice"
+            message.content = STALE_PLAN_NOTICE
+            message.payload = {}
+
+
+def plan_is_executable(plan: dict[str, Any], skill_versions: dict[str, str] | None = None) -> bool:
+    """Check a stored plan against what is installed now, so it fails on open rather than on run.
+
+    The execution gate rejects the same plans, but only once the user has already started a run;
+    ``skill_versions`` is injected because the Skill registry lives outside this projection.
+    """
+
+    if plan.get("planner") != "llm" or not plan.get("skill_name") or not plan.get("skill_version"):
+        return False
+    if skill_versions is not None:
+        installed = skill_versions.get(str(plan["skill_name"]))
+        if installed is None or installed != plan["skill_version"]:
+            return False
+    steps = plan.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return False
+    for step in steps:
+        if not isinstance(step, dict) or not step.get("function_version"):
+            return False
+        spec = FUNCTION_CATALOG.get(str(step.get("function", "")))
+        if spec is None or spec.version != step["function_version"]:
+            return False
+    return True
+
+
+def migrate_session(
+    session: ResearchSession,
+    skill_versions: dict[str, str] | None = None,
+) -> ResearchSession:
+    """Walk one stored session up to the current schema, refusing unknown jumps."""
+
+    version = session.schema_version
+    if version > SESSION_SCHEMA_VERSION:
+        raise SessionMigrationError(
+            f"会话由更新版本的程序写入（schema {version} > {SESSION_SCHEMA_VERSION}）"
+        )
+    while version < SESSION_SCHEMA_VERSION:
+        migration = SESSION_MIGRATIONS.get(version)
+        if migration is None:
+            raise SessionMigrationError(f"缺少 schema {version} 到 {version + 1} 的迁移步骤")
+        migration(session)
+        version += 1
+    session.schema_version = SESSION_SCHEMA_VERSION
+    _apply_session_invariants(session, skill_versions)
+    return session
+
+
 class SessionStore:
-    """Atomic JSON persistence under the platform application-data directory."""
+    """Atomic JSON persistence that never trades existing history for a failed read."""
 
     def __init__(self, path: str | Path | None = None) -> None:
         if path is None:
             root = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))
             path = root / "research_sessions.json"
         self.path = Path(path)
+        self.recovery_notices: list[str] = []
+        self._write_path: Path | None = None
 
-    def load(self) -> list[ResearchSession]:
-        if not self.path.is_file():
+    @property
+    def write_path(self) -> Path:
+        """Return where save() writes; redirected when the main file must stay untouched."""
+
+        return self._write_path or self.path
+
+    def load(self, skill_versions: dict[str, str] | None = None) -> list[ResearchSession]:
+        """Load every readable session; pass installed Skill versions to retire stale plans."""
+
+        self.recovery_notices = []
+        self._write_path = None
+        payload = self._read_payload()
+        if payload is None:
             return []
+        sessions: list[ResearchSession] = []
+        damaged: list[dict[str, Any]] = []
+        for index, item in enumerate(payload):
+            try:
+                sessions.append(migrate_session(ResearchSession.model_validate(item), skill_versions))
+            except (ValueError, TypeError) as exc:
+                damaged.append({"index": index, "error": f"{type(exc).__name__}: {exc}", "record": item})
+        if damaged:
+            self._quarantine(damaged)
+        return sessions
+
+    def _read_payload(self) -> list[Any] | None:
+        source = self.path
+        if not source.is_file():
+            backup = self._backup_path(self.path)
+            if not backup.is_file():
+                return None
+            # A crash between the two atomic renames in save() leaves only the backup.
+            source = backup
+            self.recovery_notices.append(f"主会话文件缺失，已从备份 {backup.name} 恢复。")
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(payload, list):
-                return []
-            sessions = [ResearchSession.model_validate(item) for item in payload]
-            for session in sessions:
-                session.schema_version = 7
-                if session.graph_event_sequence == 0 and session.graph_event_count:
-                    session.graph_event_sequence = session.graph_event_count
-                if session.current_plan and not self._plan_has_required_versions(session.current_plan):
-                    session.current_plan = None
-                    session.plan_stale = True
-                    session.status = "idle"
-                for message in session.messages:
-                    stored_plan = message.payload.get("plan") if message.kind == "plan" else None
-                    if isinstance(stored_plan, dict) and not self._plan_has_required_versions(stored_plan):
-                        message.kind = "notice"
-                        message.content = "旧版本研究方案缺少 Skill 或工具版本，已失效，请重新向大模型提出问题。"
-                        message.payload = {}
-            return sessions
-        except (OSError, ValueError, TypeError):
-            return []
+            raw = source.read_text(encoding="utf-8")
+        except OSError as exc:
+            self._redirect_writes(f"无法读取历史会话文件（{type(exc).__name__}: {exc}）")
+            return None
+        try:
+            payload = json.loads(raw)
+        except ValueError as exc:
+            self._set_aside(source, reason=f"{type(exc).__name__}: {exc}")
+            return None
+        if not isinstance(payload, list):
+            self._set_aside(source, reason="顶层不是会话数组")
+            return None
+        return payload
 
-    @staticmethod
-    def _plan_has_required_versions(plan: dict[str, Any]) -> bool:
-        if plan.get("planner") != "llm" or not plan.get("skill_name") or not plan.get("skill_version"):
-            return False
-        steps = plan.get("steps")
-        return isinstance(steps, list) and bool(steps) and all(
-            isinstance(step, dict) and bool(step.get("tool_version")) for step in steps
+    def _set_aside(self, source: Path, *, reason: str) -> None:
+        """Keep an unparseable file on disk under a new name instead of overwriting it."""
+
+        target = self._sidecar("corrupt")
+        try:
+            os.replace(source, target)
+        except OSError as exc:
+            self._redirect_writes(f"历史会话文件无法解析（{reason}），且无法移开（{type(exc).__name__}）")
+            return
+        self.recovery_notices.append(
+            f"历史会话文件无法解析（{reason}），原文件已保留为 {target.name}，程序从空白历史继续。"
         )
 
+    def _redirect_writes(self, reason: str) -> None:
+        self._write_path = self._sidecar("recovered")
+        self.recovery_notices.append(
+            f"{reason}；本次运行的会话改写到 {self._write_path.name}，原文件保持不动。"
+        )
+
+    def _quarantine(self, damaged: list[dict[str, Any]]) -> None:
+        target = self._sidecar("damaged")
+        try:
+            target.write_text(json.dumps(damaged, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            self.recovery_notices.append(
+                f"{len(damaged)} 条会话记录无法解析，隔离文件写入失败（{type(exc).__name__}），这些记录未载入。"
+            )
+            return
+        self.recovery_notices.append(
+            f"{len(damaged)} 条会话记录无法解析，已隔离到 {target.name}，其余会话正常载入。"
+        )
+
+    def _sidecar(self, marker: str) -> Path:
+        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        return self.path.with_name(f"{self.path.stem}.{marker}-{stamp}{self.path.suffix}")
+
+    @staticmethod
+    def _backup_path(target: Path) -> Path:
+        return target.with_name(f"{target.name}.bak")
+
     def save(self, sessions: list[ResearchSession]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(f"{self.path.suffix}.tmp")
+        target = self.write_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f"{target.name}.tmp")
         temporary.write_text(
             json.dumps([session.model_dump(mode="json") for session in sessions], ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        os.replace(temporary, self.path)
+        if target.is_file():
+            # Renaming is atomic and free, so the previous good file always survives one write.
+            os.replace(target, self._backup_path(target))
+        os.replace(temporary, target)

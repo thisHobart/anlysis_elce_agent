@@ -16,7 +16,7 @@ from app.research.planning.compiler import EDAPlanCompiler
 from app.research.planning.contracts import EDAPlanDraft
 from app.research.schemas.study import load_study_config
 from app.research.skills.registry import SkillRegistry
-from app.research.tools.catalog import TOOL_CATALOG
+from app.research.tools.catalog import FUNCTION_CATALOG
 from app.research.tools.eda import dependence, drivers, structure
 
 SEGMENTS = [
@@ -212,14 +212,19 @@ def test_rolling_stability_flags_a_relationship_that_flips_sign():
     assert "driver" in result["rolling_stability"]["unstable_variables"]
 
 
-def test_every_registered_function_executes_and_reports_evidence(synthetic_study: Path, tmp_path: Path):
+def test_each_generated_agenda_item_is_judged_by_its_own_rule(
+    synthetic_study: Path, tmp_path: Path
+):
+    """Keyword matchers are an ordered if-chain, so distinct items must stay distinct."""
+
+    from app.research.evaluation.eda import _assess_hypotheses
+    from app.research.planning.compiler import FUNCTION_AGENDA_HYPOTHESES
+
     config = load_study_config(synthetic_study)
-    prepared = prepare_research_data(config)
     skill = SkillRegistry.default().get("price-exogenous-eda")
     variables = [spec.name for spec in config.exogenous]
-
     steps = []
-    for name, spec in TOOL_CATALOG.items():
+    for name, spec in FUNCTION_CATALOG.items():
         if name == "data_quality":
             continue
         parameters: dict[str, object] = {}
@@ -230,7 +235,100 @@ def test_every_registered_function_executes_and_reports_evidence(synthetic_study
         if spec.uses_segments:
             parameters["comparison_id"] = "peak_vs_valley"
             parameters["segments"] = SEGMENTS
-        steps.append({"tool": name, "enabled": True, "rationale": spec.answers, "parameters": parameters})
+        steps.append({"function": name, "enabled": True, "rationale": spec.answers, "parameters": parameters})
+    plan = EDAPlanCompiler().compile(
+        EDAPlanDraft(objective="议程覆盖回归", selected_variables=variables, steps=steps),
+        question="执行全部研究函数",
+        config=config,
+        skill=skill,
+        model_name="regression",
+        prompt_version="regression",
+    )
+    plan = plan.model_copy(
+        update={"data_fingerprint": study_fingerprint(config, input_file_manifest(config))}
+    )
+    summary = EDAExecutionService().execute(
+        plan=plan,
+        study_config=config,
+        output_directory=tmp_path / "agenda-artifacts",
+        run_id="agenda-coverage",
+    ).eda_summary
+
+    owners: dict[str, list[str]] = {}
+    for function_name, hypothesis in FUNCTION_AGENDA_HYPOTHESES.items():
+        assessment = _assess_hypotheses(plan.model_copy(update={"hypotheses": [hypothesis]}), summary)[0]
+        assert assessment.scope != "needs_restatement", function_name
+        owners.setdefault(assessment.item_id, []).append(function_name)
+
+    collisions = {item: names for item, names in owners.items() if len(names) > 1}
+    assert not collisions, collisions
+    assert len(owners) == len(FUNCTION_AGENDA_HYPOTHESES)
+
+
+def test_driver_stationarity_is_judged_by_the_drivers_not_the_target(
+    synthetic_study: Path, tmp_path: Path
+):
+    from app.research.evaluation.eda import _assess_hypotheses
+    from app.research.planning.compiler import FUNCTION_AGENDA_HYPOTHESES
+
+    config = load_study_config(synthetic_study)
+    skill = SkillRegistry.default().get("price-exogenous-eda")
+    variables = [spec.name for spec in config.exogenous]
+    plan = EDAPlanCompiler().compile(
+        EDAPlanDraft(
+            objective="驱动平稳性",
+            selected_variables=variables,
+            steps=[
+                {
+                    "function": "exogenous_stationarity_tests",
+                    "enabled": True,
+                    "rationale": "检查驱动自身平稳性。",
+                    "parameters": {"variables": variables},
+                }
+            ],
+        ),
+        question="驱动变量自己平稳吗",
+        config=config,
+        skill=skill,
+        model_name="regression",
+        prompt_version="regression",
+    )
+    plan = plan.model_copy(
+        update={"data_fingerprint": study_fingerprint(config, input_file_manifest(config))}
+    )
+    summary = EDAExecutionService().execute(
+        plan=plan,
+        study_config=config,
+        output_directory=tmp_path / "driver-stationarity",
+        run_id="driver-stationarity",
+    ).eda_summary
+
+    hypothesis = FUNCTION_AGENDA_HYPOTHESES["exogenous_stationarity_tests"]
+    assessment = _assess_hypotheses(plan.model_copy(update={"hypotheses": [hypothesis]}), summary)[0]
+
+    assert assessment.item_id == "exogenous.stationarity"
+    assert "驱动变量" in assessment.evidence
+
+
+def test_every_registered_function_executes_and_reports_evidence(synthetic_study: Path, tmp_path: Path):
+    config = load_study_config(synthetic_study)
+    prepared = prepare_research_data(config)
+    skill = SkillRegistry.default().get("price-exogenous-eda")
+    variables = [spec.name for spec in config.exogenous]
+
+    steps = []
+    for name, spec in FUNCTION_CATALOG.items():
+        if name == "data_quality":
+            continue
+        parameters: dict[str, object] = {}
+        if spec.uses_variables:
+            parameters["variables"] = variables
+        if spec.uses_max_lag:
+            parameters["max_lag"] = 24
+        if spec.uses_segments:
+            parameters["comparison_id"] = "peak_vs_valley"
+            parameters["segments"] = SEGMENTS
+        steps.append({"function": name, "enabled": True, "rationale": spec.answers, "parameters": parameters})
 
     plan = EDAPlanCompiler().compile(
         EDAPlanDraft(objective="全函数回归", selected_variables=variables, steps=steps),
@@ -243,7 +341,7 @@ def test_every_registered_function_executes_and_reports_evidence(synthetic_study
     plan = plan.model_copy(
         update={"data_fingerprint": study_fingerprint(config, input_file_manifest(config))}
     )
-    assert len(plan.enabled_steps) == len(TOOL_CATALOG)
+    assert len(plan.enabled_steps) == len(FUNCTION_CATALOG)
     del prepared
 
     result = EDAExecutionService().execute(
@@ -254,7 +352,7 @@ def test_every_registered_function_executes_and_reports_evidence(synthetic_study
     )
 
     summary = result.eda_summary
-    for spec in TOOL_CATALOG.values():
+    for spec in FUNCTION_CATALOG.values():
         if spec.evidence_field is None:
             continue
         assert spec.evidence_field in summary[spec.result_key], spec.key

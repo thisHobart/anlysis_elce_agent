@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import QDialog, QLabel, QMainWindow, QMessageBox, QToolBar
 
@@ -19,7 +17,6 @@ class MainWindow(QMainWindow):
 
     def __init__(
         self,
-        config_path: Path | None = None,
         *,
         agent: ResearchCoordinator | None = None,
         session_store: SessionStore | None = None,
@@ -32,7 +29,6 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1100, 720)
 
         self.workspace = ResearchWorkspace(
-            config_path=config_path,
             agent=agent,
             store=session_store,
             plan_feedback_seconds=plan_feedback_seconds,

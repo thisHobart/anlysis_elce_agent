@@ -1,4 +1,12 @@
-"""Function-calling contracts shared by local and future MCP tool providers."""
+"""Function-calling contracts shared by local and future MCP tool providers.
+
+Vocabulary: a **function** is a research function in the domain sense - what a Skill
+authorizes, what a protocol stage orders, and what a plan step names. A **tool** is the
+OpenAI tool-call protocol boundary: ``ToolCall``, ``ToolOutput``, ``ToolResult``, the
+registry, policy and executor that carry them, and the ``tool_*`` loop state that holds
+them. Anything naming a research function uses `function`; anything naming the transport
+uses `tool`.
+"""
 
 from __future__ import annotations
 
@@ -126,7 +134,7 @@ class ToolOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     result_key: str
-    value: Any = None
+    value: dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolResult(BaseModel):

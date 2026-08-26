@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -15,17 +16,22 @@ import yaml
 from PySide6.QtWidgets import QApplication
 
 from app.config import Settings
-from app.desktop.input_config import build_session_study_config
+from app.desktop.input_config import build_runtime_study
 from app.desktop.main_window import MainWindow
 from app.desktop.message_widgets import ThinkingMessageWidget
-from app.desktop.session import ResearchSession, SessionMessage, SessionStore
+from app.desktop.session import (
+    SESSION_SCHEMA_VERSION,
+    STALE_PLAN_NOTICE,
+    ResearchSession,
+    SessionMessage,
+    SessionStore,
+)
 from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
 from app.research.agent.subagents.eda import EDASubagent
 from app.research.application.coordinator import ResearchCoordinator
 from app.research.graph.narration import STAGE_LABELS
-from app.research.schemas.study import load_study_config
 from app.research.skills.registry import SkillRegistry
-from app.research.tools.catalog import TOOL_CATALOG
+from app.research.tools.catalog import FUNCTION_CATALOG
 
 
 class DesktopModelPlanner:
@@ -48,11 +54,11 @@ class DesktopModelPlanner:
             ]
             return {
                 "objective": "分析用户关注的电价结构",
-                "hypotheses": ["电价可能存在用户关注的结构特征。"],
+                "hypotheses": [],
                 "selected_variables": [],
                 "steps": [
                     {
-                        "tool": function_name,
+                        "function": function_name,
                         "enabled": True,
                         "rationale": "问题聚焦电价自身。",
                         "parameters": {},
@@ -67,47 +73,47 @@ class DesktopModelPlanner:
         lag = 2 if "2 小时" in question or "2小时" in question else 24
         return {
             "objective": "分析所选变量与电价的关系",
-            "hypotheses": ["所选变量可能与电价存在描述性关系。"],
+            "hypotheses": [],
             "selected_variables": selected,
             "steps": [
                 {
-                    "tool": "price_calendar_group_profile",
+                    "function": "price_calendar_group_profile",
                     "enabled": True,
                     "rationale": "检查电价周期结构。",
                     "parameters": {},
                 },
                 {
-                    "tool": "price_lag_autocorrelation",
+                    "function": "price_lag_autocorrelation",
                     "enabled": True,
                     "rationale": "检查电价滞后结构。",
                     "parameters": {"max_lag": lag},
                 },
                 {
-                    "tool": "exogenous_descriptive_distribution",
+                    "function": "exogenous_descriptive_distribution",
                     "enabled": True,
                     "rationale": "检查变量画像。",
                     "parameters": {"variables": selected},
                 },
                 {
-                    "tool": "exogenous_iqr_outliers",
+                    "function": "exogenous_iqr_outliers",
                     "enabled": True,
                     "rationale": "检查变量异常值。",
                     "parameters": {"variables": selected},
                 },
                 {
-                    "tool": "relationship_scipy_pearson_pairwise",
+                    "function": "relationship_scipy_pearson_pairwise",
                     "enabled": True,
                     "rationale": "检查同期 Pearson 关系。",
                     "parameters": {"variables": selected},
                 },
                 {
-                    "tool": "relationship_scipy_spearman_pairwise",
+                    "function": "relationship_scipy_spearman_pairwise",
                     "enabled": True,
                     "rationale": "检查同期 Spearman 关系。",
                     "parameters": {"variables": selected},
                 },
                 {
-                    "tool": "relationship_pearson_positive_lead_scan",
+                    "function": "relationship_pearson_positive_lead_scan",
                     "enabled": True,
                     "rationale": "检查领先滞后关系。",
                     "parameters": {"variables": selected, "max_lag": lag},
@@ -129,7 +135,7 @@ class DesktopModelDialogue:
             return DialogueDecision(
                 intent="revise_plan",
                 response="已根据用户反馈修订方案。",
-                enabled_tools=[
+                enabled_functions=[
                     "relationship_scipy_pearson_pairwise",
                     "relationship_scipy_spearman_pairwise",
                     "relationship_pearson_positive_lead_scan",
@@ -237,6 +243,17 @@ def wait_until(qt_app: QApplication, predicate, timeout_seconds: float = 12.0) -
     raise AssertionError("Qt operation did not finish before timeout")
 
 
+def select_desktop_data(window: MainWindow, desktop_study: Path) -> None:
+    """Populate the three user-facing data roles without a configuration file."""
+
+    for role, filename in (
+        ("target", "market_prices.csv"),
+        ("actuals", "measurements.csv"),
+        ("forecasts", "predictions.csv"),
+    ):
+        window.workspace.set_input_file(role, str(desktop_study.parent / filename))
+
+
 def test_main_window_uses_one_three_pane_workspace(qt_app: QApplication, tmp_path: Path):
     window = MainWindow(session_store=SessionStore(tmp_path / "sessions.json"))
     try:
@@ -245,8 +262,8 @@ def test_main_window_uses_one_three_pane_workspace(qt_app: QApplication, tmp_pat
         assert window.workspace.current_session.title == "新会话"
         assert window.workspace.history.new_button.text() == "＋  新的研究"
         assert window.workspace.context.inputs.title_label.text() == "数据文件"
-        assert window.workspace.conversation.config_label.text() == "未使用研究配置文件（可选）"
-        assert list(window.workspace.context.inputs.rows) == ["config", "target", "actuals", "forecasts"]
+        assert not hasattr(window.workspace.conversation, "config_label")
+        assert list(window.workspace.context.inputs.rows) == ["target", "actuals", "forecasts"]
         assert all(row.name_label.text() == "尚未选择" for row in window.workspace.context.inputs.rows.values())
         assert all(not hasattr(row, "status_label") for row in window.workspace.context.inputs.rows.values())
         assert all(not hasattr(row, "variables") for row in window.workspace.context.inputs.rows.values())
@@ -296,7 +313,7 @@ def test_target_only_arbitrary_filename_builds_price_only_plan(
     try:
         workspace = window.workspace
         workspace.set_input_file("target", str(desktop_study.parent / "market_prices.csv"))
-        config = build_session_study_config(workspace.current_session)
+        config = build_runtime_study(workspace.current_session)
         assert config.target.path.name == "market_prices.csv"
         assert config.exogenous == []
 
@@ -304,7 +321,7 @@ def test_target_only_arbitrary_filename_builds_price_only_plan(
         wait_until(qt_app, lambda: not workspace.is_busy)
         plan = workspace.current_session.current_plan
         assert plan is not None
-        assert [step["tool"] for step in plan["steps"] if step["enabled"]] == [
+        assert [step["function"] for step in plan["steps"] if step["enabled"]] == [
             "data_quality",
             "price_tukey_outer_fence",
             "price_calendar_group_profile",
@@ -313,27 +330,23 @@ def test_target_only_arbitrary_filename_builds_price_only_plan(
         window.close()
 
 
-def test_user_config_selection_populates_exactly_four_inputs(
+def test_three_data_files_build_the_runtime_study_contract(
     qt_app: QApplication,
     desktop_study: Path,
     model_agent: ResearchCoordinator,
     tmp_path: Path,
 ):
-    window = MainWindow(
-        config_path=desktop_study,
-        agent=model_agent,
-        session_store=SessionStore(tmp_path / "sessions.json"),
-    )
+    window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
     try:
+        select_desktop_data(window, desktop_study)
         session = window.workspace.current_session
         assert session.can_analyze
         assert {Path(item.path).name for item in session.inputs.values()} == {
-            "study_config.yml",
             "market_prices.csv",
             "measurements.csv",
             "predictions.csv",
         }
-        config = build_session_study_config(session)
+        config = build_runtime_study(session)
         assert len(config.exogenous) == 3
         assert {spec.path.name for spec in config.exogenous} == {
             "measurements.csv",
@@ -343,42 +356,45 @@ def test_user_config_selection_populates_exactly_four_inputs(
         window.close()
 
 
-def test_yaml_and_exogenous_files_can_be_cleared_after_discovery(
+def test_forecast_availability_column_is_inferred_without_a_config_file(tmp_path: Path):
+    index = pd.date_range("2026-01-01", periods=24, freq="1h")
+    target = tmp_path / "prices.csv"
+    forecasts = tmp_path / "forecasts.csv"
+    pd.DataFrame({"datetime": index, "price": range(24)}).to_csv(target, index=False)
+    pd.DataFrame(
+        {
+            "datetime": index,
+            "available_at": index - pd.Timedelta(hours=1),
+            "load_forecast": range(24),
+        }
+    ).to_csv(forecasts, index=False)
+    session = ResearchSession()
+    session.inputs["target"].path = str(target)
+    session.inputs["forecasts"].path = str(forecasts)
+
+    context = build_runtime_study(session)
+
+    assert [item.name for item in context.exogenous] == ["load_forecast"]
+    assert context.exogenous[0].available_at_column == "available_at"
+
+
+def test_exogenous_files_can_be_cleared_without_affecting_the_target(
     qt_app: QApplication,
     desktop_study: Path,
     model_agent: ResearchCoordinator,
     tmp_path: Path,
 ):
-    window = MainWindow(
-        config_path=desktop_study,
-        agent=model_agent,
-        session_store=SessionStore(tmp_path / "sessions.json"),
-    )
+    window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
     try:
+        select_desktop_data(window, desktop_study)
         workspace = window.workspace
         workspace.clear_input_file("actuals")
         workspace.clear_input_file("forecasts")
-        config = build_session_study_config(workspace.current_session)
+        config = build_runtime_study(workspace.current_session)
         assert config.exogenous == []
-        assert workspace.current_session.inputs["config"].path
         assert workspace.current_session.inputs["target"].path
-
-        workspace.clear_input_file("config")
-        inferred = build_session_study_config(workspace.current_session)
-        assert inferred.target.path.name == "market_prices.csv"
-        assert inferred.exogenous == []
     finally:
         window.close()
-
-
-def test_default_phase1_config_excludes_day_ahead_price_file():
-    root = Path(__file__).resolve().parents[2]
-    config = load_study_config(root / "configs" / "research" / "price_exogenous_eda.yaml")
-    assert {spec.path.name for spec in config.exogenous} == {
-        "feature_actuals.csv",
-        "feature_forecasts.csv",
-    }
-    assert all(spec.name != "da_price" for spec in config.exogenous)
 
 
 def test_session_history_persists_across_window_restart(
@@ -387,7 +403,8 @@ def test_session_history_persists_across_window_restart(
     tmp_path: Path,
 ):
     store = SessionStore(tmp_path / "sessions.json")
-    first = MainWindow(config_path=desktop_study, session_store=store)
+    first = MainWindow(session_store=store)
+    select_desktop_data(first, desktop_study)
     session_id = first.workspace.current_session.session_id
     first.workspace.rename_session(session_id, "负荷关系研究")
     first.close()
@@ -403,6 +420,101 @@ def test_session_history_persists_across_window_restart(
         second.close()
 
 
+def _session_with_plan(plan: dict) -> ResearchSession:
+    session = ResearchSession(title="待执行方案", current_plan=plan, status="awaiting_plan_approval")
+    session.messages.append(SessionMessage(role="assistant", kind="plan", payload={"plan": plan}))
+    return session
+
+
+def _installed_skill_versions() -> dict[str, str]:
+    registry = SkillRegistry.default(Settings(skill_paths=""))
+    return {str(item["name"]): str(item["version"]) for item in registry.metadata()}
+
+
+def _fresh_plan(desktop_study: Path, model_agent: ResearchCoordinator) -> dict:
+    return model_agent.propose(question="分析电价分布", config_path=desktop_study).plan.model_dump(mode="json")
+
+
+def test_a_plan_from_an_older_skill_retires_when_the_session_opens(
+    desktop_study: Path, model_agent: ResearchCoordinator, tmp_path: Path
+):
+    """The execution gate rejects it either way; retiring on open avoids a failed run."""
+
+    plan = _fresh_plan(desktop_study, model_agent)
+    plan["skill_version"] = "0.0.1-before-this-build"
+    store = SessionStore(tmp_path / "sessions.json")
+    store.save([_session_with_plan(plan)])
+
+    restored = store.load(_installed_skill_versions())[0]
+
+    assert restored.current_plan is None
+    assert restored.plan_stale
+    assert restored.status == "idle"
+    assert restored.messages[0].kind == "notice"
+    assert restored.messages[0].content == STALE_PLAN_NOTICE
+
+
+def test_a_plan_from_an_older_function_version_retires_when_the_session_opens(
+    desktop_study: Path, model_agent: ResearchCoordinator, tmp_path: Path
+):
+    plan = _fresh_plan(desktop_study, model_agent)
+    plan["steps"] = [{**step, "function_version": "0.0.1"} for step in plan["steps"]]
+    store = SessionStore(tmp_path / "sessions.json")
+    store.save([_session_with_plan(plan)])
+
+    restored = store.load(_installed_skill_versions())[0]
+
+    assert restored.current_plan is None
+    assert restored.plan_stale
+
+
+def test_a_plan_naming_a_removed_function_retires_when_the_session_opens(
+    desktop_study: Path, model_agent: ResearchCoordinator, tmp_path: Path
+):
+    plan = _fresh_plan(desktop_study, model_agent)
+    plan["steps"] = [{**step, "function": "a_function_this_build_no_longer_ships"} for step in plan["steps"]]
+    store = SessionStore(tmp_path / "sessions.json")
+    store.save([_session_with_plan(plan)])
+
+    assert store.load(_installed_skill_versions())[0].current_plan is None
+
+
+def test_a_current_plan_survives_reopening(
+    desktop_study: Path, model_agent: ResearchCoordinator, tmp_path: Path
+):
+    plan = _fresh_plan(desktop_study, model_agent)
+    store = SessionStore(tmp_path / "sessions.json")
+    store.save([_session_with_plan(plan)])
+
+    restored = store.load(_installed_skill_versions())[0]
+
+    assert restored.current_plan is not None
+    assert not restored.plan_stale
+    assert restored.status == "awaiting_plan_approval"
+    assert restored.messages[0].kind == "plan"
+
+
+def test_retiring_a_stale_plan_keeps_the_conversation_and_past_reports(
+    desktop_study: Path, model_agent: ResearchCoordinator, tmp_path: Path
+):
+    plan = _fresh_plan(desktop_study, model_agent)
+    plan["skill_version"] = "0.0.1-before-this-build"
+    session = _session_with_plan(plan)
+    session.messages.insert(0, SessionMessage(role="user", kind="text", content="负荷对电价影响有多大？"))
+    session.messages.append(
+        SessionMessage(role="assistant", kind="result", content="已完成", payload={"report_path": "r/report.html"})
+    )
+    session.report_path = "r/report.html"
+    store = SessionStore(tmp_path / "sessions.json")
+    store.save([session])
+
+    restored = store.load(_installed_skill_versions())[0]
+
+    assert [message.kind for message in restored.messages] == ["text", "notice", "result"]
+    assert restored.messages[0].content == "负荷对电价影响有多大？"
+    assert restored.report_path == "r/report.html"
+
+
 def test_old_session_plan_without_skill_and_tool_versions_is_invalidated(
     desktop_study: Path,
     model_agent: ResearchCoordinator,
@@ -412,7 +524,7 @@ def test_old_session_plan_without_skill_and_tool_versions_is_invalidated(
     stored_plan.pop("skill_name")
     stored_plan.pop("skill_version")
     for step in stored_plan["steps"]:
-        step.pop("tool_version")
+        step.pop("function_version")
     session = ResearchSession(
         schema_version=3,
         title="旧计划",
@@ -432,12 +544,162 @@ def test_old_session_plan_without_skill_and_tool_versions_is_invalidated(
 
     restored = store.load()[0]
 
-    assert restored.schema_version == 7
+    assert restored.schema_version == SESSION_SCHEMA_VERSION
     assert restored.current_plan is None
     assert restored.plan_stale
     assert restored.status == "idle"
     assert restored.messages[0].kind == "notice"
-    assert "缺少 Skill 或工具版本" in restored.messages[0].content
+    assert restored.messages[0].content == STALE_PLAN_NOTICE
+
+
+def _write_records(store: SessionStore, records: list[dict]) -> None:
+    store.path.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+
+
+def _stored(store: SessionStore, *titles: str) -> list[dict]:
+    store.save([ResearchSession(title=title) for title in titles])
+    return json.loads(store.path.read_text(encoding="utf-8"))
+
+
+def test_one_unreadable_session_never_costs_the_whole_history(tmp_path: Path):
+    store = SessionStore(tmp_path / "sessions.json")
+    records = _stored(store, "重要研究 A", "重要研究 B")
+    records.append({**records[0], "session_id": "broken", "title": "坏记录", "status": "not-a-status"})
+    _write_records(store, records)
+
+    loaded = store.load()
+
+    assert [session.title for session in loaded] == ["重要研究 A", "重要研究 B"]
+    quarantine = list(tmp_path.glob("sessions.damaged-*.json"))
+    assert len(quarantine) == 1
+    assert json.loads(quarantine[0].read_text(encoding="utf-8"))[0]["record"]["title"] == "坏记录"
+    assert any("已隔离到" in notice for notice in store.recovery_notices)
+
+    store.save(loaded)
+    assert len(json.loads(store.path.read_text(encoding="utf-8"))) == 2
+
+
+def test_a_session_stored_before_the_step_rename_still_opens(tmp_path: Path):
+    store = SessionStore(tmp_path / "sessions.json")
+    session = ResearchSession(schema_version=7, title="重命名之前的会话")
+    session.current_plan = {
+        "planner": "llm",
+        "skill_name": "price-exogenous-eda",
+        "skill_version": "3.1.0",
+        "steps": [{"tool": "price_descriptive_distribution", "tool_version": "1.0.0"}],
+    }
+    session.messages.append(
+        SessionMessage(role="assistant", kind="plan", payload={"plan": session.current_plan})
+    )
+    store.save([session])
+
+    restored = store.load()[0]
+
+    assert restored.schema_version == SESSION_SCHEMA_VERSION
+    assert restored.current_plan is not None
+    step = restored.current_plan["steps"][0]
+    assert step == {"function": "price_descriptive_distribution", "function_version": "1.0.0"}
+    assert restored.messages[0].kind == "plan"
+
+
+def test_retired_research_config_slot_is_removed_from_an_old_session(tmp_path: Path):
+    store = SessionStore(tmp_path / "sessions.json")
+    record = ResearchSession(title="旧数据入口").model_dump(mode="json")
+    record["schema_version"] = 8
+    record["inputs"]["config"] = {
+        "role": "config",
+        "label": "研究配置",
+        "path": "old-study.yaml",
+        "status": "selected",
+    }
+    _write_records(store, [record])
+
+    restored = store.load()[0]
+
+    assert restored.schema_version == SESSION_SCHEMA_VERSION
+    assert list(restored.inputs) == ["target", "actuals", "forecasts"]
+
+
+def test_a_session_written_by_a_newer_build_is_kept_not_downgraded(tmp_path: Path):
+    store = SessionStore(tmp_path / "sessions.json")
+    records = _stored(store, "当前版本会话")
+    records.append({**records[0], "session_id": "future", "schema_version": SESSION_SCHEMA_VERSION + 1})
+    _write_records(store, records)
+
+    loaded = store.load()
+
+    assert [session.title for session in loaded] == ["当前版本会话"]
+    quarantine = list(tmp_path.glob("sessions.damaged-*.json"))
+    assert "更新版本的程序" in quarantine[0].read_text(encoding="utf-8")
+
+
+def test_unknown_fields_from_a_newer_build_do_not_fail_a_session(tmp_path: Path):
+    store = SessionStore(tmp_path / "sessions.json")
+    records = _stored(store, "会话 A", "会话 B")
+    records[1]["a_future_field"] = {"anything": 1}
+    _write_records(store, records)
+
+    assert [session.title for session in store.load()] == ["会话 A", "会话 B"]
+    assert not list(tmp_path.glob("sessions.damaged-*.json"))
+
+
+def test_a_corrupt_file_is_preserved_and_never_overwritten(tmp_path: Path):
+    store = SessionStore(tmp_path / "sessions.json")
+    _stored(store, "唯一的研究")
+    original = store.path.read_text(encoding="utf-8")
+    store.path.write_text(original[: len(original) // 2], encoding="utf-8")
+
+    assert store.load() == []
+    preserved = list(tmp_path.glob("sessions.corrupt-*.json"))
+    assert len(preserved) == 1
+    assert preserved[0].read_text(encoding="utf-8") == original[: len(original) // 2]
+
+    store.save([ResearchSession(title="新的研究")])
+    assert preserved[0].is_file()
+    assert [item["title"] for item in json.loads(store.path.read_text(encoding="utf-8"))] == ["新的研究"]
+
+
+def test_each_save_keeps_one_recoverable_generation(tmp_path: Path):
+    store = SessionStore(tmp_path / "sessions.json")
+    _stored(store, "第一版")
+    _stored(store, "第二版")
+
+    backup = tmp_path / "sessions.json.bak"
+    assert [item["title"] for item in json.loads(backup.read_text(encoding="utf-8"))] == ["第一版"]
+
+    store.path.unlink()
+    assert [session.title for session in store.load()] == ["第一版"]
+    assert any("从备份" in notice for notice in store.recovery_notices)
+
+
+def test_recovery_notices_reach_the_conversation_once(
+    qt_app: QApplication,
+    tmp_path: Path,
+    model_agent: ResearchCoordinator,
+):
+    store = SessionStore(tmp_path / "sessions.json")
+    records = _stored(store, "保留下来的研究")
+    records.append({**records[0], "session_id": "broken", "status": "not-a-status"})
+    _write_records(store, records)
+
+    window = MainWindow(agent=model_agent, session_store=store)
+    try:
+        workspace = window.workspace
+        notices = [
+            message.content
+            for message in workspace.current_session.messages
+            if message.kind == "notice"
+        ]
+        assert any("已隔离到" in notice for notice in notices)
+
+        workspace.create_session()
+        assert not [
+            message.content
+            for message in workspace.current_session.messages
+            if message.kind == "notice"
+        ]
+    finally:
+        window.close()
 
 
 def test_continuous_conversation_runs_plan_and_answers_followup(
@@ -447,7 +709,8 @@ def test_continuous_conversation_runs_plan_and_answers_followup(
     tmp_path: Path,
 ):
     store = SessionStore(tmp_path / "sessions.json")
-    window = MainWindow(config_path=desktop_study, agent=model_agent, session_store=store)
+    window = MainWindow(agent=model_agent, session_store=store)
+    select_desktop_data(window, desktop_study)
     try:
         workspace = window.workspace
         workspace.submit_question("分析 actual_load 与电价 2 小时的滞后关系")
@@ -516,7 +779,8 @@ def test_thinking_process_is_visible_and_survives_a_restart(
     tmp_path: Path,
 ):
     store = SessionStore(tmp_path / "sessions.json")
-    window = MainWindow(config_path=desktop_study, agent=model_agent, session_store=store)
+    window = MainWindow(agent=model_agent, session_store=store)
+    select_desktop_data(window, desktop_study)
     try:
         workspace = window.workspace
         workspace.submit_question("分析 actual_load 与电价 2 小时的滞后关系")
@@ -573,7 +837,8 @@ def test_run_trace_reads_as_a_professional_audit_log(
     tmp_path: Path,
 ):
     store = SessionStore(tmp_path / "sessions.json")
-    window = MainWindow(config_path=desktop_study, agent=model_agent, session_store=store)
+    window = MainWindow(agent=model_agent, session_store=store)
+    select_desktop_data(window, desktop_study)
     try:
         workspace = window.workspace
         workspace.submit_question("分析 actual_load 与电价 2 小时的滞后关系")
@@ -607,7 +872,7 @@ def test_run_trace_reads_as_a_professional_audit_log(
         # A running row explains the method; the finished row only reports elapsed time.
         started = next(text for text in texts if text.startswith("分析中 · 数据质量与时间对齐"))
         completed = next(text for text in texts if text.startswith("已完成 · 数据质量与时间对齐"))
-        assert started.split(" — ")[1] == TOOL_CATALOG["data_quality"].description.rstrip("。")
+        assert started.split(" — ")[1] == FUNCTION_CATALOG["data_quality"].description.rstrip("。")
         assert completed.split(" — ")[1].endswith(("毫秒", "秒"))
 
         # The locked batch is named by the research stages it covers.
@@ -626,10 +891,10 @@ def test_plan_can_be_revised_and_executed_through_dialogue(
     tmp_path: Path,
 ):
     window = MainWindow(
-        config_path=desktop_study,
         agent=model_agent,
         session_store=SessionStore(tmp_path / "sessions.json"),
     )
+    select_desktop_data(window, desktop_study)
     try:
         workspace = window.workspace
         workspace.submit_question("分析 actual_load 与电价的滞后关系")
@@ -650,14 +915,14 @@ def test_plan_can_be_revised_and_executed_through_dialogue(
         assert revised["parent_plan_id"] == original["plan_id"]
         assert revised["revision_source"] == "user_dialogue"
         assert revised["selected_variables"] == ["actual_wind"]
-        assert [step["tool"] for step in revised["steps"] if step["enabled"]] == [
+        assert [step["function"] for step in revised["steps"] if step["enabled"]] == [
             "data_quality",
             "relationship_scipy_pearson_pairwise",
             "relationship_scipy_spearman_pairwise",
             "relationship_pearson_positive_lead_scan",
         ]
         relationship = next(
-            step for step in revised["steps"] if step["tool"] == "relationship_pearson_positive_lead_scan"
+            step for step in revised["steps"] if step["function"] == "relationship_pearson_positive_lead_scan"
         )
         assert relationship["parameters"]["max_lag"] == 4
 
@@ -678,10 +943,10 @@ def test_replacing_input_invalidates_existing_plan(
     tmp_path: Path,
 ):
     window = MainWindow(
-        config_path=desktop_study,
         agent=model_agent,
         session_store=SessionStore(tmp_path / "sessions.json"),
     )
+    select_desktop_data(window, desktop_study)
     try:
         workspace = window.workspace
         workspace.submit_question("分析电价与预测发电的关系")
@@ -706,11 +971,11 @@ def test_model_plan_auto_executes_after_feedback_window(
     tmp_path: Path,
 ):
     window = MainWindow(
-        config_path=desktop_study,
         agent=model_agent,
         session_store=SessionStore(tmp_path / "sessions.json"),
         plan_feedback_seconds=1,
     )
+    select_desktop_data(window, desktop_study)
     try:
         workspace = window.workspace
         workspace.submit_question("分析 actual_load 与电价的滞后关系")
@@ -765,11 +1030,11 @@ def test_expired_approval_restores_from_sqlite_and_requires_explicit_confirmatio
         checkpoint_path=checkpoint,
     )
     first = MainWindow(
-        config_path=desktop_study,
         agent=first_agent,
         session_store=store,
         plan_feedback_seconds=1,
     )
+    select_desktop_data(first, desktop_study)
     session_id = first.workspace.current_session.session_id
     first.workspace.submit_question("分析 actual_load 与电价关系")
     wait_until(qt_app, lambda: not first.workspace.is_busy)

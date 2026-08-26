@@ -13,7 +13,7 @@ from app.desktop.worker import FunctionWorker
 from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
 from app.research.agent.subagents.eda import EDASubagent
 from app.research.application.coordinator import ResearchCoordinator
-from app.research.schemas.study import load_study_config
+from app.research.data.inference import infer_study_context
 
 
 class CancelDialogue:
@@ -39,7 +39,7 @@ class CancelPlanner:
             "selected_variables": [],
             "steps": [
                 {
-                    "tool": "price_descriptive_distribution",
+                    "function": "price_descriptive_distribution",
                     "enabled": True,
                     "rationale": "提供一个可审批的本地分析步骤。",
                     "parameters": {},
@@ -77,7 +77,6 @@ def test_worker_cancel_stops_at_next_progress_boundary():
 
 def test_cancel_removes_checkpoint_so_restart_has_no_resumable_work(tmp_path: Path):
     database = tmp_path / "cancel.sqlite3"
-    config = load_study_config(Path("configs/research/price_exogenous_eda.yaml"))
     target_path = tmp_path / "target.csv"
     pd.DataFrame(
         {
@@ -85,12 +84,9 @@ def test_cancel_removes_checkpoint_so_restart_has_no_resumable_work(tmp_path: Pa
             "rt_node_price_2B": range(96),
         }
     ).to_csv(target_path, index=False)
-    config = config.model_copy(
-        update={
-            "target": config.target.model_copy(update={"path": target_path}),
-            "exogenous": [],
-            "analysis": config.analysis.model_copy(update={"output_directory": tmp_path / "artifacts"}),
-        }
+    config = infer_study_context(
+        target_path=target_path,
+        output_directory=tmp_path / "artifacts",
     )
     first = ResearchCoordinator(
         main_agent=MainResearchAgent(model_dialogue=CancelDialogue()),

@@ -22,8 +22,6 @@ class ResearchLoopState(TypedDict, total=False):
     study_config: dict[str, Any] | None
     data_profile: dict[str, Any] | None
     quality_report: dict[str, Any] | None
-    data_fingerprint: str | None
-    available_skills: list[dict[str, Any]]
     active_skill: dict[str, Any] | None
     decision: dict[str, Any] | None
     current_plan: dict[str, Any] | None
@@ -41,7 +39,6 @@ class ResearchLoopState(TypedDict, total=False):
     tool_result_cache: dict[str, dict[str, Any]]
     tool_results: list[dict[str, Any]]
     pending_tool_result: dict[str, Any] | None
-    tool_outcome: str
     evaluation: dict[str, Any] | None
     eda_summary: dict[str, Any] | None
     feedback_packets: list[dict[str, Any]]

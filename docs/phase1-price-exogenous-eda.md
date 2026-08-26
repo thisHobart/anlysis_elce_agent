@@ -40,8 +40,8 @@ Agent 只有一条模型函数提议路径：已配置的 OpenAI 兼容模型根
 
 | Skill | 领域协议 | 授权函数 | 适用场景 |
 |---|---|---:|---|
-| `price-exogenous-eda@3.0.0` | `electricity-price-evidence-ladder@2.0.0` | 30 | 电价与外生变量联合研究 |
-| `price-forecastability-audit@1.0.0` | `price-forecastability-ladder@1.0.0` | 14 | 只有目标电价数据，或需要先判断序列本身有多可预测 |
+| `price-exogenous-eda@3.2.0` | `electricity-price-evidence-ladder@2.2.0` | 30 | 电价与外生变量联合研究 |
+| `price-forecastability-audit@1.2.0` | `price-forecastability-ladder@1.2.0` | 14 | 只有目标电价数据，或需要先判断序列本身有多可预测 |
 
 两个 Skill 都可以从程序同级 `skills/` 或 `VPP_SKILL_PATHS` 之外加载外部专业 Skill。Skill 通过受限相对路径声明本地 YAML 研究协议；加载器禁止协议引用越出 Skill 目录。外部 Skill 不能注册或执行代码，只能使用应用已注册且经策略授权的函数。协议函数集合必须与 Skill 授权集合完全一致，否则加载失败。
 
@@ -61,7 +61,7 @@ Agent 只有一条模型函数提议路径：已配置的 OpenAI 兼容模型根
 
 叙述遵循同一套审计日志文风：动词开头、句尾不加标点、不使用第二人称；进行中的分析写作 `分析中 · <函数名>` 并附该函数的注册技术说明，完成后写作 `已完成 · <函数名>` 并只附耗时；批量锁定按研究阶段报告构成（例如“数据体检 1 项、电价自身规律 2 项……共 8 项”）。同一函数的“准备执行 / 执行完成 / 结果校验通过”三条事件在界面上折叠为两行，完整三条仍保留在会话文件与研究包中。
 
-数据文件按研究配置、目标电价、实际外生变量和预测外生变量四种角色管理，但不限制文件名，也不要求全部填写。执行分析时至少需要目标电价序列。用户更换文件后，旧数据画像和计划立即失效。
+数据文件按目标电价、实际外生变量和预测外生变量三种角色管理，不限制文件名。程序从 CSV/Parquet 自动识别时间列、数值列和频率；执行分析时至少需要目标电价序列。用户更换文件后，旧数据画像和计划立即失效。
 
 启动方式：
 
@@ -95,11 +95,11 @@ ADF/KPSS、MSTL/STL 分解、PACF 和 Ljung-Box 无法接受缺口。这些函�
 
 模型、计划、注册表、checkpoint 和审计记录使用同一个函数名。中文展示名称、"这一步回答什么问题"和所属阶段单独存储在 `app/research/tools/catalog.py`；算法变化通过函数版本管理。
 
-每个计划保存父计划、版本、修订来源和数据指纹。执行前重新计算输入文件及配置指纹；如果文件在方案生成后被原地修改，旧方案会被拒绝并要求重新规划。
+每个计划保存父计划、版本、修订来源和数据指纹。执行前重新计算输入文件及自动识别上下文的指纹；如果文件在方案生成后被原地修改，旧方案会被拒绝并要求重新规划。
 
-## 当前数据配置
+## 当前数据文件
 
-默认配置为 `configs/research/price_exogenous_eda.yaml`，使用根目录 `data/` 下的数据：
+桌面端由用户直接选择以下三类数据文件：
 
 | 文件 | 用途 |
 |---|---|
@@ -120,7 +120,7 @@ ADF/KPSS、MSTL/STL 分解、PACF 和 Ljung-Box 无法接受缺口。这些函�
   conversation.json
   research_plan.json
   execution_trace.json
-  study_config.json
+  study_context.json
   data_quality.json
   eda_summary.json
   agent_evaluation.json
@@ -130,12 +130,15 @@ ADF/KPSS、MSTL/STL 分解、PACF 和 Ljung-Box 无法接受缺口。这些函�
   manifest.json
 ```
 
-`report.html` 是用户和评审看的主入口：概览卡片、结论与限制、分析步骤、数据体检、电价规律、影响因素、关系证据、可预测性八个章节，只渲染本轮真的执行过的证据；方案编号、数据指纹、函数版本和参数收在末尾的折叠区。`research_plan.json` 保存模型、提示词版本、Skill、领域协议、用户反馈形成的修订关系、原子函数、函数版本、变量和参数；`manifest.json` 保存输入输出 SHA-256、Git 状态和运行环境（含 statsmodels 版本）。相同数据、代码、配置和锁定计划可以重新执行并核对结构化证据。
+`report.html` 是用户和评审看的主入口：概览卡片、结论与限制、分析步骤、数据体检、电价规律、影响因素、关系证据、可预测性八个章节，只渲染本轮真的执行过的证据；方案编号、数据指纹、函数版本和参数收在末尾的折叠区。`research_plan.json` 保存模型、提示词版本、Skill、领域协议、用户反馈形成的修订关系、原子函数、函数版本、变量和参数；`study_context.json` 保存程序从数据文件推断出的字段与时间轴上下文；`manifest.json` 保存输入输出 SHA-256、Git 状态和运行环境（含 statsmodels 版本）。相同数据、代码和锁定计划可以重新执行并核对结构化证据。
 
 原有确定性入口仍可用于算法回归验证，输出 PNG 图表与 `report.md`：
 
 ```powershell
-.\venv\Scripts\python.exe -m app.research.cli --config configs/research/price_exogenous_eda.yaml
+.\venv\Scripts\python.exe -m app.research.cli `
+  --target data/target_rt_price.csv `
+  --actuals data/feature_actuals.csv `
+  --forecasts data/feature_forecasts.csv
 ```
 
 它不是桌面 Agent 的主要用户入口。

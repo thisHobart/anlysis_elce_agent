@@ -208,15 +208,9 @@ class ConversationPane(QFrame):
         header.setObjectName("conversationHeader")
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(18, 9, 18, 9)
-        title_layout = QVBoxLayout()
-        title_layout.setSpacing(1)
         self.title_label = QLabel("新研究")
         self.title_label.setObjectName("sessionTitle")
-        self.config_label = QLabel("未使用研究配置文件（可选）")
-        self.config_label.setObjectName("sessionMeta")
-        title_layout.addWidget(self.title_label)
-        title_layout.addWidget(self.config_label)
-        header_layout.addLayout(title_layout, 1)
+        header_layout.addWidget(self.title_label, 1)
         self.status_label = QLabel("等待输入")
         self.status_label.setObjectName("sessionStatus")
         header_layout.addWidget(self.status_label)
@@ -258,8 +252,6 @@ class ConversationPane(QFrame):
     def set_session(self, session: ResearchSession) -> None:
         self.title_label.setText(session.title)
         self.status_label.setText(STATUS_LABELS.get(session.status, session.status))
-        config = session.inputs["config"]
-        self.config_label.setText(Path(config.path).name if config.path else "未使用研究配置文件（可选）")
         self.clear_messages()
         for message in session.messages:
             self.render_message(message)
@@ -279,6 +271,7 @@ class ConversationPane(QFrame):
             item = self.timeline_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                widget.hide()
                 widget.deleteLater()
         self._message_widgets.clear()
         self.current_plan_widget = None
@@ -418,7 +411,7 @@ class FileSlotRow(QFrame):
 
 
 class InputFilesPanel(QFrame):
-    """The only entry point for the four supported research input files."""
+    """The only entry point for the three supported research data files."""
 
     file_selected = Signal(str, str)
     file_cleared = Signal(str)
@@ -448,7 +441,7 @@ class InputFilesPanel(QFrame):
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(5)
-        for role in ("config", "target", "actuals", "forecasts"):
+        for role in ("target", "actuals", "forecasts"):
             row = FileSlotRow(role, ROLE_LABELS[role])
             row.selected.connect(self.file_selected)
             row.cleared.connect(self.file_cleared)
@@ -504,7 +497,7 @@ class TracePanel(QFrame):
         self.tree.setObjectName("traceTree")
         self.tree.setRootIsDecorated(False)
         self.tree.setAlternatingRowColors(False)
-        self.tree.setHeaderLabels(["时间", "阶段", "发生了什么"])
+        self.tree.setHeaderLabels(["时间", "阶段", "事件描述"])
         self.tree.header().resizeSection(0, 58)
         self.tree.header().resizeSection(1, 58)
         self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)

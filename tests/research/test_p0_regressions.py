@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from app.research.agent.errors import RepairablePlanError, ResearchPlanValidationError
 from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
 from app.research.agent.subagents.eda import EDASubagent
 from app.research.application.coordinator import ResearchCoordinator
@@ -14,8 +15,9 @@ from app.research.application.execution import EDAExecutionService
 from app.research.application.planning import prepare_research_data
 from app.research.graph.guards import authorization_envelope, validate_automatic_revision
 from app.research.schemas.study import load_study_config
-from app.research.tools.contracts import SegmentDefinition
+from app.research.tools.contracts import SegmentDefinition, ToolOutput
 from app.research.tools.eda.segments import compare_price_segments
+from app.research.tools.executor import output_fingerprint
 
 
 class PricePlanner:
@@ -34,7 +36,7 @@ class PricePlanner:
             "selected_variables": [],
             "steps": [
                 {
-                    "tool": "price_descriptive_distribution",
+                    "function": "price_descriptive_distribution",
                     "rationale": "检查电价分布。",
                     "parameters": {},
                 }
@@ -77,12 +79,12 @@ def test_segment_comparisons_share_one_summary_and_evaluation(synthetic_study: P
                 "selected_variables": ["load"],
                 "steps": [
                     {
-                        "tool": "price_segment_distribution_comparison",
+                        "function": "price_segment_distribution_comparison",
                         "rationale": "在同一快照比较峰谷电价。",
                         "parameters": {"comparison_id": "peak_vs_valley", "segments": segments},
                     },
                     {
-                        "tool": "relationship_pearson_segment_comparison",
+                        "function": "relationship_pearson_segment_comparison",
                         "rationale": "在同一快照比较峰谷负荷关系。",
                         "parameters": {
                             "comparison_id": "peak_vs_valley",
@@ -122,7 +124,7 @@ def test_segment_comparisons_share_one_summary_and_evaluation(synthetic_study: P
                 }
             }
         )
-        if step.tool == "price_segment_distribution_comparison"
+        if step.function == "price_segment_distribution_comparison"
         else step
         for step in proposal.plan.steps
     ]
@@ -250,12 +252,12 @@ def test_duplicate_function_feedback_explains_batch_alternative(synthetic_study:
                 "selected_variables": [],
                 "steps": [
                     {
-                        "tool": "price_lag_autocorrelation",
+                        "function": "price_lag_autocorrelation",
                         "rationale": "检查短滞后。",
                         "parameters": {"max_lag": 1},
                     },
                     {
-                        "tool": "price_lag_autocorrelation",
+                        "function": "price_lag_autocorrelation",
                         "rationale": "检查日滞后。",
                         "parameters": {"max_lag": 24},
                     },
@@ -342,25 +344,108 @@ def test_invalid_resume_action_keeps_current_interrupt(synthetic_study: Path, mo
     assert unchanged.interrupt and unchanged.interrupt.kind == "result"
 
 
-def test_finalize_failure_persists_failed_state_and_preserves_tool_results(synthetic_study: Path):
+def _executed_call(synthetic_study: Path):
+    """Run one real function and hand back the pieces its validation needs."""
+
+    coordinator = _coordinator()
+    config = load_study_config(synthetic_study)
+    proposal = coordinator.propose(question="分析电价分布", config_path=synthetic_study)
+    plan = proposal.plan
+    service = EDAExecutionService()
+    service.prepare(plan=plan, study_config=config)
+    call = next(
+        item for item in service.compile_tool_queue(plan) if item.name == "price_descriptive_distribution"
+    )
+    result = service.execute_call(plan=plan, study_config=config, call=call)
+    return service, plan, call, result
+
+
+def test_a_result_missing_its_evidence_field_is_rejected(synthetic_study: Path):
+    service, plan, call, result = _executed_call(synthetic_study)
+    stripped = {key: value for key, value in result.output.value.items() if key != "distribution"}
+    hollow = ToolOutput(result_key=result.output.result_key, value=stripped)
+    damaged = result.model_copy(
+        update={"output": hollow, "output_hash": output_fingerprint(hollow)}
+    )
+
+    with pytest.raises(RepairablePlanError, match="distribution"):
+        service.validate_tool_result(plan=plan, call=call, result=damaged)
+
+
+def test_a_payload_that_no_longer_matches_its_output_hash_is_rejected(synthetic_study: Path):
+    service, plan, call, result = _executed_call(synthetic_study)
+    tampered_value = {
+        **result.output.value,
+        "distribution": {**result.output.value["distribution"], "mean": 999999.0},
+    }
+    tampered = result.model_copy(
+        update={"output": ToolOutput(result_key=result.output.result_key, value=tampered_value)}
+    )
+
+    with pytest.raises(ResearchPlanValidationError, match="output_hash"):
+        service.validate_tool_result(plan=plan, call=call, result=tampered)
+
+    service.validate_tool_result(plan=plan, call=call, result=result)
+
+
+def test_every_catalog_function_declares_where_its_evidence_lives():
+    from app.research.tools.catalog import FUNCTION_CATALOG
+
+    missing = [name for name, spec in FUNCTION_CATALOG.items() if spec.evidence_field is None]
+    assert missing == ["data_quality"]
+
+
+def test_finalize_failure_offers_a_retry_over_the_preserved_tool_results(synthetic_study: Path):
+    class FlakyFinalizeExecution(EDAExecutionService):
+        attempts = 0
+
+        def finalize(self, **kwargs):
+            type(self).attempts += 1
+            if type(self).attempts == 1:
+                raise RuntimeError("simulated finalization failure")
+            return super().finalize(**kwargs)
+
+    coordinator = _coordinator(execution=FlakyFinalizeExecution())
+    coordinator.submit_user_message(
+        session_id="p0-finalize-failure",
+        message="分析电价",
+        study_config=load_study_config(synthetic_study),
+    )
+    interrupted = coordinator.resume(session_id="p0-finalize-failure", action="approve")
+
+    assert interrupted.phase == "awaiting_user"
+    assert interrupted.interrupt is not None
+    assert interrupted.interrupt.kind == "finalization_error"
+    assert interrupted.interrupt.choices == ["retry", "stop"]
+    assert interrupted.values["tool_results"]
+    assert "simulated finalization failure" in interrupted.values["stop_reason"]
+
+    completed = coordinator.resume(session_id="p0-finalize-failure", action="retry")
+
+    assert FlakyFinalizeExecution.attempts == 2
+    assert completed.values["latest_run"]
+    assert not completed.values.get("stop_reason")
+
+
+def test_a_finalize_failure_the_user_stops_still_leaves_a_terminal_record(synthetic_study: Path):
     class BrokenFinalizeExecution(EDAExecutionService):
         def finalize(self, **_kwargs):
             raise RuntimeError("simulated finalization failure")
 
     coordinator = _coordinator(execution=BrokenFinalizeExecution())
     coordinator.submit_user_message(
-        session_id="p0-finalize-failure",
+        session_id="p0-finalize-stop",
         message="分析电价",
         study_config=load_study_config(synthetic_study),
     )
-    failed = coordinator.resume(session_id="p0-finalize-failure", action="approve")
+    coordinator.resume(session_id="p0-finalize-stop", action="approve")
+    stopped = coordinator.resume(session_id="p0-finalize-stop", action="stop")
 
-    assert failed.phase == "failed"
-    assert failed.interrupt is None
-    assert failed.values["tool_results"]
-    assert "simulated finalization failure" in failed.values["stop_reason"]
-    record = json.loads(Path(failed.values["loop_records"][-1]).read_text(encoding="utf-8"))
-    assert record["outcome"] == "failed"
+    assert stopped.phase == "stopped"
+    assert stopped.values["tool_results"]
+    assert "simulated finalization failure" in stopped.values["stop_reason"]
+    record = json.loads(Path(stopped.values["loop_records"][-1]).read_text(encoding="utf-8"))
+    assert record["outcome"] == "stopped"
     assert record["tool_records"]
 
 

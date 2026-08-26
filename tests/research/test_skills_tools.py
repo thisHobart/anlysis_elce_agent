@@ -15,7 +15,7 @@ from app.research.application.planning import prepare_research_data
 from app.research.schemas.study import load_study_config
 from app.research.skills.loader import SkillLoadError, load_skill
 from app.research.skills.registry import SkillRegistry
-from app.research.tools.catalog import TOOL_CATALOG
+from app.research.tools.catalog import FUNCTION_CATALOG
 from app.research.tools.contracts import ToolCall, ToolContext
 from app.research.tools.eda.functions import build_eda_tool_registry
 from app.research.tools.executor import ToolExecutor
@@ -27,13 +27,13 @@ def test_builtin_eda_skill_is_discoverable_and_versioned():
     skill = registry.get("price-exogenous-eda")
 
     assert skill.source == "builtin"
-    assert skill.version == "3.0.0"
+    assert skill.version == "3.2.0"
     assert skill.domain == "eda"
-    assert set(skill.allowed_tools) == set(TOOL_CATALOG)
+    assert set(skill.allowed_functions) == set(FUNCTION_CATALOG)
     assert skill.research_protocol is not None
     assert skill.research_protocol.protocol_id == "electricity-price-evidence-ladder"
-    assert skill.research_protocol.version == "2.0.0"
-    assert set(skill.research_protocol.function_order) == set(TOOL_CATALOG)
+    assert skill.research_protocol.version == "2.2.0"
+    assert set(skill.research_protocol.function_order) == set(FUNCTION_CATALOG)
 
 
 def test_builtin_domain_protocol_orders_model_calls_locally(synthetic_study: Path):
@@ -52,17 +52,17 @@ def test_builtin_domain_protocol_orders_model_calls_locally(synthetic_study: Pat
                 "selected_variables": ["wind"],
                 "steps": [
                     {
-                        "tool": "relationship_pearson_positive_lead_scan",
+                        "function": "relationship_pearson_positive_lead_scan",
                         "rationale": "检查正领先关系。",
                         "parameters": {"variables": ["wind"], "max_lag": 24},
                     },
                     {
-                        "tool": "exogenous_descriptive_distribution",
+                        "function": "exogenous_descriptive_distribution",
                         "rationale": "先检查变量画像。",
                         "parameters": {"variables": ["wind"]},
                     },
                     {
-                        "tool": "price_lag_autocorrelation",
+                        "function": "price_lag_autocorrelation",
                         "rationale": "建立电价自身滞后基线。",
                         "parameters": {"max_lag": 24},
                     },
@@ -76,14 +76,14 @@ def test_builtin_domain_protocol_orders_model_calls_locally(synthetic_study: Pat
         skill=skill,
     )
 
-    assert [step.tool for step in plan.enabled_steps] == [
+    assert [step.function for step in plan.enabled_steps] == [
         "data_quality",
         "price_lag_autocorrelation",
         "exogenous_descriptive_distribution",
         "relationship_pearson_positive_lead_scan",
     ]
     assert plan.research_protocol_id == "electricity-price-evidence-ladder"
-    assert plan.research_protocol_version == "2.0.0"
+    assert plan.research_protocol_version == "2.2.0"
     assert plan.research_protocol_function_order == list(skill.research_protocol.function_order)
     assert any("请求参数禁用 thinking" in note for note in plan.planning_notes)
 
@@ -97,7 +97,7 @@ def test_builtin_domain_protocol_orders_model_calls_locally(synthetic_study: Pat
         config=config,
         decision=DialogueDecision(
             intent="revise_plan",
-            enabled_tools=[
+            enabled_functions=[
                 "price_tukey_outer_fence",
                 "price_lag_autocorrelation",
                 "exogenous_descriptive_distribution",
@@ -107,7 +107,7 @@ def test_builtin_domain_protocol_orders_model_calls_locally(synthetic_study: Pat
             max_lag=24,
         ),
     )
-    assert [step.tool for step in revised.enabled_steps] == [
+    assert [step.function for step in revised.enabled_steps] == [
         "data_quality",
         "price_tukey_outer_fence",
         "price_lag_autocorrelation",
@@ -164,9 +164,9 @@ def test_external_professional_skill_is_loaded_without_executing_scripts(tmp_pat
 
     assert skill.source == "external"
     assert skill.version == "2.1.0"
-    assert skill.allowed_tools == [
+    assert skill.allowed_functions == [
         "data_quality",
-        *[name for name, spec in TOOL_CATALOG.items() if spec.category == "price"],
+        *[name for name, spec in FUNCTION_CATALOG.items() if spec.category == "price"],
     ]
     assert not marker.exists()
 
@@ -206,7 +206,7 @@ def test_external_professional_skill_can_drive_the_eda_subagent(tmp_path: Path, 
                 "selected_variables": [],
                 "steps": [
                     {
-                        "tool": "price_descriptive_distribution",
+                        "function": "price_descriptive_distribution",
                         "enabled": True,
                         "rationale": "外部专业 Skill 要求最小分布分析。",
                         "parameters": {},
@@ -257,7 +257,7 @@ def test_external_skill_cannot_plan_an_unapproved_function(tmp_path: Path, synth
                 "selected_variables": [config.exogenous[0].name],
                 "steps": [
                     {
-                        "tool": "relationship_scipy_pearson_pairwise",
+                        "function": "relationship_scipy_pearson_pairwise",
                         "enabled": True,
                         "rationale": "应被编译器拒绝。",
                         "parameters": {"variables": [config.exogenous[0].name]},

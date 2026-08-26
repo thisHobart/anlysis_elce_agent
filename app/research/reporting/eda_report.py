@@ -178,7 +178,7 @@ def build_eda_report(config: StudyConfig, quality: DataQualityReport, summary: d
             "## Interpretation limits and next checks",
             "",
             (
-                "- Source units and market identity are marked as unknown in the current configuration and must be confirmed "
+                "- Source units and market identity are marked as unknown in the inferred study context and must be confirmed "
                 "before business interpretation."
             ),
             "- Variables marked `observed_only` are useful for descriptive diagnosis but may leak future information in forecasting.",
@@ -191,7 +191,7 @@ def build_eda_report(config: StudyConfig, quality: DataQualityReport, summary: d
             "",
             "## Reproducibility artifacts",
             "",
-            "- `study_config.json`: resolved configuration used by this run",
+            "- `study_context.json`: inferred data and time-axis context used by this run",
             "- `data_quality.json`: source and alignment quality evidence",
             "- `eda_summary.json`: complete structured EDA output",
             "- `aligned_data.parquet`: canonical aligned analysis frame",

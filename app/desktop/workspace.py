@@ -10,7 +10,7 @@ from typing import Any
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import QMessageBox, QSplitter, QWidget
 
-from app.desktop.input_config import build_session_study_config, discover_inputs_from_config, validate_input_path
+from app.desktop.input_config import build_runtime_study, validate_input_path
 from app.desktop.message_widgets import ThinkingMessageWidget
 from app.desktop.panes import STATUS_LABELS, ContextPane, ConversationPane, HistoryPane
 from app.desktop.session import (
@@ -51,7 +51,6 @@ class ResearchWorkspace(QSplitter):
     def __init__(
         self,
         *,
-        config_path: Path | None = None,
         agent: ResearchCoordinator | None = None,
         store: SessionStore | None = None,
         plan_feedback_seconds: int = 30,
@@ -70,7 +69,13 @@ class ResearchWorkspace(QSplitter):
             checkpoint_path=self.store.path.with_name("research_graph.sqlite3")
         )
         self.plan_feedback_seconds = max(1, int(plan_feedback_seconds))
-        self.sessions = [session for session in self.store.load() if not self._is_blank_session(session)]
+        self.sessions = [
+            session
+            for session in self.store.load(self._installed_skill_versions())
+            if not self._is_blank_session(session)
+        ]
+        # Surfaced once, in the first session created after startup.
+        self._recovery_notices = list(self.store.recovery_notices)
         self.current_session_id: str | None = None
         self._thread: QThread | None = None
         self._worker: FunctionWorker | None = None
@@ -123,9 +128,18 @@ class ResearchWorkspace(QSplitter):
         session = self._new_session()
         self.sessions.insert(0, session)
         self.current_session_id = session.session_id
-        if config_path is not None:
-            self._apply_config_to_session(self.current_session, config_path, show_errors=False)
         self._persist_and_render()
+
+    def _installed_skill_versions(self) -> dict[str, str]:
+        """Report the Skill versions this build ships, so stale plans retire when a session opens."""
+
+        registry = getattr(self.agent, "skills", None)
+        if registry is None:
+            return {}
+        try:
+            return {str(item["name"]): str(item["version"]) for item in registry.metadata()}
+        except Exception:  # noqa: BLE001 - a broken registry must not block opening sessions
+            return {}
 
     @property
     def is_busy(self) -> bool:
@@ -154,6 +168,12 @@ class ResearchWorkspace(QSplitter):
         session.trace.append(
             TraceEvent(category="session", name="新建研究会话", status="completed", summary="等待研究问题输入")
         )
+        notices, self._recovery_notices = getattr(self, "_recovery_notices", []), []
+        for notice in notices:
+            session.messages.append(SessionMessage(role="assistant", kind="notice", content=notice))
+            session.trace.append(
+                TraceEvent(category="session", name="历史会话恢复", status="warning", summary=notice)
+            )
         skill_errors = list(getattr(self.agent, "skill_load_errors", []))
         if skill_errors:
             summary = "；".join(skill_errors)
@@ -232,6 +252,8 @@ class ResearchWorkspace(QSplitter):
                     self.conversation.current_plan_widget.set_feedback_paused("需要你重新确认")
 
     def rename_session(self, session_id: str, title: str) -> None:
+        if self.is_busy:
+            return
         session = next((item for item in self.sessions if item.session_id == session_id), None)
         if session is None:
             return
@@ -269,17 +291,14 @@ class ResearchWorkspace(QSplitter):
         self._cancel_plan_feedback_window()
         try:
             resolved = validate_input_path(role, path)  # type: ignore[arg-type]
-            if role == "config":
-                self._apply_config_to_session(self.current_session, resolved, show_errors=True)
-            else:
-                item = self.current_session.inputs[role]  # type: ignore[index]
-                if item.path and Path(item.path).resolve() == resolved:
-                    return
-                item.path = str(resolved)
-                item.status = "selected"
-                item.detail = "待检查"
-                item.variables = []
-                self._invalidate_plan_for_input_change()
+            item = self.current_session.inputs[role]  # type: ignore[index]
+            if item.path and Path(item.path).resolve() == resolved:
+                return
+            item.path = str(resolved)
+            item.status = "selected"
+            item.detail = "待检查"
+            item.variables = []
+            self._invalidate_plan_for_input_change()
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "这个文件暂时用不了", str(exc))
             return
@@ -301,22 +320,6 @@ class ResearchWorkspace(QSplitter):
         self._invalidate_plan_for_input_change()
         self._add_trace("input", f"移除数据文件：{filename}", "completed", "输入数据已更新")
         self._persist_and_render()
-
-    def _apply_config_to_session(self, session: ResearchSession, path: Path, *, show_errors: bool) -> bool:
-        try:
-            discovered = discover_inputs_from_config(path)
-        except (OSError, ValueError) as exc:
-            if show_errors:
-                QMessageBox.warning(self, "配置文件无法使用", str(exc))
-            return False
-        for role, resolved in discovered.items():
-            item = session.inputs[role]
-            item.path = str(resolved)
-            item.status = "selected"
-            item.detail = "待检查"
-            item.variables = []
-        self._invalidate_plan_for_input_change()
-        return True
 
     def _invalidate_plan_for_input_change(self) -> None:
         self._cancel_plan_feedback_window()
@@ -358,7 +361,7 @@ class ResearchWorkspace(QSplitter):
         study_config = None
         if session.can_analyze:
             try:
-                study_config = build_session_study_config(
+                study_config = build_runtime_study(
                     session,
                     output_directory=self.research_output_directory,
                 )
@@ -825,9 +828,6 @@ class ResearchWorkspace(QSplitter):
                     detail=f"有效值 {report.aligned_non_null_rows:,}；缺失 {report.missing_interval_count:,}",
                 )
             )
-        if session.inputs["config"].path:
-            session.inputs["config"].status = "ready"
-            session.inputs["config"].detail = "配置解析完成"
         for role in ("target", "actuals", "forecasts"):
             if not session.inputs[role].path:
                 continue
@@ -873,7 +873,7 @@ class ResearchWorkspace(QSplitter):
                 else self.agent.submit_user_message(
                     session_id=session.session_id,
                     message="按这个执行",
-                    study_config=build_session_study_config(
+                    study_config=build_runtime_study(
                         session,
                         output_directory=self.research_output_directory,
                     ),
@@ -1214,10 +1214,6 @@ class ResearchWorkspace(QSplitter):
         if keep_timeline:
             self.conversation.title_label.setText(self.current_session.title)
             self.conversation.set_status(self.current_session.status)
-            config = self.current_session.inputs["config"]
-            self.conversation.config_label.setText(
-                Path(config.path).name if config.path else "未使用 YAML 配置（可选）"
-            )
             self.context.set_session(self.current_session)
         else:
             self._render_current()

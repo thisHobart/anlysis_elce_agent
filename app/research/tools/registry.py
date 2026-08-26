@@ -23,8 +23,8 @@ class ToolRegistry:
         except KeyError as exc:
             raise ToolRegistryError(f"工具未注册：{name}") from exc
 
-    def function_schemas(self, allowed_tools: list[str] | None = None) -> list[dict]:
-        names = set(allowed_tools) if allowed_tools is not None else set(self._specs)
+    def function_schemas(self, allowed_functions: list[str] | None = None) -> list[dict]:
+        names = set(allowed_functions) if allowed_functions is not None else set(self._specs)
         unknown = names.difference(self._specs)
         if unknown:
             raise ToolRegistryError(f"Skill 引用了未注册工具：{', '.join(sorted(unknown))}")

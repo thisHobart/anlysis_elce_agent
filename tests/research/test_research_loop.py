@@ -11,7 +11,7 @@ import pytest
 from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
 from app.research.agent.schemas import AgentEvaluation, EvaluationCheck
 from app.research.agent.subagents.eda import EDASubagent
-from app.research.application.coordinator import ResearchCoordinator
+from app.research.application.coordinator import GRAPH_SCHEMA_VERSION, ResearchCoordinator
 from app.research.application.execution import EDAExecutionService
 from app.research.graph.contracts import ApprovalState, LoopBudget
 from app.research.schemas.feedback import FeedbackPacket
@@ -48,7 +48,7 @@ class LoopPlanner:
             "selected_variables": [],
             "steps": [
                 {
-                    "tool": function_name,
+                    "function": function_name,
                     "enabled": True,
                     "rationale": "执行受控电价画像。",
                     "parameters": {},
@@ -79,19 +79,19 @@ class FourToolPlanner:
             "selected_variables": variables,
             "steps": [
                 {
-                    "tool": "price_descriptive_distribution",
+                    "function": "price_descriptive_distribution",
                     "enabled": True,
                     "rationale": "检查电价分布。",
                     "parameters": {},
                 },
                 {
-                    "tool": "exogenous_descriptive_distribution",
+                    "function": "exogenous_descriptive_distribution",
                     "enabled": True,
                     "rationale": "检查外生变量画像。",
                     "parameters": {"variables": variables},
                 },
                 {
-                    "tool": "relationship_scipy_pearson_pairwise",
+                    "function": "relationship_scipy_pearson_pairwise",
                     "enabled": True,
                     "rationale": "检查同期关系。",
                     "parameters": {"variables": variables},
@@ -109,7 +109,7 @@ class NeedUserDialogue(LoopDialogue):
                 intent="revise_plan",
                 response="已生成用户要求的收缩方案。",
                 objective="仅保留电价画像",
-                enabled_tools=["price_descriptive_distribution"],
+                enabled_functions=["price_descriptive_distribution"],
                 selected_variables=[],
                 max_lag=4,
             )
@@ -320,7 +320,7 @@ def test_old_graph_schema_restarts_on_the_next_user_message(synthetic_study: Pat
         study_config=config,
     )
 
-    assert restarted.values["graph_schema_version"] == 8
+    assert restarted.values["graph_schema_version"] == GRAPH_SCHEMA_VERSION
     assert restarted.values["user_request"] == "分析电价结构"
     assert restarted.interrupt and restarted.interrupt.kind == "plan_approval"
     assert restarted.values["budget"]["plan_attempts_in_iteration"] == 1
@@ -531,7 +531,7 @@ def test_evaluation_revision_cannot_expand_original_approval(
                 "selected_variables": [],
                 "steps": [
                     {
-                        "tool": "price_descriptive_distribution",
+                        "function": "price_descriptive_distribution",
                         "enabled": True,
                         "rationale": "测试已审批函数。",
                         "parameters": {},
@@ -539,7 +539,7 @@ def test_evaluation_revision_cannot_expand_original_approval(
                     *(
                         [
                             {
-                                "tool": "price_calendar_group_profile",
+                                "function": "price_calendar_group_profile",
                                 "enabled": True,
                                 "rationale": "测试新增未审批函数。",
                                 "parameters": {},
@@ -601,7 +601,7 @@ def test_duplicate_automatic_plan_stops_before_reexecuting_tools(
                 "selected_variables": [],
                 "steps": [
                     {
-                        "tool": "price_descriptive_distribution",
+                        "function": "price_descriptive_distribution",
                         "enabled": True,
                         "rationale": "始终相同。",
                         "parameters": {},
@@ -824,7 +824,7 @@ def test_evaluator_need_user_modify_returns_to_plan_approval(
     assert waiting.interrupt and waiting.interrupt.kind == "result_limitations"
     revised = coordinator.resume(session_id=session_id, action="modify", message="修改方案，只保留电价画像")
     assert revised.interrupt and revised.interrupt.kind == "plan_approval"
-    assert [step["tool"] for step in revised.values["current_plan"]["steps"] if step["enabled"]] == [
+    assert [step["function"] for step in revised.values["current_plan"]["steps"] if step["enabled"]] == [
         "data_quality",
         "price_descriptive_distribution",
     ]
@@ -913,7 +913,7 @@ def test_function_queue_size_does_not_reduce_iteration_limit(
             draft = super().propose(*args, **kwargs)
             draft["steps"].append(
                 {
-                    "tool": "price_lag_autocorrelation",
+                    "function": "price_lag_autocorrelation",
                     "enabled": True,
                     "rationale": "每轮收缩滞后范围以产生不同证据。",
                     "parameters": {"max_lag": max(1, 5 - self.calls)},

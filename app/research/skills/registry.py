@@ -63,7 +63,7 @@ class SkillRegistry:
                 "description": skill.description,
                 "version": skill.version,
                 "domain": skill.domain,
-                "allowed_tools": skill.allowed_tools,
+                "allowed_functions": skill.allowed_functions,
                 "research_protocol": (
                     {
                         "protocol_id": skill.research_protocol.protocol_id,

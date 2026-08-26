@@ -2,7 +2,7 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,13 +17,13 @@ def runtime_env_file() -> Path:
 class Settings(BaseSettings):
     """Runtime configuration loaded from environment variables."""
 
-    llm_enabled: bool = False
     llm_base_url: str = ""
     llm_api_key: SecretStr = SecretStr("")
     llm_model: str = ""
     llm_timeout_seconds: float = 20.0
     llm_max_retries: int = 1
-    llm_history_messages: int = 8
+    llm_history_messages: int = Field(default=8, ge=1, le=100)
+    """Conversation turns sent to the model; the desktop dialog writes this value."""
     skill_paths: str = ""
     model_config = SettingsConfigDict(
         env_file=str(runtime_env_file()),

@@ -21,7 +21,7 @@ from app.research.planning.compiler import EDAPlanCompiler
 from app.research.planning.contracts import EDAPlanDraft
 from app.research.schemas.study import load_study_config
 from app.research.skills.registry import SkillRegistry
-from app.research.tools.catalog import STAGE_TITLES, TOOL_CATALOG
+from app.research.tools.catalog import FUNCTION_CATALOG, STAGE_TITLES
 
 
 def test_narration_turns_loop_events_into_plain_language():
@@ -36,7 +36,7 @@ def test_narration_turns_loop_events_into_plain_language():
     assert step.stage_label == "执行分析"
     assert step.title == "分析中 · 电价平稳性检验"
     assert step.function_name == "price_stationarity_tests"
-    assert step.detail == TOOL_CATALOG["price_stationarity_tests"].description.rstrip("。")
+    assert step.detail == FUNCTION_CATALOG["price_stationarity_tests"].description.rstrip("。")
     assert "price_stationarity_tests" not in step.title
 
 
@@ -99,6 +99,40 @@ def test_every_graph_node_has_a_staged_label_or_is_silent():
     assert narrate_node("unknown_node")[1].title == "研究进行中"
 
 
+# What the Skill promises the model, and the constant the evaluator judges by.
+SKILL_THRESHOLD_CONTRACT = (
+    ("SEASONAL_STRENGTH_THRESHOLD", 0.3, "< 0.3 视为无稳定周期结构"),
+    ("CALENDAR_EFFECT_THRESHOLD", 0.06, "≥ 6% 的电价方差"),
+    ("DISTRIBUTION_SKEW_THRESHOLD", 0.5, "绝对值 ≥ 0.5"),
+    ("DISTRIBUTION_KURTOSIS_THRESHOLD", 1.0, "（超额峰度）≥ 1.0"),
+    ("VOLATILITY_REGIME_RATIO", 2.0, "比值 ≥ 2"),
+    ("MINIMUM_DRIVER_COVERAGE", 0.9, "< 90% 的变量不足以支撑关系分析"),
+)
+
+
+def test_the_skill_states_the_thresholds_the_evaluator_actually_applies():
+    """A model told one threshold and judged by another produces unexplainable verdicts."""
+
+    from app.research.evaluation import eda as evaluator
+
+    skill = SkillRegistry.default(Settings(skill_paths="")).get("price-exogenous-eda")
+    for name, expected_value, promised_text in SKILL_THRESHOLD_CONTRACT:
+        assert getattr(evaluator, name) == expected_value, name
+        assert promised_text in skill.instructions, f"{name} 的判据没有写进 SKILL.md"
+
+
+def test_both_skills_tell_the_model_a_hypothesis_must_be_verifiable():
+    """Since unverifiable hypotheses now block a run, the Skill has to say so up front."""
+
+    registry = SkillRegistry.default(Settings(skill_paths=""))
+    for name in ("price-exogenous-eda", "price-forecastability-audit"):
+        instructions = registry.get(name).instructions
+        assert "必须能被**本轮选择的函数**判定" in instructions, name
+        protocol = registry.get(name).research_protocol
+        assert protocol is not None
+        assert any("写不出对应函数的猜想不得列入议程" in item for item in protocol.invariants), name
+
+
 def test_two_core_skills_ship_with_the_application():
     registry = SkillRegistry.default(Settings(skill_paths=""))
     names = {item["name"] for item in registry.metadata()}
@@ -107,8 +141,8 @@ def test_two_core_skills_ship_with_the_application():
     audit = registry.get("price-forecastability-audit")
     assert audit.domain == "eda"
     assert audit.research_protocol is not None
-    assert "data_quality" in audit.allowed_tools
-    assert not any(name.startswith(("exogenous_", "relationship_")) for name in audit.allowed_tools)
+    assert "data_quality" in audit.allowed_functions
+    assert not any(name.startswith(("exogenous_", "relationship_")) for name in audit.allowed_functions)
 
 
 def test_catalog_stages_match_the_builtin_protocol_stages():
@@ -118,7 +152,7 @@ def test_catalog_stages_match_the_builtin_protocol_stages():
         assert skill.research_protocol is not None
         for stage in skill.research_protocol.stages:
             for function_name in stage.functions:
-                assert TOOL_CATALOG[function_name].stage == stage.stage_id
+                assert FUNCTION_CATALOG[function_name].stage == stage.stage_id
             assert stage.stage_id in STAGE_TITLES or not stage.functions
 
 
@@ -127,7 +161,7 @@ def forecastability_result(synthetic_study: Path, tmp_path: Path):
     config = load_study_config(synthetic_study)
     skill = SkillRegistry.default(Settings(skill_paths="")).get("price-forecastability-audit")
     steps = [
-        {"tool": name, "enabled": True, "rationale": "可预测性审计", "parameters": {"max_lag": 24} if TOOL_CATALOG[name].uses_max_lag else {}}
+        {"function": name, "enabled": True, "rationale": "可预测性审计", "parameters": {"max_lag": 24} if FUNCTION_CATALOG[name].uses_max_lag else {}}
         for name in (
             "price_descriptive_distribution",
             "price_duration_curve",

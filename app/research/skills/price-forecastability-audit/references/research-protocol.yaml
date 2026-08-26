@@ -1,15 +1,17 @@
 protocol_id: price-forecastability-ladder
-version: "1.0.0"
+version: "1.2.0"
 kind: domain-evidence-ladder
 objective: >-
-  只用目标电价序列，按形态、动态和建模就绪三层证据判断该序列的可预测性难度，
-  并给出后续算法实验必须超越的朴素基线误差底线。
+  只用目标电价序列，按形态、动态、建模就绪三层证据把该序列的可预测性归入结构清晰、
+  以持续性为主、难度高或需先预处理之一，并给出后续算法实验必须超越的朴素基线误差底线。
 invariants:
   - 预测问题必须区分市场产品、预测起点、预测范围、时间粒度和市场时区；未知项保持未知。
   - 本协议不使用任何外生变量函数，selected_variables 始终为空。
   - 时间戳对齐必须保留时区与夏令时语义，不用行号近似市场时间。
   - 负价、价格上限附近值和尖峰默认保留；只识别和解释，不静默截尾、删除或插补。
   - 平稳性、季节分解和偏自相关需要连续序列，只在这些方法内部做时间插值并报告插值比例。
+  - 定级必须同时引用季节强度、记忆结构和朴素基线，不得只凭单一指标。
+  - 每条假设都必须能被本轮选择的函数判定；写不出对应函数的猜想不得列入议程。
   - 朴素基线为全样本计算，只作为误差底线量级参考，不等于样本外预测精度。
   - 可预测性判定只描述序列自身难度，不构成模型选择结论。
 stop_conditions:
@@ -27,16 +29,18 @@ stages:
 
   - stage_id: data_readiness
     title: 数据质量门禁
-    objective: 检查时间轴、覆盖、重复、缺失和数值有效性。
+    objective: 确认目标序列的时间轴、覆盖和有效样本足以支撑时序结论。
     functions:
       - data_quality
     function_rules:
-      data_quality: 每个方案强制执行一次；由本地编译器加入，不由 API 模型提出。
-    exit_gate: 目标满足最低 EDA 样本要求；高风险问题进入限制清单。
+      data_quality: >-
+        每个方案强制执行一次，由本地编译器加入。确认有效样本量、覆盖缺口位置与重复时间戳；
+        缺口成片出现时，滚动统计与季节分解结论都要标注受影响区间。
+    exit_gate: 目标满足最低 EDA 样本要求；不足两个完整日周期时不进入季节分解与偏自相关。
 
   - stage_id: price_shape
     title: 价格形态与极端状态
-    objective: 建立价格水平、分布、集中度、极端阈值和尖峰负价状态的描述性证据。
+    objective: 建立价格水平、集中度、极端阈值和尖峰负价状态的证据。
     functions:
       - price_descriptive_distribution
       - price_duration_curve
@@ -44,16 +48,23 @@ stages:
       - price_spike_regime_profile
       - price_segment_distribution_comparison
     function_rules:
-      price_descriptive_distribution: 研究价格水平、离散或偏态时选择。
-      price_duration_curve: 关注高价时段占比与价格集中度时选择。
-      price_tukey_outer_fence: 关注极端点阈值与具体时点时选择。
-      price_spike_regime_profile: 关注尖峰与负价的频率、持续时间、聚集性和出现时段时选择。
-      price_segment_distribution_comparison: 峰谷、季节或事件前后比较时，把所有子样本放入一次 segments 调用。
-    exit_gate: 已区分常态价格区间与极端状态，并说明极端事件是否成片出现。
+      price_descriptive_distribution: >-
+        先做，为后续所有阈值提供量纲与分位基准。skewness 绝对值 ≥ 0.5 或 kurtosis（超额峰度）
+        ≥ 1.0 即认定明显偏斜或厚尾。
+      price_duration_curve: >-
+        需要量化高价时段集中度时做。少数时段贡献大部分价格水平时，
+        平均误差指标不足以刻画难度。
+      price_tukey_outer_fence: 需要具体极端时点及其阈值时做；只标记，不删除。
+      price_spike_regime_profile: >-
+        判断尖峰是孤立还是成片。persistence_ratio 大于 1 表示聚集，此时朴素基线的平均误差
+        低估真实难度，定级要下调；concentration 指出风险时段；negative_share 非零时单独说明负价。
+      price_segment_distribution_comparison: >-
+        用户明确给出子样本边界时做，一次 segments 调用覆盖全部子样本。
+    exit_gate: 已区分常态价格区间与极端状态，并说明极端事件是孤立出现还是成片出现。
 
   - stage_id: price_dynamics
     title: 波动、平稳性与记忆
-    objective: 建立波动状态、平稳性、趋势与季节成分和自相关记忆的证据。
+    objective: 建立波动状态、平稳性 verdict、季节强度和记忆阶数的证据。
     functions:
       - price_calendar_group_profile
       - price_rolling_mean_std
@@ -62,21 +73,40 @@ stages:
       - price_lag_autocorrelation
       - price_partial_autocorrelation
     function_rules:
-      price_calendar_group_profile: 关注小时、星期、工作日/周末或月份结构时选择。
-      price_rolling_mean_std: 关注波动聚集或状态切换时选择。
-      price_stationarity_tests: 关注趋势、漂移或差分需求时选择。
-      price_seasonal_decomposition: 关注趋势与日周季节成分占比、残差规模时选择。
-      price_lag_autocorrelation: 关注整体持续性与滞后衰减时选择。
-      price_partial_autocorrelation: 关注自回归阶数或是否接近随机游走时选择。
-    exit_gate: 已同时给出平稳性结论、季节成分强度和记忆结构，不用单一指标下结论。
+      price_calendar_group_profile: >-
+        确认日内、周内或月度结构是否稳定。没有分解强度时，用分组自身的组间方差占比判断：
+        某个分组解释了 ≥ 6% 的电价方差即认定存在该层结构。
+      price_rolling_mean_std: >-
+        判断波动是否分阶段切换：rolling_statistics.one_day 的 maximum_std 与 minimum_std 比值 ≥ 2
+        即认定分阶段。波动分段切换会让全样本统计量失去代表性。
+      price_stationarity_tests: >-
+        verdict 为 unit_root 时先差分再谈记忆结构；为 trend_or_break_suspected 时配合
+        trend_strength 或分段对比定位；为 inconclusive 时记为限制，不在两者中硬选一个。
+      price_seasonal_decomposition: >-
+        seasonal_strength ≥ 0.6 为强周期结构，0.3–0.6 为中等，< 0.3 视为无稳定周期结构；
+        variance_share.remainder 过半时季节结论一律降级表述。
+      price_lag_autocorrelation: >-
+        看整体持续性与日/周滞后衰减形状。Ljung-Box 各阶均不拒绝时序列接近白噪声，
+        不再用衰减形状讲记忆。
+      price_partial_autocorrelation: >-
+        取 suggested_autoregressive_order 与 significance_band 看直接记忆；
+        一阶后即落入置信带说明接近随机游走，模型增益空间有限。
+    exit_gate: 平稳性 verdict、季节强度和记忆阶数三项均有结论或明确限制，不用单一指标下结论。
 
   - stage_id: modeling_readiness
     title: 预处理建议与误差底线
-    objective: 给出方差稳定变换建议，并计算后续模型必须超越的朴素基线误差。
+    objective: 给出方差稳定变换建议与朴素基线误差底线，并完成可预测性定级。
     functions:
       - price_variance_stabilization_check
       - price_naive_baseline_benchmark
     function_rules:
-      price_variance_stabilization_check: 关注厚尾或建模预处理必要性时选择。
-      price_naive_baseline_benchmark: 关注可预测性难度或后续模型达标线时选择。
-    exit_gate: 误差底线与预处理建议均已记录；进入预测阶段前仍需时间顺序切分与样本外验证。
+      price_variance_stabilization_check: >-
+        厚尾明显或需要给出建模预处理建议时做。recommended_transform 为 asinh_median_mad 时，
+        先给预处理结论再谈难度档。
+      price_naive_baseline_benchmark: >-
+        引用 best_baseline_label 与 best_mae 原值作为达标线。best_baseline 为 daily_naive 或
+        weekly_naive 支持结构清晰；为 persistence 且日/周 naive 的 mae_ratio_to_persistence 均大于 1
+        时归入以持续性为主。near_zero_share ≥ 1% 时不得使用百分比误差指标。
+    exit_gate: >-
+      已归入结构清晰、以持续性为主、难度高或需先预处理之一，误差底线与预处理建议均已记录；
+      进入预测阶段前仍需时间顺序切分与样本外验证。

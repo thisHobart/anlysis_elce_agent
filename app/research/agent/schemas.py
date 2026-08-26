@@ -11,10 +11,16 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.research.schemas.feedback import FeedbackPacket
 from app.research.schemas.results import DataQualityReport
-from app.research.tools.catalog import LEGACY_METHOD_TO_FUNCTION, TOOL_CATALOG, ResearchFunctionName
+from app.research.tools.catalog import FUNCTION_CATALOG, LEGACY_METHOD_TO_FUNCTION, ResearchFunctionName
 
 EDAToolName = ResearchFunctionName
-AgendaScope = Literal["within_envelope", "needs_approval", "needs_data", "inherent"]
+AgendaScope = Literal[
+    "within_envelope",
+    "needs_approval",
+    "needs_data",
+    "needs_restatement",
+    "inherent",
+]
 
 
 class ConversationMessage(BaseModel):
@@ -27,20 +33,34 @@ class ConversationMessage(BaseModel):
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
 
+def rename_legacy_step_keys(step: Any) -> Any:
+    """Accept plans written before a research function stopped being called a tool."""
+
+    if not isinstance(step, dict):
+        return step
+    renamed = dict(step)
+    for old_key, new_key in (("tool", "function"), ("tool_version", "function_version")):
+        if old_key in renamed and new_key not in renamed:
+            renamed[new_key] = renamed.pop(old_key)
+        else:
+            renamed.pop(old_key, None)
+    return renamed
+
+
 class EDAPlanStep(BaseModel):
     """One allow-listed atomic research function proposed by the agent."""
 
     model_config = ConfigDict(extra="forbid")
 
     step_id: str = Field(pattern=r"^S[1-9][0-9]*$")
-    tool: EDAToolName
+    function: EDAToolName
     title: str = Field(min_length=1)
     description: str = Field(min_length=1)
     rationale: str = Field(min_length=1)
     enabled: bool = True
     required: bool = False
     parameters: dict[str, Any] = Field(default_factory=dict)
-    tool_version: str = Field(min_length=1)
+    function_version: str = Field(min_length=1)
 
 
 class EDAPlan(BaseModel):
@@ -85,33 +105,34 @@ class EDAPlan(BaseModel):
 
         if not isinstance(value, dict) or not isinstance(value.get("steps"), list):
             return value
+        value = {**value, "steps": [rename_legacy_step_keys(step) for step in value["steps"]]}
         legacy_tools = {"price_profile", "exogenous_profile", "relationship_analysis"}
-        if not any(isinstance(step, dict) and step.get("tool") in legacy_tools for step in value["steps"]):
+        if not any(isinstance(step, dict) and step.get("function") in legacy_tools for step in value["steps"]):
             return value
         migrated: list[dict[str, Any]] = []
         seen: set[str] = set()
         for raw_step in value["steps"]:
             if not isinstance(raw_step, dict):
                 continue
-            tool = str(raw_step.get("tool", ""))
-            if tool == "data_quality":
+            name = str(raw_step.get("function", ""))
+            if name == "data_quality":
                 quality = {key: item for key, item in raw_step.items() if key != "method_versions"}
                 migrated.append(quality)
-                seen.add(tool)
+                seen.add(name)
                 continue
-            if tool not in legacy_tools:
+            if name not in legacy_tools:
                 migrated.append({key: item for key, item in raw_step.items() if key != "method_versions"})
-                seen.add(tool)
+                seen.add(name)
                 continue
             parameters = dict(raw_step.get("parameters") or {})
             methods = parameters.pop("methods", [])
             for method in methods:
-                function_name = LEGACY_METHOD_TO_FUNCTION.get((tool, str(method)))
+                function_name = LEGACY_METHOD_TO_FUNCTION.get((name, str(method)))
                 if function_name is None:
-                    raise ValueError(f"旧计划包含无法迁移的方法：{tool}.{method}")
+                    raise ValueError(f"旧计划包含无法迁移的方法：{name}.{method}")
                 if function_name in seen:
                     continue
-                spec = TOOL_CATALOG[function_name]
+                spec = FUNCTION_CATALOG[function_name]
                 function_parameters: dict[str, Any] = {}
                 if spec.uses_variables and "variables" in parameters:
                     function_parameters["variables"] = parameters["variables"]
@@ -129,14 +150,14 @@ class EDAPlan(BaseModel):
                 migrated.append(
                     {
                         "step_id": "S1",
-                        "tool": function_name,
+                        "function": function_name,
                         "title": spec.title,
                         "description": spec.description,
                         "rationale": raw_step.get("rationale") or spec.description,
                         "enabled": bool(raw_step.get("enabled", True)),
                         "required": False,
                         "parameters": function_parameters,
-                        "tool_version": spec.version,
+                        "function_version": spec.version,
                     }
                 )
                 seen.add(function_name)
@@ -147,12 +168,12 @@ class EDAPlan(BaseModel):
     @model_validator(mode="after")
     def validate_steps(self) -> EDAPlan:
         ids = [step.step_id for step in self.steps]
-        tools = [step.tool for step in self.steps]
+        tools = [step.function for step in self.steps]
         if len(ids) != len(set(ids)):
             raise ValueError("plan step ids must be unique")
         if len(tools) != len(set(tools)):
             raise ValueError("each research function may appear at most once")
-        quality = next((step for step in self.steps if step.tool == "data_quality"), None)
+        quality = next((step for step in self.steps if step.function == "data_quality"), None)
         if quality is None or not quality.required or not quality.enabled:
             raise ValueError("data_quality must be an enabled, required plan step")
         if bool(self.research_protocol_id) != bool(self.research_protocol_version):
@@ -169,13 +190,13 @@ class EDAPlan(BaseModel):
                 raise ValueError(f"research protocol does not cover plan functions: {', '.join(uncovered)}")
         selected = list(dict.fromkeys(self.selected_variables))
         for step in self.steps:
-            spec = TOOL_CATALOG[step.tool]
+            spec = FUNCTION_CATALOG[step.function]
             if "methods" in step.parameters:
-                raise ValueError(f"atomic function {step.tool} must not contain methods")
+                raise ValueError(f"atomic function {step.function} must not contain methods")
             if spec.uses_variables and step.enabled and step.parameters.get("variables") != selected:
-                raise ValueError(f"{step.tool} variables must match plan.selected_variables")
+                raise ValueError(f"{step.function} variables must match plan.selected_variables")
             if spec.uses_max_lag and step.enabled and step.parameters.get("max_lag") is None:
-                raise ValueError(f"{step.tool} requires max_lag")
+                raise ValueError(f"{step.function} requires max_lag")
         return self
 
     @property
@@ -190,7 +211,7 @@ class EDAPlan(BaseModel):
         rank = {
             name: index for index, name in enumerate(self.research_protocol_function_order)
         }
-        ordered = sorted(self.steps, key=lambda step: rank[step.tool])
+        ordered = sorted(self.steps, key=lambda step: rank[step.function])
         renumbered = [
             step.model_copy(update={"step_id": f"S{index}"})
             for index, step in enumerate(ordered, start=1)
@@ -221,7 +242,7 @@ class EDAPlan(BaseModel):
         updated_steps: list[EDAPlanStep] = []
         for step in self.steps:
             parameters = dict(step.parameters)
-            spec = TOOL_CATALOG[step.tool]
+            spec = FUNCTION_CATALOG[step.function]
             if spec.uses_variables:
                 parameters["variables"] = variables
             if spec.uses_max_lag:

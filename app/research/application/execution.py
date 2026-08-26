@@ -25,10 +25,10 @@ from app.research.evaluation.eda import evaluate_agent_run
 from app.research.reporting.artifacts import write_agent_research_package
 from app.research.schemas.study import StudyConfig
 from app.research.skills.registry import SkillRegistry
-from app.research.tools.catalog import TOOL_CATALOG
+from app.research.tools.catalog import FUNCTION_CATALOG
 from app.research.tools.contracts import ToolCall, ToolContext, ToolResult
 from app.research.tools.eda.functions import build_eda_tool_registry
-from app.research.tools.executor import ToolExecutor
+from app.research.tools.executor import ToolExecutor, output_fingerprint
 from app.research.tools.policy import ToolPolicy
 from app.research.tools.registry import ToolRegistry
 from app.runtime_paths import source_worktree
@@ -133,28 +133,29 @@ class EDAExecutionService:
             raise PlanCompatibilityError(
                 f"Skill 版本不匹配 {plan.skill_name}: plan={plan.skill_version}, installed={skill.version}"
             )
-        policy = ToolPolicy(allowed_tools=frozenset(skill.allowed_tools))
+        policy = ToolPolicy(allowed_functions=frozenset(skill.allowed_functions))
         for step in plan.enabled_steps:
             try:
-                installed_tool = self.registry.get(step.tool)
+                installed_tool = self.registry.get(step.function)
             except ValueError as exc:
                 raise PlanCompatibilityError(str(exc)) from exc
-            if step.tool_version != installed_tool.version:
+            if step.function_version != installed_tool.version:
                 raise PlanCompatibilityError(
-                    f"工具版本不匹配 {step.tool}: "
-                    f"plan={step.tool_version}, installed={installed_tool.version}"
+                    f"工具版本不匹配 {step.function}: "
+                    f"plan={step.function_version}, installed={installed_tool.version}"
                 )
             arguments = {key: value for key, value in step.parameters.items() if key != "max_lag_limit"}
             try:
                 installed_tool.arguments_model.model_validate(arguments)
             except (TypeError, ValueError) as exc:
-                raise RepairablePlanError(f"函数 {step.tool} 参数无效：{exc}") from exc
+                raise RepairablePlanError(f"函数 {step.function} 参数无效：{exc}") from exc
         prepared = prepare_research_data(config)
         inputs = input_file_manifest(config)
         study_hash = study_fingerprint(config, inputs)
         if plan.data_fingerprint is not None and plan.data_fingerprint != study_hash:
             raise DataFingerprintMismatchError(
-                "研究文件或配置在方案生成后发生变化；为避免在新数据上执行旧方案，请重新生成分析方案"
+                "研究数据或自动识别的数据上下文在方案生成后发生变化；"
+                "为避免在新数据上执行旧方案，请重新生成分析方案"
             )
         if not prepared.quality.usable_for_eda:
             raise InsufficientDataError("target data does not meet the minimum observation requirement for EDA")
@@ -163,7 +164,7 @@ class EDAExecutionService:
         unknown = sorted(set(selected).difference(available_variables))
         if unknown:
             raise RepairablePlanError(f"plan contains unknown variables: {', '.join(unknown)}")
-        needs_variables = any(step.enabled and TOOL_CATALOG[step.tool].uses_variables for step in plan.steps)
+        needs_variables = any(step.enabled and FUNCTION_CATALOG[step.function].uses_variables for step in plan.steps)
         if needs_variables and not selected:
             raise RepairablePlanError(
                 "at least one exogenous variable must be selected for the approved plan"
@@ -215,8 +216,8 @@ class EDAExecutionService:
         for step in plan.enabled_steps:
             arguments = {key: value for key, value in step.parameters.items() if key != "max_lag_limit"}
             payload = {
-                "name": step.tool,
-                "version": step.tool_version,
+                "name": step.function,
+                "version": step.function_version,
                 "arguments": arguments,
             }
             work_id = self._stable_work_id(plan, payload)
@@ -225,8 +226,8 @@ class EDAExecutionService:
                     call_id=self._stable_call_id(plan, step.step_id, work_id),
                     work_id=work_id,
                     step_id=step.step_id,
-                    name=step.tool,
-                    version=step.tool_version,
+                    name=step.function,
+                    version=step.function_version,
                     arguments=arguments,
                 )
             )
@@ -273,6 +274,14 @@ class EDAExecutionService:
             raise ResearchPlanValidationError("工具结果版本与锁定调用不匹配")
         if result.data_fingerprint != plan.data_fingerprint:
             raise ResearchPlanValidationError("工具结果数据指纹与锁定计划不匹配")
+        if output_fingerprint(result.output) != result.output_hash:
+            # A reused or checkpoint-restored payload must still hash to its recorded value.
+            raise ResearchPlanValidationError(f"工具 {call.name} 的结果与记录的 output_hash 不一致")
+        evidence_field = FUNCTION_CATALOG[call.name].evidence_field
+        if evidence_field is not None and evidence_field not in result.output.value:
+            raise RepairablePlanError(
+                f"工具 {call.name} 的结果缺少证据字段 {evidence_field}"
+            )
 
     @classmethod
     def _merge_evidence(cls, existing: Any, incoming: Any, *, field: str = "") -> Any:
@@ -361,7 +370,7 @@ class EDAExecutionService:
                 {
                     "step_id": step.step_id,
                     "call_id": result.call.call_id,
-                    "tool": result.call.name,
+                    "function": result.call.name,
                     "title": step.title,
                     "parameters": step.parameters,
                     "status": "completed",
@@ -370,7 +379,7 @@ class EDAExecutionService:
                     "finished_at": result.finished_at or record.get("finished_at"),
                     "duration_ms": result.duration_ms,
                     "provider": result.provider,
-                    "tool_version": result.tool_version,
+                    "function_version": result.tool_version,
                     "data_fingerprint": result.data_fingerprint,
                     "output_hash": result.output_hash,
                 }
