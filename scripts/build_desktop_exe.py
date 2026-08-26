@@ -46,7 +46,13 @@ def main(argv: list[str] | None = None) -> int:
         "notebook",
     )
     exclude_args = [f"--exclude-module={name}" for name in desktop_excludes]
-    builtin_skill = root / "app" / "research" / "skills" / "price-exogenous-eda"
+    skill_root = root / "app" / "research" / "skills"
+    builtin_skills = sorted(path for path in skill_root.iterdir() if (path / "SKILL.md").is_file())
+    if not builtin_skills:
+        raise SystemExit("No builtin Skill bundle was found to package.")
+    skill_args = [
+        f"--add-data={path};app/research/skills/{path.name}" for path in builtin_skills
+    ]
     PyInstaller.__main__.run(
         [
             str(entry),
@@ -61,7 +67,11 @@ def main(argv: list[str] | None = None) -> int:
             f"--distpath={root / 'dist'}",
             f"--workpath={root / 'build' / 'pyinstaller'}",
             f"--specpath={root / 'build'}",
-            f"--add-data={builtin_skill};app/research/skills/price-exogenous-eda",
+            "--collect-data=statsmodels",
+            "--hidden-import=statsmodels.tsa.seasonal",
+            "--hidden-import=statsmodels.tsa.stattools",
+            "--hidden-import=statsmodels.stats.diagnostic",
+            *skill_args,
             *exclude_args,
         ]
     )

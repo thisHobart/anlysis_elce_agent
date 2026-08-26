@@ -64,6 +64,15 @@ class SkillRegistry:
                 "version": skill.version,
                 "domain": skill.domain,
                 "allowed_tools": skill.allowed_tools,
+                "research_protocol": (
+                    {
+                        "protocol_id": skill.research_protocol.protocol_id,
+                        "version": skill.research_protocol.version,
+                        "kind": skill.research_protocol.kind,
+                    }
+                    if skill.research_protocol is not None
+                    else None
+                ),
                 "source": skill.source,
             }
             for skill in self._skills.values()

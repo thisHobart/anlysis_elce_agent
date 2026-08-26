@@ -20,6 +20,7 @@ dependencies = [
   "pyarrow>=15.0,<24.0",
   "pyyaml>=6.0,<7.0",
   "scipy>=1.12,<2.0",
+  "statsmodels>=0.14,<1.0",
   # Phase 1 desktop application
   "PySide6>=6.8,<7.0",
 ]

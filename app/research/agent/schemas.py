@@ -11,14 +11,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.research.schemas.feedback import FeedbackPacket
 from app.research.schemas.results import DataQualityReport
-from app.research.tools.catalog import method_keys, selected_implementation_versions
+from app.research.tools.catalog import LEGACY_METHOD_TO_FUNCTION, TOOL_CATALOG, ResearchFunctionName
 
-EDAToolName = Literal[
-    "data_quality",
-    "price_profile",
-    "exogenous_profile",
-    "relationship_analysis",
-]
+EDAToolName = ResearchFunctionName
+AgendaScope = Literal["within_envelope", "needs_approval", "needs_data", "inherent"]
 
 
 class ConversationMessage(BaseModel):
@@ -32,7 +28,7 @@ class ConversationMessage(BaseModel):
 
 
 class EDAPlanStep(BaseModel):
-    """One allow-listed analytical tool call proposed by the agent."""
+    """One allow-listed atomic research function proposed by the agent."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -45,7 +41,6 @@ class EDAPlanStep(BaseModel):
     required: bool = False
     parameters: dict[str, Any] = Field(default_factory=dict)
     tool_version: str = Field(min_length=1)
-    method_versions: dict[str, str] = Field(default_factory=dict)
 
 
 class EDAPlan(BaseModel):
@@ -70,15 +65,84 @@ class EDAPlan(BaseModel):
     study_name: str = Field(min_length=1)
     planner: Literal["llm"]
     planning_model: str | None = None
-    planning_prompt_version: str = "eda-plan-v5"
+    planning_prompt_version: str = "eda-plan-v9"
     skill_name: str = Field(min_length=1)
     skill_version: str = Field(min_length=1)
+    research_protocol_id: str | None = None
+    research_protocol_version: str | None = None
+    research_protocol_function_order: list[EDAToolName] = Field(default_factory=list)
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     hypotheses: list[str] = Field(default_factory=list)
     selected_variables: list[str] = Field(default_factory=list)
     steps: list[EDAPlanStep] = Field(min_length=1)
     assumptions: list[str] = Field(default_factory=list)
     planning_notes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_steps(cls, value: Any) -> Any:
+        """Translate v1 aggregate tool/method plans into atomic function calls."""
+
+        if not isinstance(value, dict) or not isinstance(value.get("steps"), list):
+            return value
+        legacy_tools = {"price_profile", "exogenous_profile", "relationship_analysis"}
+        if not any(isinstance(step, dict) and step.get("tool") in legacy_tools for step in value["steps"]):
+            return value
+        migrated: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw_step in value["steps"]:
+            if not isinstance(raw_step, dict):
+                continue
+            tool = str(raw_step.get("tool", ""))
+            if tool == "data_quality":
+                quality = {key: item for key, item in raw_step.items() if key != "method_versions"}
+                migrated.append(quality)
+                seen.add(tool)
+                continue
+            if tool not in legacy_tools:
+                migrated.append({key: item for key, item in raw_step.items() if key != "method_versions"})
+                seen.add(tool)
+                continue
+            parameters = dict(raw_step.get("parameters") or {})
+            methods = parameters.pop("methods", [])
+            for method in methods:
+                function_name = LEGACY_METHOD_TO_FUNCTION.get((tool, str(method)))
+                if function_name is None:
+                    raise ValueError(f"旧计划包含无法迁移的方法：{tool}.{method}")
+                if function_name in seen:
+                    continue
+                spec = TOOL_CATALOG[function_name]
+                function_parameters: dict[str, Any] = {}
+                if spec.uses_variables and "variables" in parameters:
+                    function_parameters["variables"] = parameters["variables"]
+                if spec.uses_max_lag:
+                    if "max_lag" in parameters:
+                        function_parameters["max_lag"] = parameters["max_lag"]
+                    if "max_lag_limit" in parameters:
+                        function_parameters["max_lag_limit"] = parameters["max_lag_limit"]
+                if function_name == "price_tukey_outer_fence" and "spike_iqr_multiplier" in parameters:
+                    function_parameters["spike_iqr_multiplier"] = parameters["spike_iqr_multiplier"]
+                if function_name == "exogenous_iqr_outliers" and "outlier_iqr_multiplier" in parameters:
+                    function_parameters["outlier_iqr_multiplier"] = parameters["outlier_iqr_multiplier"]
+                if spec.category == "relationship" and "min_observations" in parameters:
+                    function_parameters["min_observations"] = parameters["min_observations"]
+                migrated.append(
+                    {
+                        "step_id": "S1",
+                        "tool": function_name,
+                        "title": spec.title,
+                        "description": spec.description,
+                        "rationale": raw_step.get("rationale") or spec.description,
+                        "enabled": bool(raw_step.get("enabled", True)),
+                        "required": False,
+                        "parameters": function_parameters,
+                        "tool_version": spec.version,
+                    }
+                )
+                seen.add(function_name)
+        for index, step in enumerate(migrated, start=1):
+            step["step_id"] = f"S{index}"
+        return {**value, "steps": migrated}
 
     @model_validator(mode="after")
     def validate_steps(self) -> EDAPlan:
@@ -87,26 +151,51 @@ class EDAPlan(BaseModel):
         if len(ids) != len(set(ids)):
             raise ValueError("plan step ids must be unique")
         if len(tools) != len(set(tools)):
-            raise ValueError("each EDA tool may appear at most once")
+            raise ValueError("each research function may appear at most once")
         quality = next((step for step in self.steps if step.tool == "data_quality"), None)
         if quality is None or not quality.required or not quality.enabled:
             raise ValueError("data_quality must be an enabled, required plan step")
+        if bool(self.research_protocol_id) != bool(self.research_protocol_version):
+            raise ValueError("research protocol id and version must be recorded together")
+        if self.research_protocol_function_order:
+            if not self.research_protocol_id:
+                raise ValueError("research protocol function order requires a protocol id")
+            if len(self.research_protocol_function_order) != len(
+                set(self.research_protocol_function_order)
+            ):
+                raise ValueError("research protocol function order must not contain duplicates")
+            uncovered = sorted(set(tools).difference(self.research_protocol_function_order))
+            if uncovered:
+                raise ValueError(f"research protocol does not cover plan functions: {', '.join(uncovered)}")
+        selected = list(dict.fromkeys(self.selected_variables))
         for step in self.steps:
-            methods = step.parameters.get("methods")
-            if methods is None:
-                continue
-            if not isinstance(methods, list) or any(not isinstance(method, str) for method in methods):
-                raise ValueError(f"{step.tool} methods must be a list of strings")
-            unknown_methods = sorted(set(methods).difference(method_keys(step.tool)))
-            if unknown_methods:
-                raise ValueError(f"{step.tool} contains unknown methods: {', '.join(unknown_methods)}")
-            if step.enabled and method_keys(step.tool) and not methods:
-                raise ValueError(f"enabled tool {step.tool} must select at least one method")
+            spec = TOOL_CATALOG[step.tool]
+            if "methods" in step.parameters:
+                raise ValueError(f"atomic function {step.tool} must not contain methods")
+            if spec.uses_variables and step.enabled and step.parameters.get("variables") != selected:
+                raise ValueError(f"{step.tool} variables must match plan.selected_variables")
+            if spec.uses_max_lag and step.enabled and step.parameters.get("max_lag") is None:
+                raise ValueError(f"{step.tool} requires max_lag")
         return self
 
     @property
     def enabled_steps(self) -> list[EDAPlanStep]:
         return [step for step in self.steps if step.enabled]
+
+    def ordered_by_research_protocol(self) -> EDAPlan:
+        """Return a copy whose step order follows the protocol captured in this plan."""
+
+        if not self.research_protocol_function_order:
+            return self
+        rank = {
+            name: index for index, name in enumerate(self.research_protocol_function_order)
+        }
+        ordered = sorted(self.steps, key=lambda step: rank[step.tool])
+        renumbered = [
+            step.model_copy(update={"step_id": f"S{index}"})
+            for index, step in enumerate(ordered, start=1)
+        ]
+        return self.model_copy(update={"steps": renumbered})
 
     def adjusted(
         self,
@@ -114,7 +203,6 @@ class EDAPlan(BaseModel):
         enabled_step_ids: set[str],
         selected_variables: list[str],
         max_lag: int,
-        selected_methods: dict[str, list[str]] | None = None,
         reason: str = "用户在计划卡中确认或调整了分析方案。",
         source: Literal["user_ui", "user_dialogue"] = "user_ui",
     ) -> EDAPlan:
@@ -133,27 +221,17 @@ class EDAPlan(BaseModel):
         updated_steps: list[EDAPlanStep] = []
         for step in self.steps:
             parameters = dict(step.parameters)
-            if selected_methods is not None and step.tool in selected_methods:
-                allowed = set(method_keys(step.tool))
-                parameters["methods"] = [
-                    method for method in dict.fromkeys(selected_methods[step.tool]) if method in allowed
-                ]
-            if step.tool in {"exogenous_profile", "relationship_analysis"}:
+            spec = TOOL_CATALOG[step.tool]
+            if spec.uses_variables:
                 parameters["variables"] = variables
-            if step.tool in {"price_profile", "relationship_analysis"}:
+            if spec.uses_max_lag:
                 parameters["max_lag"] = max_lag
             enabled = step.required or step.step_id in enabled_step_ids
-            if enabled and method_keys(step.tool) and not parameters.get("methods"):
-                raise ValueError(f"enabled tool {step.tool} must select at least one method")
             updated_steps.append(
                 step.model_copy(
                     update={
                         "enabled": enabled,
                         "parameters": parameters,
-                        "method_versions": selected_implementation_versions(
-                            step.tool,
-                            parameters.get("methods", []),
-                        ),
                     }
                 )
             )
@@ -232,6 +310,17 @@ class EvaluationCheck(BaseModel):
     name: str
     status: Literal["pass", "warning", "fail"]
     message: str
+    scope: AgendaScope = "inherent"
+    remediable: bool = False
+    remediation: str | None = None
+
+    @model_validator(mode="after")
+    def migrate_remediable_scope(self) -> EvaluationCheck:
+        """Keep persisted pre-scope checks compatible with the agenda contract."""
+
+        if self.remediable and self.scope == "inherent":
+            self.scope = "within_envelope"
+        return self
 
 
 class HypothesisAssessment(BaseModel):
@@ -239,9 +328,12 @@ class HypothesisAssessment(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    item_id: str = ""
     hypothesis: str
     status: Literal["candidate_support", "not_supported", "inconclusive", "not_tested"]
     evidence: str
+    scope: AgendaScope = "inherent"
+    remediation: str | None = None
 
 
 class AgentEvaluation(BaseModel):
@@ -257,6 +349,7 @@ class AgentEvaluation(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     suggested_followups: list[str] = Field(default_factory=list)
     feedback_packets: list[FeedbackPacket] = Field(default_factory=list)
+    agenda_fingerprint: str = ""
 
 
 class AgentRunResult(BaseModel):

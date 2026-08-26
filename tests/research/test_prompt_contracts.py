@@ -50,11 +50,21 @@ def test_planning_prompt_states_local_eda_scope_and_version(synthetic_study: Pat
 
     messages = gateway.calls[0]
     assert "离线、只读" in messages[0][1]
-    assert "EDAPlanDraft schema" in messages[0][1]
+    assert "Function Calling" in messages[0][1]
     payload = _payload(messages)
     assert payload["prompt_version"] == PLANNING_PROMPT_VERSION
     assert payload["task_scope"].startswith("离线本地文件上的描述性 EDA")
-    assert payload["constraints"]["executable_methods"] == "catalog_entries_only"
+    assert payload["constraints"]["executable_functions"] == "provided_function_names_only"
+    assert payload["constraints"]["function_cardinality"] == "each_function_at_most_once_per_plan"
+    assert "price_calendar_group_profile" in payload["allowed_functions"]
+    assert payload["allowed_functions"]["price_segment_distribution_comparison"]["batch_parameter"] == "segments"
+    assert payload["allowed_functions"]["price_lag_autocorrelation"]["batch_parameter"] == "max_lag"
+    assert "reasoning_control" not in payload
+    assert (
+        payload["active_skill"]["research_protocol"]["protocol_id"]
+        == "electricity-price-evidence-ladder"
+    )
+    assert "method_id" not in json.dumps(payload, ensure_ascii=False)
     assert "target_must_never_appear_in_selected_variables" not in payload["constraints"]
 
 
@@ -84,5 +94,32 @@ def test_dialogue_prompt_states_route_contract_and_version(synthetic_study: Path
     payload = _payload(messages)
     assert payload["prompt_version"] == DIALOGUE_PROMPT_VERSION
     assert payload["task_scope"].startswith("离线本地文件上的描述性 EDA")
-    assert payload["revision_contract"]["method_selection"] == "catalog_keys_only"
+    assert payload["revision_contract"]["function_selection"] == "exact_allowed_function_names_only"
+    assert "reasoning_control" not in payload
     assert payload["study"]["target"]["name"] == config.target.name
+
+
+def test_automatic_revision_prompt_contains_current_plan_and_approval_boundary(synthetic_study: Path):
+    config = load_study_config(synthetic_study)
+    prepared = prepare_research_data(config)
+    skill = load_skill(Path("app/research/skills/price-exogenous-eda/SKILL.md"), source="builtin")
+    gateway = CaptureGateway()
+    revision_context = {
+        "current_plan": {"plan_id": "approved-plan", "selected_variables": ["load"]},
+        "authorization_envelope": {"functions": ["price_descriptive_distribution"]},
+        "allowed_changes": {"max_lag": "decrease only"},
+    }
+
+    with pytest.raises(RuntimeError, match="captured EDAPlanDraft"):
+        ModelEDAPlanner(gateway=gateway).propose_with_context(
+            "分析电价",
+            config,
+            prepared.quality,
+            skill=skill,
+            revision_context=revision_context,
+        )
+
+    messages = gateway.calls[0]
+    assert "revision_context" in messages[0][1]
+    payload = _payload(messages)
+    assert payload["revision_context"] == revision_context

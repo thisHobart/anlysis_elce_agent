@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from app.config import Settings
-from app.llm.gateway import ModelGatewayError
+from app.llm.gateway import ModelGatewayError, ModelToolCall
 from app.research.agent.errors import ResearchModelUnavailableError, ResearchPlanValidationError
 from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent, ModelResearchDialogue
 from app.research.agent.schemas import ConversationMessage
@@ -41,24 +42,25 @@ class ScriptedModelPlanner:
                 "assumptions": [],
             }
         if not any(word in question for word in ("关系", "相关", "滞后", "影响", "驱动")):
-            methods: list[str] = []
+            functions: list[str] = []
             if "季节" in question:
-                methods.append("seasonality")
+                functions.append("price_calendar_group_profile")
             if any(word in question for word in ("尖峰", "极端", "负价")):
-                methods.append("extremes")
-            if not methods:
-                methods.append("distribution")
+                functions.append("price_tukey_outer_fence")
+            if not functions:
+                functions.append("price_descriptive_distribution")
             return {
                 "objective": "验证用户指定的电价结构特征",
                 "hypotheses": ["电价可能存在用户关注的结构特征。"],
                 "selected_variables": [],
                 "steps": [
                     {
-                        "tool": "price_profile",
+                        "tool": function_name,
                         "enabled": True,
                         "rationale": "问题聚焦电价自身结构。",
-                        "parameters": {"methods": list(dict.fromkeys(methods)), "max_lag": 24},
+                        "parameters": {},
                     }
+                    for function_name in dict.fromkeys(functions)
                 ],
                 "assumptions": [],
             }
@@ -73,22 +75,46 @@ class ScriptedModelPlanner:
             "selected_variables": selected,
             "steps": [
                 {
-                    "tool": "price_profile",
+                    "tool": "price_calendar_group_profile",
                     "enabled": True,
                     "rationale": "先识别目标序列的周期结构。",
-                    "parameters": {"methods": ["seasonality", "autocorrelation"], "max_lag": lag},
+                    "parameters": {},
                 },
                 {
-                    "tool": "exogenous_profile",
+                    "tool": "price_lag_autocorrelation",
                     "enabled": True,
-                    "rationale": "检查所选变量的分布和异常观测。",
-                    "parameters": {"methods": ["distribution", "outliers"]},
+                    "rationale": "检查目标序列的滞后结构。",
+                    "parameters": {"max_lag": lag},
                 },
                 {
-                    "tool": "relationship_analysis",
+                    "tool": "exogenous_descriptive_distribution",
                     "enabled": True,
-                    "rationale": "检查同期与领先滞后关系。",
-                    "parameters": {"methods": ["pearson", "spearman", "lag_scan"], "max_lag": lag},
+                    "rationale": "检查所选变量的分布。",
+                    "parameters": {"variables": selected},
+                },
+                {
+                    "tool": "exogenous_iqr_outliers",
+                    "enabled": True,
+                    "rationale": "检查所选变量的异常观测。",
+                    "parameters": {"variables": selected},
+                },
+                {
+                    "tool": "relationship_scipy_pearson_pairwise",
+                    "enabled": True,
+                    "rationale": "检查同期线性关系。",
+                    "parameters": {"variables": selected},
+                },
+                {
+                    "tool": "relationship_scipy_spearman_pairwise",
+                    "enabled": True,
+                    "rationale": "检查同期秩关系。",
+                    "parameters": {"variables": selected},
+                },
+                {
+                    "tool": "relationship_pearson_positive_lead_scan",
+                    "enabled": True,
+                    "rationale": "检查领先滞后关系。",
+                    "parameters": {"variables": selected, "max_lag": lag},
                 },
             ],
             "assumptions": [],
@@ -109,9 +135,12 @@ class ScriptedModelDialogue:
                 response="已根据你的意见生成修订方案。",
                 objective="只验证 actual_wind 与电价的滞后关系",
                 hypotheses=["actual_wind 可能领先电价变化。"],
-                enabled_tools=["relationship_analysis"],
+                enabled_tools=[
+                    "relationship_scipy_pearson_pairwise",
+                    "relationship_scipy_spearman_pairwise",
+                    "relationship_pearson_positive_lead_scan",
+                ],
                 selected_variables=["actual_wind"],
-                selected_methods={"relationship_analysis": ["pearson", "spearman", "lag_scan"]},
                 max_lag=4,
             )
         if "结果" in question or "说明什么" in question:
@@ -235,21 +264,22 @@ def test_model_recommends_different_processes_for_different_questions(synthetic_
     assert [step.tool for step in quality_plan.enabled_steps] == ["data_quality"]
     assert [step.tool for step in relationship_plan.enabled_steps] == [
         "data_quality",
-        "price_profile",
-        "exogenous_profile",
-        "relationship_analysis",
+        "price_calendar_group_profile",
+        "price_lag_autocorrelation",
+        "exogenous_descriptive_distribution",
+        "exogenous_iqr_outliers",
+        "relationship_scipy_pearson_pairwise",
+        "relationship_scipy_spearman_pairwise",
+        "relationship_pearson_positive_lead_scan",
     ]
-    relationship_step = next(step for step in relationship_plan.steps if step.tool == "relationship_analysis")
+    relationship_step = next(
+        step for step in relationship_plan.steps if step.tool == "relationship_pearson_positive_lead_scan"
+    )
     assert relationship_plan.planner == "llm"
     assert relationship_plan.planning_model == "scripted-test-model"
     assert relationship_plan.selected_variables == ["load"]
     assert relationship_step.parameters["max_lag"] == 2
-    assert relationship_step.parameters["methods"] == ["pearson", "spearman", "lag_scan"]
-    assert relationship_step.method_versions == {
-        "relationship.scipy_pearson_pairwise": "1.0.0",
-        "relationship.scipy_spearman_pairwise": "1.0.0",
-        "relationship.pearson_positive_lead_scan": "1.0.0",
-    }
+    assert all(step.tool_version == "1.0.0" for step in relationship_plan.enabled_steps)
     assert max_lag_limit("15min") == 31 * 24 * 4
 
 
@@ -258,14 +288,85 @@ def test_model_selects_only_requested_price_methods(synthetic_study: Path):
         question="只分析电价季节性和尖峰",
         config_path=synthetic_study,
     ).plan
-    price_step = next(step for step in plan.steps if step.tool == "price_profile")
-
-    assert price_step.parameters["methods"] == ["seasonality", "extremes"]
-    assert price_step.method_versions == {
-        "price.calendar_group_profile": "1.0.0",
-        "price.tukey_outer_fence": "1.0.0",
-    }
+    assert [step.tool for step in plan.enabled_steps] == [
+        "data_quality",
+        "price_tukey_outer_fence",
+        "price_calendar_group_profile",
+    ]
     assert plan.data_fingerprint is not None
+
+
+def test_legacy_implementation_ids_migrate_to_atomic_functions(synthetic_study: Path):
+    planner = ModelEDAPlanner(
+        gateway=FakeModelGateway(
+            {
+                "objective": "兼容旧模型输出",
+                "selected_variables": [],
+                "steps": [
+                    {
+                        "tool": "price_profile",
+                        "enabled": True,
+                        "rationale": "旧模型错误地返回实现 ID。",
+                        "parameters": {
+                            "methods": [
+                                "price.descriptive_distribution",
+                                "price.calendar_group_profile",
+                            ]
+                        },
+                    }
+                ],
+            }
+        )
+    )
+    coordinator = ResearchCoordinator(
+        eda_subagent=EDASubagent(model_planner=planner),
+        main_agent=MainResearchAgent(model_dialogue=ScriptedModelDialogue()),
+    )
+
+    plan = coordinator.propose(question="分析电价分布和季节性", config_path=synthetic_study).plan
+
+    assert [step.tool for step in plan.enabled_steps] == [
+        "data_quality",
+        "price_descriptive_distribution",
+        "price_calendar_group_profile",
+    ]
+    assert all("methods" not in step.parameters for step in plan.steps)
+
+
+def test_native_tool_calls_compile_into_an_approval_plan(synthetic_study: Path):
+    class NativeToolGateway:
+        enabled = True
+        model_name = "native-tool-model"
+
+        def __init__(self):
+            self.tools = []
+
+        def invoke_tool_calls(self, *, messages, tools):
+            del messages
+            self.tools = tools
+            return [
+                ModelToolCall(name="price_descriptive_distribution", arguments={}),
+                ModelToolCall(name="price_lag_autocorrelation", arguments={"max_lag": 2}),
+            ]
+
+    gateway = NativeToolGateway()
+    coordinator = ResearchCoordinator(
+        eda_subagent=EDASubagent(model_planner=ModelEDAPlanner(gateway=gateway)),
+        main_agent=MainResearchAgent(model_dialogue=ScriptedModelDialogue()),
+    )
+
+    plan = coordinator.propose(question="分析电价分布和自相关", config_path=synthetic_study).plan
+
+    assert [step.tool for step in plan.enabled_steps] == [
+        "data_quality",
+        "price_descriptive_distribution",
+        "price_lag_autocorrelation",
+    ]
+    assert "电价可能存在自相关或持续性。" in plan.hypotheses
+    assert next(step for step in plan.steps if step.tool == "price_lag_autocorrelation").parameters["max_lag"] == 2
+    exposed_names = {tool["function"]["name"] for tool in gateway.tools}
+    assert "price_lag_autocorrelation" in exposed_names
+    assert all("methods" not in tool["function"]["parameters"].get("properties", {}) for tool in gateway.tools)
 
 
 def test_invalid_model_plan_is_rejected_without_local_repair(synthetic_study: Path):
@@ -277,10 +378,10 @@ def test_invalid_model_plan_is_rejected_without_local_repair(synthetic_study: Pa
             "selected_variables": ["not_a_real_variable"],
             "steps": [
                 {
-                    "tool": "relationship_analysis",
+                    "tool": "relationship_scipy_pearson_pairwise",
                     "enabled": True,
                     "rationale": "问题聚焦同期关系。",
-                    "parameters": {"methods": ["pearson", "not_allowed"], "max_lag": 99999},
+                    "parameters": {"variables": ["not_a_real_variable"]},
                 }
             ],
             "assumptions": [],
@@ -306,9 +407,11 @@ def test_model_revision_controls_the_executable_plan(synthetic_study: Path, tmp_
         config=config,
         decision=DialogueDecision(
             intent="revise_plan",
-            enabled_tools=["relationship_analysis"],
+            enabled_tools=[
+                "relationship_scipy_pearson_pairwise",
+                "relationship_pearson_positive_lead_scan",
+            ],
             selected_variables=["wind"],
-            selected_methods={"relationship_analysis": ["pearson", "lag_scan"]},
             max_lag=4,
         ),
     )
@@ -322,25 +425,55 @@ def test_model_revision_controls_the_executable_plan(synthetic_study: Path, tmp_
 
     assert revised.parent_plan_id == proposal.plan.plan_id
     assert revised.revision_source == "user_dialogue"
-    assert [step.tool for step in revised.enabled_steps] == ["data_quality", "relationship_analysis"]
+    assert [step.tool for step in revised.enabled_steps] == [
+        "data_quality",
+        "relationship_scipy_pearson_pairwise",
+        "relationship_pearson_positive_lead_scan",
+    ]
     assert list(result.eda_summary["relationships"]["series"]) == ["wind"]
-    assert set(result.figure_paths) == {"correlation_matrix", "lag_relationships"}
+    assert set(result.figure_paths) == {"correlation_matrix", "correlation_ranking", "lag_relationships"}
+    assert all(path.suffix == ".svg" and path.is_file() for path in result.figure_paths.values())
+    assert result.report_path.name == "report.html"
+    assert result.evaluation.decision == "accept"
+    assert any(check.name == "时间序列混杂控制" and check.status == "warning" for check in result.evaluation.checks)
+    assert not result.evaluation.feedback_packets
 
     package_files = {path.name for path in result.artifact_directory.iterdir()}
     assert {"conversation.json", "research_plan.json", "execution_trace.json", "manifest.json"}.issubset(
         package_files
     )
     manifest = json.loads((result.artifact_directory / "manifest.json").read_text(encoding="utf-8"))
+    trace = json.loads((result.artifact_directory / "execution_trace.json").read_text(encoding="utf-8"))
+    assert all(item["started_at"] and item["finished_at"] for item in trace)
+    assert all(
+        datetime.fromisoformat(item["started_at"]) <= datetime.fromisoformat(item["finished_at"])
+        for item in trace
+    )
     assert manifest["research_agent"]["planning_model"] == "scripted-test-model"
-    assert manifest["research_agent"]["skill"] == {"name": "price-exogenous-eda", "version": "1.0.0"}
-    assert manifest["research_agent"]["tool_versions"]["S4"] == "1.0.0"
-    assert manifest["research_agent"]["method_versions"]["S4"] == {
-        "relationship.scipy_pearson_pairwise": "1.0.0",
-        "relationship.pearson_positive_lead_scan": "1.0.0",
+    assert manifest["research_agent"]["skill"] == {"name": "price-exogenous-eda", "version": "3.0.0"}
+    assert manifest["research_agent"]["research_protocol"] == {
+        "protocol_id": "electricity-price-evidence-ladder",
+        "version": "2.0.0",
+        "function_order": revised.research_protocol_function_order,
+    }
+    assert manifest["research_agent"]["function_versions"] == {
+        step.tool: "1.0.0" for step in revised.enabled_steps
     }
     for output in manifest["outputs"]:
         path = result.artifact_directory / output["path"]
         assert hashlib.sha256(path.read_bytes()).hexdigest() == output["sha256"]
+
+    incomplete_summary = dict(result.eda_summary)
+    incomplete_summary.pop("relationships")
+    incomplete = evaluate_agent_run(
+        plan=result.plan,
+        quality=result.quality_report,
+        summary=incomplete_summary,
+    )
+    packet = next(item for item in incomplete.feedback_packets if item.code.endswith("_fail"))
+    assert incomplete.decision == "revise"
+    assert next(check for check in incomplete.checks if check.name == "计划执行完整性").scope == "within_envelope"
+    assert packet.recommendation == "补齐缺少的确定性结果步骤：relationships，然后重新执行。"
 
 
 def test_evaluator_scopes_unselected_variable_risks(synthetic_study: Path, tmp_path: Path):
@@ -370,6 +503,25 @@ def test_evaluator_scopes_unselected_variable_risks(synthetic_study: Path, tmp_p
     assert not scoped.warnings
 
 
+def test_unplanned_hypothesis_requires_approval_instead_of_auto_repair(synthetic_study: Path, tmp_path: Path):
+    agent = _model_agent()
+    plan = agent.propose(question="分析电价分布", config_path=synthetic_study).plan
+    plan = plan.model_copy(update={"hypotheses": ["电价可能存在季节性结构。"]})
+
+    result = agent.execute(
+        plan=plan,
+        config_path=synthetic_study,
+        output_directory=tmp_path / "agenda-approval-artifacts",
+        run_id="agent-agenda-approval",
+    )
+
+    assessment = result.evaluation.hypothesis_assessments[0]
+    assert result.evaluation.decision == "need_user"
+    assert assessment.status == "not_tested"
+    assert assessment.scope == "needs_approval"
+    assert any(packet.requires_user for packet in result.evaluation.feedback_packets)
+
+
 def test_execution_rejects_files_changed_after_plan_generation(synthetic_study: Path, tmp_path: Path):
     agent = _model_agent()
     proposal = agent.propose(question="分析电价分布", config_path=synthetic_study)
@@ -386,17 +538,17 @@ def test_execution_rejects_files_changed_after_plan_generation(synthetic_study: 
         )
 
 
-def test_execution_rejects_missing_method_version(synthetic_study: Path, tmp_path: Path):
+def test_execution_rejects_unregistered_atomic_function(synthetic_study: Path, tmp_path: Path):
     agent = _model_agent()
     plan = agent.propose(question="分析电价分布", config_path=synthetic_study).plan
-    price = next(step for step in plan.steps if step.tool == "price_profile")
+    price = next(step for step in plan.steps if step.tool == "price_descriptive_distribution")
     invalid_steps = [
-        step.model_copy(update={"method_versions": {}}) if step.step_id == price.step_id else step
+        step.model_copy(update={"tool": "price_profile"}) if step.step_id == price.step_id else step
         for step in plan.steps
     ]
     invalid = plan.model_copy(update={"steps": invalid_steps})
 
-    with pytest.raises(ResearchPlanValidationError, match="method version mismatch"):
+    with pytest.raises(ResearchPlanValidationError, match="工具未注册"):
         agent.execute(
             plan=invalid,
             config_path=synthetic_study,
@@ -415,7 +567,7 @@ def test_execution_rejects_skill_and_tool_version_changes(synthetic_study: Path,
             output_directory=tmp_path / "invalid-skill-version",
         )
 
-    price = next(step for step in plan.steps if step.tool == "price_profile")
+    price = next(step for step in plan.steps if step.tool == "price_calendar_group_profile")
     changed_steps = [
         step.model_copy(update={"tool_version": "0.0.0"}) if step.step_id == price.step_id else step
         for step in plan.steps

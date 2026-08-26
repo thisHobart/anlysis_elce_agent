@@ -2,24 +2,31 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QPushButton,
-    QSpinBox,
-    QToolButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
 from app.research.agent.schemas import AgentRunResult, EDAPlan
-from app.research.tools.catalog import TOOL_CATALOG
+from app.research.tools.catalog import STAGE_TITLES, TOOL_CATALOG
+
+STATUS_MARK = {
+    "running": "◐",
+    "completed": "✓",
+    "warning": "!",
+    "failed": "✕",
+    "stopped": "■",
+    "info": "·",
+}
 
 
 class TextMessageWidget(QFrame):
@@ -36,7 +43,7 @@ class TextMessageWidget(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 9, 12, 9)
         layout.setSpacing(4)
-        role_label = QLabel("你" if role == "user" else "研究 Agent")
+        role_label = QLabel("你" if role == "user" else "研究助手")
         role_label.setObjectName("messageRole")
         content_label = QLabel(content)
         content_label.setObjectName("messageContent")
@@ -52,15 +59,215 @@ class NoticeMessageWidget(QFrame):
     def __init__(self, content: str, *, error: bool = False) -> None:
         super().__init__()
         self.setObjectName("errorNotice" if error else "noticeMessage")
+        self.setMaximumWidth(680)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 7, 10, 7)
+        layout.setContentsMargins(12, 9, 12, 9)
         label = QLabel(content)
         label.setWordWrap(True)
         layout.addWidget(label)
 
 
+class ThinkingStepRow(QWidget):
+    """One visible step of the Agent's working process."""
+
+    def __init__(self, *, stage: str, title: str, detail: str, status: str) -> None:
+        super().__init__()
+        self.setObjectName("thinkingStep")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 3, 0, 3)
+        layout.setSpacing(9)
+        self.mark = QLabel(STATUS_MARK.get(status, "·"))
+        self.mark.setObjectName("stepMark")
+        self.mark.setFixedWidth(14)
+        self.mark.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(self.mark)
+        text = QVBoxLayout()
+        text.setSpacing(1)
+        headline = QHBoxLayout()
+        headline.setSpacing(7)
+        self.stage_label = QLabel(stage)
+        self.stage_label.setObjectName("stepStage")
+        headline.addWidget(self.stage_label)
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("stepTitle")
+        self.title_label.setWordWrap(True)
+        self.title_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        headline.addWidget(self.title_label, 1)
+        text.addLayout(headline)
+        self.detail_label = QLabel(detail)
+        self.detail_label.setObjectName("stepDetail")
+        self.detail_label.setWordWrap(True)
+        self.detail_label.setVisible(bool(detail))
+        text.addWidget(self.detail_label)
+        layout.addLayout(text, 1)
+        self.set_status(status)
+
+    def set_status(self, status: str) -> None:
+        self.mark.setText(STATUS_MARK.get(status, "·"))
+        for widget in (self.mark, self.title_label):
+            widget.setProperty("traceStatus", status)
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+
+    def update_text(self, *, title: str | None = None, detail: str | None = None) -> None:
+        if title is not None:
+            self.title_label.setText(title)
+        if detail is not None:
+            self.detail_label.setText(detail)
+            self.detail_label.setVisible(bool(detail))
+
+
+class ThinkingMessageWidget(QFrame):
+    """Collapsible, live view of what the Agent is doing and why."""
+
+    def __init__(self, *, steps: list[dict[str, Any]] | None = None, state: str = "running") -> None:
+        super().__init__()
+        self.setObjectName("thinkingMessage")
+        self.setMaximumWidth(680)
+        self.setMinimumWidth(520)
+        self._steps: list[dict[str, Any]] = []
+        self._rows: list[ThinkingStepRow] = []
+        self._collapsed = False
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 11, 14, 11)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        self.toggle_button = QPushButton("▾")
+        self.toggle_button.setObjectName("thinkingToggle")
+        self.toggle_button.setFixedWidth(22)
+        self.toggle_button.clicked.connect(self._toggle)
+        header.addWidget(self.toggle_button)
+        self.title_label = QLabel("正在研究…")
+        self.title_label.setObjectName("thinkingTitle")
+        header.addWidget(self.title_label, 1)
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("thinkingStatus")
+        header.addWidget(self.status_label)
+        layout.addLayout(header)
+
+        self.steps_container = QWidget()
+        self.steps_layout = QVBoxLayout(self.steps_container)
+        self.steps_layout.setContentsMargins(2, 0, 0, 0)
+        self.steps_layout.setSpacing(2)
+        layout.addWidget(self.steps_container)
+
+        for step in steps or []:
+            self.add_step(
+                stage=str(step.get("stage", "研究")),
+                title=str(step.get("title", "")),
+                detail=str(step.get("detail", "")),
+                status=str(step.get("status", "completed")),
+                function_name=step.get("function_name"),
+            )
+        if state != "running":
+            self.finish(state=state)
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> ThinkingMessageWidget:
+        return cls(steps=list(payload.get("steps", [])), state=str(payload.get("state", "running")))
+
+    @property
+    def steps(self) -> list[dict[str, Any]]:
+        return list(self._steps)
+
+    def replace_current(
+        self,
+        *,
+        stage: str,
+        title: str,
+        detail: str = "",
+        status: str = "running",
+        function_name: str | None = None,
+        keep_detail: bool = False,
+    ) -> None:
+        """Update the current step in place instead of adding a near-duplicate line."""
+
+        if not self._rows:
+            self.add_step(stage=stage, title=title, detail=detail, status=status, function_name=function_name)
+            return
+        kept_detail = detail or (str(self._steps[-1].get("detail", "")) if keep_detail else "")
+        self._rows[-1].stage_label.setText(stage)
+        self._rows[-1].update_text(title=title, detail=kept_detail)
+        self._rows[-1].set_status(status)
+        self._steps[-1] = {
+            "stage": stage,
+            "title": title,
+            "detail": kept_detail,
+            "status": status,
+            "function_name": function_name,
+        }
+
+    def add_step(
+        self,
+        *,
+        stage: str,
+        title: str,
+        detail: str = "",
+        status: str = "running",
+        function_name: str | None = None,
+    ) -> None:
+        for row in self._rows:
+            if row.mark.text() == STATUS_MARK["running"]:
+                row.set_status("completed")
+        for step in self._steps:
+            if step.get("status") == "running":
+                step["status"] = "completed"
+        row = ThinkingStepRow(stage=stage, title=title, detail=detail, status=status)
+        self._rows.append(row)
+        self._steps.append(
+            {
+                "stage": stage,
+                "title": title,
+                "detail": detail,
+                "status": status,
+                "function_name": function_name,
+            }
+        )
+        self.steps_layout.addWidget(row)
+        self._refresh_status()
+
+    def update_current(self, *, detail: str | None = None, status: str | None = None) -> None:
+        if not self._rows:
+            return
+        self._rows[-1].update_text(detail=detail)
+        if detail is not None:
+            self._steps[-1]["detail"] = detail
+        if status is not None:
+            self._rows[-1].set_status(status)
+            self._steps[-1]["status"] = status
+
+    def finish(self, *, state: str = "completed", summary: str = "") -> None:
+        for row in self._rows:
+            if row.mark.text() == STATUS_MARK["running"]:
+                row.set_status("completed" if state == "completed" else state)
+        for step in self._steps:
+            if step.get("status") == "running":
+                step["status"] = "completed" if state == "completed" else state
+        titles = {
+            "completed": "研究过程",
+            "failed": "研究中断",
+            "stopped": "已终止",
+        }
+        self.title_label.setText(titles.get(state, "研究过程"))
+        self.status_label.setText(summary or f"{len(self._steps)} 步")
+        self.set_collapsed(True)
+
+    def set_collapsed(self, collapsed: bool) -> None:
+        self._collapsed = collapsed
+        self.steps_container.setVisible(not collapsed)
+        self.toggle_button.setText("▸" if collapsed else "▾")
+
+    def _toggle(self) -> None:
+        self.set_collapsed(not self._collapsed)
+
+    def _refresh_status(self) -> None:
+        self.status_label.setText(f"{len(self._steps)} 步")
+
+
 class ToolMessageWidget(QFrame):
-    """Observable tool status card mirrored in the Agent trace."""
+    """Compatibility card for conversations saved before the thinking view existed."""
 
     def __init__(self, title: str, detail: str, *, status: str = "running") -> None:
         super().__init__()
@@ -74,6 +281,7 @@ class ToolMessageWidget(QFrame):
         self.title_label.setObjectName("toolTitle")
         self.detail_label = QLabel(detail)
         self.detail_label.setObjectName("toolDetail")
+        self.detail_label.setWordWrap(True)
         text_layout.addWidget(self.title_label)
         text_layout.addWidget(self.detail_label)
         layout.addLayout(text_layout, 1)
@@ -83,11 +291,11 @@ class ToolMessageWidget(QFrame):
 
     def set_status(self, status: str, detail: str | None = None) -> None:
         labels = {
-            "running": "运行中",
-            "completed": "完成",
-            "warning": "警告",
+            "running": "进行中",
+            "completed": "已完成",
+            "warning": "注意",
             "failed": "失败",
-            "stopped": "已停止",
+            "stopped": "已终止",
         }
         self.status_label.setText(labels.get(status, status))
         self.status_label.setProperty("traceStatus", status)
@@ -98,124 +306,71 @@ class ToolMessageWidget(QFrame):
 
 
 class PlanMessageWidget(QFrame):
-    """Read-only model plan; revisions are requested through the conversation."""
+    """Read-only analysis plan; changes are requested in plain language."""
 
     run_requested = Signal(object)
 
-    def __init__(self, plan: EDAPlan, available_variables: list[str]) -> None:
+    def __init__(self, plan: EDAPlan) -> None:
         super().__init__()
         self.setObjectName("planMessage")
+        self.setMinimumWidth(560)
         self.setMaximumWidth(720)
         self.plan = plan
-        self.step_checks: dict[str, QCheckBox] = {}
-        self.method_items: dict[tuple[str, str], QListWidgetItem] = {}
+        self.step_checks: dict[str, QWidget] = {}
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
         header = QHBoxLayout()
-        title = QLabel(f"Agent 推荐的 EDA 方案 · v{plan.revision}")
+        title = QLabel("建议的分析方案" if plan.revision <= 1 else f"修订后的分析方案（第 {plan.revision} 版）")
         title.setObjectName("planTitle")
         header.addWidget(title)
         header.addStretch(1)
-        self.status_label = QLabel("等待反馈")
+        self.status_label = QLabel("待确认")
         self.status_label.setObjectName("planStatus")
         header.addWidget(self.status_label)
         layout.addLayout(header)
-
-        skill_label = QLabel(f"Skill：{plan.skill_name}@{plan.skill_version}")
-        skill_label.setObjectName("planObjective")
-        layout.addWidget(skill_label)
 
         objective = QLabel(plan.objective)
         objective.setWordWrap(True)
         objective.setObjectName("planObjective")
         layout.addWidget(objective)
+
+        if plan.selected_variables:
+            variables = QLabel("纳入分析的影响因素：" + "、".join(plan.selected_variables))
+            variables.setWordWrap(True)
+            variables.setObjectName("planObjective")
+            layout.addWidget(variables)
+
+        grouped: dict[str, list[Any]] = {}
+        for step in plan.enabled_steps:
+            grouped.setdefault(TOOL_CATALOG[step.tool].stage, []).append(step)
+        for stage, steps in grouped.items():
+            group = QLabel(STAGE_TITLES.get(stage, stage))
+            group.setObjectName("planStage")
+            layout.addWidget(group)
+            for step in steps:
+                row = QLabel(f"· {step.title}｜{TOOL_CATALOG[step.tool].answers}")
+                row.setObjectName("planStep")
+                row.setWordWrap(True)
+                row.setToolTip(f"{step.description}\n选择理由：{step.rationale}")
+                self.step_checks[step.step_id] = row
+                layout.addWidget(row)
+
         if plan.hypotheses:
-            hypotheses = QLabel("待验证假设\n" + "\n".join(f"• {item}" for item in plan.hypotheses[:5]))
+            hypotheses = QLabel("想验证的判断\n" + "\n".join(f"· {item}" for item in plan.hypotheses[:5]))
             hypotheses.setWordWrap(True)
             hypotheses.setObjectName("planObjective")
             layout.addWidget(hypotheses)
-        feedback_hint = QLabel("如需修改，请在下方对话框中提出建议；没有反馈时方案将在倒计时结束后自动执行。")
+
+        feedback_hint = QLabel("想改就直接在下面说，比如“只看夏季”“加上负价分析”；不回复会自动按这个方案开始。")
         feedback_hint.setWordWrap(True)
-        feedback_hint.setObjectName("planObjective")
+        feedback_hint.setObjectName("planHint")
         layout.addWidget(feedback_hint)
-
-        for step in plan.steps:
-            checkbox = QCheckBox(step.title)
-            checkbox.setChecked(step.enabled)
-            checkbox.setEnabled(False)
-            checkbox.setToolTip(f"{step.description}\nAgent 理由：{step.rationale}")
-            self.step_checks[step.step_id] = checkbox
-            layout.addWidget(checkbox)
-
-        self.editor_toggle = QToolButton()
-        self.editor_toggle.setText("变量与参数")
-        self.editor_toggle.setCheckable(True)
-        self.editor_toggle.setChecked(True)
-        self.editor_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        layout.addWidget(self.editor_toggle)
-
-        self.editor = QWidget()
-        editor_layout = QHBoxLayout(self.editor)
-        editor_layout.setContentsMargins(0, 0, 0, 0)
-        self.variable_list = QListWidget()
-        self.variable_list.setMaximumHeight(118)
-        selected = set(plan.selected_variables)
-        for name in available_variables:
-            item = QListWidgetItem(name)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked if name in selected else Qt.CheckState.Unchecked)
-            self.variable_list.addItem(item)
-        editor_layout.addWidget(self.variable_list, 1)
-
-        method_layout = QVBoxLayout()
-        method_layout.setSpacing(3)
-        method_layout.addWidget(QLabel("分析方法"))
-        self.method_list = QListWidget()
-        self.method_list.setMaximumHeight(118)
-        for step in plan.steps:
-            catalog = TOOL_CATALOG[step.tool]
-            configured_methods = step.parameters.get("methods")
-            selected_methods = (
-                set(configured_methods) if configured_methods is not None else {method.key for method in catalog.methods}
-            )
-            for method in catalog.methods:
-                item = QListWidgetItem(f"{step.title} · {method.label}")
-                item.setToolTip(f"{method.description}\n实现：{method.implementation_id} · v{method.version}")
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(
-                    Qt.CheckState.Checked if method.key in selected_methods else Qt.CheckState.Unchecked
-                )
-                self.method_list.addItem(item)
-                self.method_items[(step.tool, method.key)] = item
-        method_layout.addWidget(self.method_list)
-        editor_layout.addLayout(method_layout, 1)
-
-        parameter_layout = QVBoxLayout()
-        parameter_layout.addWidget(QLabel("最大滞后"))
-        self.max_lag = QSpinBox()
-        lag_limit = next(
-            (int(step.parameters["max_lag_limit"]) for step in plan.steps if "max_lag_limit" in step.parameters),
-            24 * 31,
-        )
-        self.max_lag.setRange(0, lag_limit)
-        self.max_lag.setSuffix(" 个间隔")
-        self.max_lag.setValue(
-            next((int(step.parameters["max_lag"]) for step in plan.steps if "max_lag" in step.parameters), 0)
-        )
-        self.variable_list.setEnabled(False)
-        self.method_list.setEnabled(False)
-        self.max_lag.setEnabled(False)
-        parameter_layout.addWidget(self.max_lag)
-        parameter_layout.addStretch(1)
-        editor_layout.addLayout(parameter_layout)
-        layout.addWidget(self.editor)
-        self.editor_toggle.toggled.connect(self.editor.setVisible)
 
         actions = QHBoxLayout()
         actions.addStretch(1)
-        self.run_button = QPushButton("立即执行")
+        self.run_button = QPushButton("立即开始")
         self.run_button.setObjectName("primaryButton")
         self.run_button.clicked.connect(self._emit_plan)
         actions.addWidget(self.run_button)
@@ -231,28 +386,20 @@ class PlanMessageWidget(QFrame):
         self.status_label.setText(f"{seconds} 秒后自动执行")
         self.run_button.show()
 
-    def set_feedback_paused(self, text: str = "正在输入修改意见") -> None:
+    def set_feedback_paused(self, text: str = "正在接收修改意见") -> None:
         self.status_label.setText(text)
 
     def set_running(self) -> None:
-        self.status_label.setText("运行中")
+        self.status_label.setText("执行中")
         self.run_button.hide()
-        self.editor_toggle.setChecked(False)
-        self.editor_toggle.setEnabled(False)
-        self.editor.setEnabled(False)
-        for checkbox in self.step_checks.values():
-            checkbox.setEnabled(False)
 
     def set_finished(self, status: str = "已完成") -> None:
         self.status_label.setText(status)
         self.run_button.hide()
-        self.editor_toggle.setChecked(False)
-        self.editor_toggle.setEnabled(False)
-        self.editor.setEnabled(False)
 
 
 class ResultMessageWidget(QFrame):
-    """Final evaluation, findings, and reproducibility actions."""
+    """Final conclusions, limitations, and where to find the full report."""
 
     def __init__(self, result: AgentRunResult | None = None, *, payload: dict | None = None) -> None:
         super().__init__()
@@ -263,7 +410,6 @@ class ResultMessageWidget(QFrame):
             findings = result.evaluation.findings
             warnings = result.evaluation.warnings
             hypothesis_assessments = result.evaluation.hypothesis_assessments
-            run_id = result.run_id
             figure_count = len(result.figure_paths)
             report_path = str(result.report_path)
             artifact_directory = str(result.artifact_directory)
@@ -274,53 +420,62 @@ class ResultMessageWidget(QFrame):
             findings = list(evaluation.get("findings", []))
             warnings = list(evaluation.get("warnings", []))
             hypothesis_assessments = list(evaluation.get("hypothesis_assessments", []))
-            run_id = str(data.get("run_id", ""))
             figure_count = int(data.get("figure_count", 0))
             report_path = str(data.get("report_path", ""))
             artifact_directory = str(data.get("artifact_directory", ""))
         self.setObjectName("resultMessage")
+        self.setMinimumWidth(560)
         self.setMaximumWidth(720)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(8)
-        title = QLabel(evaluation_summary)
+        title = QLabel("分析完成")
         title.setObjectName("resultTitle")
-        title.setWordWrap(True)
         layout.addWidget(title)
-        for finding in findings:
-            label = QLabel(f"• {finding}")
+        summary = QLabel(evaluation_summary)
+        summary.setObjectName("resultSummary")
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+        if findings:
+            heading = QLabel("主要发现")
+            heading.setObjectName("resultHeading")
+            layout.addWidget(heading)
+        for finding in findings[:6]:
+            label = QLabel(f"· {finding}")
             label.setWordWrap(True)
             layout.addWidget(label)
         if hypothesis_assessments:
             status_labels = {
-                "candidate_support": "候选支持",
-                "not_supported": "暂不支持",
+                "candidate_support": "有证据支持",
+                "not_supported": "证据不支持",
                 "inconclusive": "证据不足",
-                "not_tested": "未检验",
+                "not_tested": "本轮未检验",
             }
-            hypothesis_title = QLabel("假设验收")
-            hypothesis_title.setObjectName("resultMeta")
-            layout.addWidget(hypothesis_title)
+            heading = QLabel("判断验收")
+            heading.setObjectName("resultHeading")
+            layout.addWidget(heading)
             for assessment in hypothesis_assessments[:4]:
                 if hasattr(assessment, "model_dump"):
                     assessment = assessment.model_dump(mode="json")
                 status = status_labels.get(str(assessment.get("status", "")), str(assessment.get("status", "")))
-                label = QLabel(f"• [{status}] {assessment.get('hypothesis', '')} — {assessment.get('evidence', '')}")
+                label = QLabel(f"· [{status}] {assessment.get('hypothesis', '')} — {assessment.get('evidence', '')}")
                 label.setWordWrap(True)
                 layout.addWidget(label)
         if warnings:
-            warning = QLabel("风险：" + "；".join(warnings[:3]))
+            warning = QLabel("需要留意：" + "；".join(warnings[:3]))
             warning.setObjectName("resultWarning")
             warning.setWordWrap(True)
             layout.addWidget(warning)
-        meta = QLabel(f"运行编号 {run_id} · {figure_count} 张图表")
+        meta = QLabel(f"完整报告含 {figure_count} 张图表，可随时打开查看或分享。")
         meta.setObjectName("resultMeta")
+        meta.setWordWrap(True)
         layout.addWidget(meta)
         actions = QHBoxLayout()
-        report_button = QPushButton("打开报告")
+        report_button = QPushButton("查看完整报告")
+        report_button.setObjectName("primaryButton")
         report_button.setEnabled(bool(report_path))
         report_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(report_path)))
-        package_button = QPushButton("打开研究包")
+        package_button = QPushButton("打开结果文件夹")
         package_button.setEnabled(bool(artifact_directory))
         package_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(artifact_directory)))
         actions.addWidget(report_button)

@@ -1,4 +1,4 @@
-"""Compile model function-call drafts into deterministic versioned plans."""
+"""Compile model-proposed atomic function calls into deterministic plans."""
 
 from __future__ import annotations
 
@@ -7,14 +7,46 @@ from uuid import uuid4
 
 import pandas as pd
 
-from app.research.agent.errors import ResearchPlanValidationError
+from app.research.agent.errors import DuplicateResearchFunctionError, ResearchPlanValidationError
 from app.research.agent.schemas import EDAPlan, EDAPlanStep
 from app.research.planning.contracts import DraftStep, EDAPlanDraft
 from app.research.schemas.study import StudyConfig
 from app.research.skills.contracts import SkillDefinition
-from app.research.tools.catalog import TOOL_CATALOG, method_keys, selected_implementation_versions
+from app.research.tools.catalog import TOOL_CATALOG
 
-OPTIONAL_TOOLS = ("price_profile", "exogenous_profile", "relationship_analysis")
+FUNCTION_AGENDA_HYPOTHESES: dict[str, str] = {
+    "price_tukey_outer_fence": "电价可能存在尖峰或极端值。",
+    "price_calendar_group_profile": "电价可能存在日内或季节结构。",
+    "price_lag_autocorrelation": "电价可能存在自相关或持续性。",
+    "exogenous_iqr_outliers": "所选外生变量可能存在异常观测。",
+    "exogenous_pearson_collinearity": "所选外生变量之间可能存在共线性。",
+    "relationship_scipy_pearson_pairwise": "所选变量与电价可能存在同期关系。",
+    "relationship_scipy_spearman_pairwise": "所选变量与电价可能存在单调关系。",
+    "relationship_pearson_positive_lead_scan": "所选变量可能存在领先滞后关系。",
+    "relationship_pearson_by_hour": "变量与电价的关系可能存在时段差异。",
+    "relationship_pearson_by_month": "变量与电价的关系可能存在月份结构。",
+    "relationship_pearson_segment_comparison": "峰段、谷段或其他明确分段可能存在关系差异。",
+    "price_segment_distribution_comparison": "峰段、谷段或其他明确分段可能存在电价差异。",
+    "price_stationarity_tests": "电价可能不是围绕稳定水平波动，建模前需要差分或去趋势。",
+    "price_seasonal_decomposition": "电价的可解释部分可能主要来自日内和周内季节成分。",
+    "price_partial_autocorrelation": "电价可能存在有限阶的直接记忆结构。",
+    "price_spike_regime_profile": "极端价格可能集中出现并具有聚集性。",
+    "price_duration_curve": "高价时段可能只占很小比例但贡献主要价值。",
+    "price_variance_stabilization_check": "电价厚尾可能需要方差稳定变换才能进入建模。",
+    "price_naive_baseline_benchmark": "朴素基线可能已经提供较低误差，后续模型需超越该底线。",
+    "exogenous_variance_inflation": "所选变量之间可能存在多重共线性冗余。",
+    "exogenous_stationarity_tests": "部分驱动变量可能自身非平稳，与电价形成共同趋势。",
+    "relationship_mutual_information_scan": "部分变量可能与电价存在线性相关无法捕捉的非线性依赖。",
+    "relationship_granger_causality_scan": "部分变量的历史可能在样本内改善电价自回归拟合。",
+    "relationship_rolling_correlation_stability": "电价与变量的关系可能随时间漂移甚至反号。",
+}
+
+
+def _agenda_hypotheses(draft: EDAPlanDraft, functions: list[str]) -> list[str]:
+    """Ensure atomic Function Calls also produce a deterministic research agenda."""
+
+    generated = [FUNCTION_AGENDA_HYPOTHESES[name] for name in functions if name in FUNCTION_AGENDA_HYPOTHESES]
+    return list(dict.fromkeys([*draft.hypotheses, *generated]))
 
 
 def _intervals_per_hour(frequency: str) -> float:
@@ -39,64 +71,99 @@ def _parameter_int(parameters: dict[str, Any], key: str, default: int) -> int:
         raise ResearchPlanValidationError(f"{key} 必须是整数") from exc
 
 
-def _compile_step(
+def compile_function_parameters(
+    function_name: str,
+    parameters: dict[str, Any],
+    *,
+    selected_variables: list[str],
+    config: StudyConfig,
+    enabled: bool,
+) -> dict[str, Any]:
+    """Fill trusted arguments and reject parameters unrelated to one atomic function."""
+
+    spec = TOOL_CATALOG[function_name]
+    supplied = dict(parameters)
+    compiled: dict[str, Any] = {}
+
+    if spec.uses_variables:
+        requested_variables = supplied.pop("variables", selected_variables)
+        if requested_variables != selected_variables:
+            raise ResearchPlanValidationError(f"{function_name}.variables 必须与方案所选变量一致")
+        if enabled and len(selected_variables) < spec.min_variables:
+            raise ResearchPlanValidationError(
+                f"模型启用了 {function_name}，但所选外生变量少于 {spec.min_variables} 个"
+            )
+        compiled["variables"] = selected_variables
+    elif "variables" in supplied:
+        raise ResearchPlanValidationError(f"{function_name} 不接受 variables 参数")
+
+    if spec.uses_max_lag:
+        maximum = max_lag_limit(config.study.frequency)
+        max_lag = _parameter_int(supplied, "max_lag", config.analysis.max_lag)
+        supplied.pop("max_lag", None)
+        supplied.pop("max_lag_limit", None)
+        if not 0 <= max_lag <= maximum:
+            raise ResearchPlanValidationError(f"{function_name}.max_lag 必须在 0 到 {maximum} 之间")
+        compiled.update({"max_lag": max_lag, "max_lag_limit": maximum})
+    elif "max_lag" in supplied or "max_lag_limit" in supplied:
+        raise ResearchPlanValidationError(f"{function_name} 不接受 max_lag 参数")
+
+    if spec.uses_segments:
+        comparison_id = supplied.pop("comparison_id", None)
+        segments = supplied.pop("segments", None)
+        if not comparison_id or not segments:
+            raise ResearchPlanValidationError(f"{function_name} 必须提供 comparison_id 和至少两个 segments")
+        compiled["comparison_id"] = comparison_id
+        compiled["segments"] = segments
+    elif "comparison_id" in supplied or "segments" in supplied:
+        raise ResearchPlanValidationError(f"{function_name} 不接受分段参数")
+
+    if spec.uses_spike_multiplier:
+        supplied.pop("spike_iqr_multiplier", None)
+        compiled["spike_iqr_multiplier"] = config.analysis.spike_iqr_multiplier
+    if spec.uses_outlier_multiplier:
+        supplied.pop("outlier_iqr_multiplier", None)
+        compiled["outlier_iqr_multiplier"] = config.analysis.outlier_iqr_multiplier
+    if spec.category == "relationship":
+        supplied.pop("min_observations", None)
+        compiled["min_observations"] = config.analysis.min_relationship_observations
+
+    if supplied:
+        raise ResearchPlanValidationError(
+            f"{function_name} 包含不支持的参数：{', '.join(sorted(supplied))}"
+        )
+    return compiled
+
+
+def compile_function_step(
     number: int,
-    tool: str,
-    draft: DraftStep | None,
+    draft: DraftStep,
     *,
     selected_variables: list[str],
     config: StudyConfig,
 ) -> EDAPlanStep:
-    catalog = TOOL_CATALOG[tool]
-    enabled = bool(draft and draft.enabled)
-    rationale = draft.rationale if draft is not None else "大模型未选择本步骤。"
-    parameters: dict[str, Any] = {}
-    versions: dict[str, str] = {}
-    if catalog.methods:
-        requested = draft.parameters.get("methods") if draft is not None else []
-        if not isinstance(requested, list) or any(not isinstance(method, str) for method in requested):
-            raise ResearchPlanValidationError(f"{tool}.methods 必须是方法名称列表")
-        requested = list(dict.fromkeys(requested))
-        unknown = sorted(set(requested).difference(method_keys(tool)))
-        if unknown:
-            raise ResearchPlanValidationError(f"{tool} 包含未注册方法：{', '.join(unknown)}")
-        if enabled and not requested:
-            raise ResearchPlanValidationError(f"大模型启用了 {tool}，但没有选择具体分析方法")
-        parameters["methods"] = requested
-        versions = selected_implementation_versions(tool, requested)
-
-    if tool in {"exogenous_profile", "relationship_analysis"}:
-        parameters["variables"] = selected_variables
-        if enabled and not selected_variables:
-            raise ResearchPlanValidationError(f"大模型启用了 {tool}，但没有选择可用外生变量")
-    if tool in {"price_profile", "relationship_analysis"}:
-        maximum = max_lag_limit(config.study.frequency)
-        max_lag = _parameter_int(draft.parameters if draft else {}, "max_lag", config.analysis.max_lag)
-        if not 0 <= max_lag <= maximum:
-            raise ResearchPlanValidationError(f"{tool}.max_lag 必须在 0 到 {maximum} 之间")
-        parameters.update({"max_lag": max_lag, "max_lag_limit": maximum})
-    if tool == "price_profile":
-        parameters["spike_iqr_multiplier"] = config.analysis.spike_iqr_multiplier
-    elif tool == "exogenous_profile":
-        parameters["outlier_iqr_multiplier"] = config.analysis.outlier_iqr_multiplier
-    elif tool == "relationship_analysis":
-        parameters["min_observations"] = config.analysis.min_relationship_observations
-
+    catalog = TOOL_CATALOG[draft.tool]
+    parameters = compile_function_parameters(
+        draft.tool,
+        draft.parameters,
+        selected_variables=selected_variables,
+        config=config,
+        enabled=draft.enabled,
+    )
     return EDAPlanStep(
         step_id=f"S{number}",
-        tool=tool,  # type: ignore[arg-type]
+        tool=draft.tool,
         title=catalog.title,
         description=catalog.description,
-        rationale=rationale,
-        enabled=enabled,
+        rationale=draft.rationale,
+        enabled=draft.enabled,
         parameters=parameters,
         tool_version=catalog.version,
-        method_versions=versions,
     )
 
 
 class EDAPlanCompiler:
-    """Enforce Skill, tool, method, variable, parameter, and version constraints."""
+    """Enforce Skill, function, variable, argument and version constraints."""
 
     def compile(
         self,
@@ -113,13 +180,26 @@ class EDAPlanCompiler:
         if unknown_variables:
             raise ResearchPlanValidationError(f"大模型选择了未知变量：{', '.join(unknown_variables)}")
         selected = list(dict.fromkeys(draft.selected_variables))
-        tools = [step.tool for step in draft.steps]
-        disallowed_tools = sorted(set(tools).difference(skill.allowed_tools))
-        if disallowed_tools:
-            raise ResearchPlanValidationError(f"Skill {skill.name} 未授权工具：{', '.join(disallowed_tools)}")
-        if len(tools) != len(set(tools)):
-            raise ResearchPlanValidationError("大模型方案包含重复工具步骤")
-        by_tool = {step.tool: step for step in draft.steps}
+        functions = [step.tool for step in draft.steps]
+        if "data_quality" in functions:
+            raise ResearchPlanValidationError("data_quality 由编译器添加，模型不应直接选择")
+        disallowed = sorted(set(functions).difference(skill.allowed_tools))
+        if disallowed:
+            raise ResearchPlanValidationError(f"Skill {skill.name} 未授权函数：{', '.join(disallowed)}")
+        if len(functions) != len(set(functions)):
+            duplicate = next(name for name in functions if functions.count(name) > 1)
+            spec = TOOL_CATALOG[duplicate]
+            recommendation = spec.planning_guidance
+            if spec.uses_max_lag:
+                recommendation = "请合并为一次调用，并用最大的 max_lag 覆盖完整滞后范围。"
+            elif spec.uses_segments:
+                recommendation = "请把全部子样本合并到一次 segments 调用。"
+            elif spec.uses_variables:
+                recommendation = "请合并为一次调用，并在 variables 中列出全部变量。"
+            raise DuplicateResearchFunctionError(duplicate, recommendation)
+        ordered_names = skill.order_function_names(functions)
+        draft_by_function = {step.tool: step for step in draft.steps}
+        ordered_draft_steps = [draft_by_function[name] for name in ordered_names]
 
         quality_catalog = TOOL_CATALOG["data_quality"]
         steps = [
@@ -135,8 +215,8 @@ class EDAPlanCompiler:
             )
         ]
         steps.extend(
-            _compile_step(number, tool, by_tool.get(tool), selected_variables=selected, config=config)
-            for number, tool in enumerate(OPTIONAL_TOOLS, start=2)
+            compile_function_step(number, step, selected_variables=selected, config=config)
+            for number, step in enumerate(ordered_draft_steps, start=2)
         )
 
         assumptions = list(
@@ -145,15 +225,28 @@ class EDAPlanCompiler:
                     *draft.assumptions,
                     "所有统计结论均为描述性证据，不解释为因果关系。",
                     "关系分析使用成对有效样本，不进行隐式插补。",
+                    "变量进入预测候选集前必须证明其在预测起点真实可获得。",
                 ]
             )
         )
-        notes = [
-            (
-                f"方案由大模型 {model_name or 'configured-model'} 生成，"
-                "并由确定性计划编译器完成 Skill、工具、方法版本、变量和参数校验。"
-            )
-        ]
+        if skill.research_protocol is None:
+            notes = [
+                (
+                    f"API 模型 {model_name or 'configured-model'} 在 Skill 授权范围内提出原子研究函数，"
+                    "确定性计划编译器完成函数版本、变量和参数校验。"
+                )
+            ]
+        else:
+            notes = [
+                (
+                    f"本地领域协议 {skill.research_protocol.protocol_id}@"
+                    f"{skill.research_protocol.version} 固定研究阶段、函数顺序和停止边界。"
+                ),
+                (
+                    f"API 模型 {model_name or 'configured-model'} 只提出具体 Function Call；"
+                    "模型网关通过请求参数禁用 thinking，并拒绝任何非空思考响应。"
+                ),
+            ]
         if config.target.unit.casefold() in {"", "unknown", "unspecified"}:
             notes.append("目标电价单位未知，绝对数值和阈值解释前需要用户确认单位。")
         if "unspecified" in config.study.market.casefold():
@@ -168,7 +261,18 @@ class EDAPlanCompiler:
             planning_prompt_version=prompt_version,
             skill_name=skill.name,
             skill_version=skill.version,
-            hypotheses=draft.hypotheses,
+            research_protocol_id=(
+                skill.research_protocol.protocol_id if skill.research_protocol is not None else None
+            ),
+            research_protocol_version=(
+                skill.research_protocol.version if skill.research_protocol is not None else None
+            ),
+            research_protocol_function_order=(
+                list(skill.research_protocol.function_order)
+                if skill.research_protocol is not None
+                else []
+            ),
+            hypotheses=_agenda_hypotheses(draft, ordered_names),
             selected_variables=selected,
             steps=steps,
             assumptions=assumptions,

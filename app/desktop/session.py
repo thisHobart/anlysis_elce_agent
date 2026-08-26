@@ -26,7 +26,7 @@ SessionStatus = Literal[
 ]
 InputRole = Literal["config", "target", "actuals", "forecasts"]
 InputStatus = Literal["empty", "selected", "loading", "ready", "warning", "failed", "changed"]
-MessageKind = Literal["text", "notice", "tool", "plan", "result", "error"]
+MessageKind = Literal["text", "notice", "thinking", "tool", "plan", "result", "error"]
 TraceCategory = Literal["session", "user", "agent", "input", "plan", "tool", "evaluation", "artifact", "error"]
 
 
@@ -128,7 +128,7 @@ class ResearchSession(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 5
+    schema_version: int = 7
     session_id: str = Field(default_factory=lambda: uuid4().hex)
     title: str = "新会话"
     status: SessionStatus = "idle"
@@ -150,6 +150,7 @@ class ResearchSession(BaseModel):
     artifact_directory: str | None = None
     report_path: str | None = None
     graph_event_count: int = 0
+    graph_event_sequence: int = 0
 
     @property
     def can_analyze(self) -> bool:
@@ -183,7 +184,9 @@ class SessionStore:
                 return []
             sessions = [ResearchSession.model_validate(item) for item in payload]
             for session in sessions:
-                session.schema_version = 5
+                session.schema_version = 7
+                if session.graph_event_sequence == 0 and session.graph_event_count:
+                    session.graph_event_sequence = session.graph_event_count
                 if session.current_plan and not self._plan_has_required_versions(session.current_plan):
                     session.current_plan = None
                     session.plan_stale = True

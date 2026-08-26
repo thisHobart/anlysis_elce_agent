@@ -111,11 +111,7 @@ class ModelConfigDialog(QDialog):
         self.retries.setValue(settings.llm_max_retries)
         self.retries.setSuffix(" 次")
 
-        self.structured_mode = QComboBox()
-        self.structured_mode.addItem("Function Calling（推荐）", "native")
-        self.structured_mode.addItem("JSON 提示词（兼容模式）", "json_prompt")
-        mode_index = self.structured_mode.findData(settings.llm_structured_mode)
-        self.structured_mode.setCurrentIndex(max(mode_index, 0))
+        self.structured_mode = QLabel("Function Calling（固定）")
 
         self.history_messages = QSpinBox()
         self.history_messages.setRange(1, 100)
@@ -135,7 +131,10 @@ class ModelConfigDialog(QDialog):
 
         help_label = QLabel(
             "配置保存到项目 .env。DeepSeek 使用官方 Base URL；自定义接口需要填写完整的 OpenAI 兼容 Base URL。"
-            "研究规划和方案修订必须调用大模型；模型不可用时任务会暂停并提示重试。"
+            "研究规划和方案修订必须调用大模型，但大模型只做受限对话路由、函数提议和结构化修订；"
+            "领域研究顺序由本地 Skill 协议控制，"
+            "自定义 OpenAI 兼容接口和 DeepSeek 全部模型固定发送 enable_thinking=false；"
+            "若响应仍包含思考内容会立即失败。模型不可用时任务会暂停并提示重试。"
         )
         help_label.setWordWrap(True)
         help_label.setObjectName("modelConfigHelp")
@@ -198,7 +197,6 @@ class ModelConfigDialog(QDialog):
             "VPP_LLM_MODEL": self.model.text().strip(),
             "VPP_LLM_TIMEOUT_SECONDS": self.timeout.value(),
             "VPP_LLM_MAX_RETRIES": self.retries.value(),
-            "VPP_LLM_STRUCTURED_MODE": self.structured_mode.currentData(),
             "VPP_LLM_HISTORY_MESSAGES": self.history_messages.value(),
         }
         try:

@@ -17,12 +17,15 @@ from PySide6.QtWidgets import QApplication
 from app.config import Settings
 from app.desktop.input_config import build_session_study_config
 from app.desktop.main_window import MainWindow
+from app.desktop.message_widgets import ThinkingMessageWidget
 from app.desktop.session import ResearchSession, SessionMessage, SessionStore
 from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
 from app.research.agent.subagents.eda import EDASubagent
 from app.research.application.coordinator import ResearchCoordinator
+from app.research.graph.narration import STAGE_LABELS
 from app.research.schemas.study import load_study_config
 from app.research.skills.registry import SkillRegistry
+from app.research.tools.catalog import TOOL_CATALOG
 
 
 class DesktopModelPlanner:
@@ -35,18 +38,26 @@ class DesktopModelPlanner:
         names = [spec.name for spec in config.exogenous]
         relationship_request = any(word in question for word in ("关系", "相关", "滞后", "影响"))
         if not relationship_request:
-            methods = [method for word, method in (("季节", "seasonality"), ("尖峰", "extremes")) if word in question]
+            functions = [
+                function_name
+                for word, function_name in (
+                    ("季节", "price_calendar_group_profile"),
+                    ("尖峰", "price_tukey_outer_fence"),
+                )
+                if word in question
+            ]
             return {
                 "objective": "分析用户关注的电价结构",
                 "hypotheses": ["电价可能存在用户关注的结构特征。"],
                 "selected_variables": [],
                 "steps": [
                     {
-                        "tool": "price_profile",
+                        "tool": function_name,
                         "enabled": True,
                         "rationale": "问题聚焦电价自身。",
-                        "parameters": {"methods": methods or ["distribution"], "max_lag": 24},
+                        "parameters": {},
                     }
+                    for function_name in (functions or ["price_descriptive_distribution"])
                 ],
                 "assumptions": [],
             }
@@ -60,22 +71,46 @@ class DesktopModelPlanner:
             "selected_variables": selected,
             "steps": [
                 {
-                    "tool": "price_profile",
+                    "tool": "price_calendar_group_profile",
                     "enabled": True,
                     "rationale": "检查电价周期结构。",
-                    "parameters": {"methods": ["seasonality", "autocorrelation"], "max_lag": lag},
+                    "parameters": {},
                 },
                 {
-                    "tool": "exogenous_profile",
+                    "tool": "price_lag_autocorrelation",
+                    "enabled": True,
+                    "rationale": "检查电价滞后结构。",
+                    "parameters": {"max_lag": lag},
+                },
+                {
+                    "tool": "exogenous_descriptive_distribution",
                     "enabled": True,
                     "rationale": "检查变量画像。",
-                    "parameters": {"methods": ["distribution", "outliers"]},
+                    "parameters": {"variables": selected},
                 },
                 {
-                    "tool": "relationship_analysis",
+                    "tool": "exogenous_iqr_outliers",
                     "enabled": True,
-                    "rationale": "检查同期和滞后关系。",
-                    "parameters": {"methods": ["pearson", "spearman", "lag_scan"], "max_lag": lag},
+                    "rationale": "检查变量异常值。",
+                    "parameters": {"variables": selected},
+                },
+                {
+                    "tool": "relationship_scipy_pearson_pairwise",
+                    "enabled": True,
+                    "rationale": "检查同期 Pearson 关系。",
+                    "parameters": {"variables": selected},
+                },
+                {
+                    "tool": "relationship_scipy_spearman_pairwise",
+                    "enabled": True,
+                    "rationale": "检查同期 Spearman 关系。",
+                    "parameters": {"variables": selected},
+                },
+                {
+                    "tool": "relationship_pearson_positive_lead_scan",
+                    "enabled": True,
+                    "rationale": "检查领先滞后关系。",
+                    "parameters": {"variables": selected, "max_lag": lag},
                 },
             ],
             "assumptions": [],
@@ -94,9 +129,12 @@ class DesktopModelDialogue:
             return DialogueDecision(
                 intent="revise_plan",
                 response="已根据用户反馈修订方案。",
-                enabled_tools=["relationship_analysis"],
+                enabled_tools=[
+                    "relationship_scipy_pearson_pairwise",
+                    "relationship_scipy_spearman_pairwise",
+                    "relationship_pearson_positive_lead_scan",
+                ],
                 selected_variables=["actual_wind"],
-                selected_methods={"relationship_analysis": ["pearson", "spearman", "lag_scan"]},
                 max_lag=4,
             )
         if "结果" in question or "说明什么" in question:
@@ -205,12 +243,26 @@ def test_main_window_uses_one_three_pane_workspace(qt_app: QApplication, tmp_pat
         assert window.workspace.count() == 3
         assert not hasattr(window, "tabs")
         assert window.workspace.current_session.title == "新会话"
-        assert window.workspace.history.new_button.text() == "＋  新建会话"
-        assert window.workspace.context.inputs.title_label.text() == "文件输入"
-        assert window.workspace.conversation.config_label.text() == "未使用 YAML 配置（可选）"
+        assert window.workspace.history.new_button.text() == "＋  新的研究"
+        assert window.workspace.context.inputs.title_label.text() == "数据文件"
+        assert window.workspace.conversation.config_label.text() == "未使用研究配置文件（可选）"
         assert list(window.workspace.context.inputs.rows) == ["config", "target", "actuals", "forecasts"]
-        assert all(row.name_label.text() == "未选择文件" for row in window.workspace.context.inputs.rows.values())
+        assert all(row.name_label.text() == "尚未选择" for row in window.workspace.context.inputs.rows.values())
+        assert all(not hasattr(row, "status_label") for row in window.workspace.context.inputs.rows.values())
+        assert all(not hasattr(row, "variables") for row in window.workspace.context.inputs.rows.values())
+        assert not hasattr(window.workspace.context, "plan")
         assert window.workspace.context.trace.tree.verticalScrollBar() is not None
+        window.workspace.context.trace.maximize_button.click()
+        qt_app.processEvents()
+        assert window.workspace.history.isHidden()
+        assert window.workspace.conversation.isHidden()
+        assert window.workspace.context.inputs.isHidden()
+        assert window.workspace.context.trace.maximize_button.text() == "还原"
+        window.workspace.context.trace.maximize_button.click()
+        qt_app.processEvents()
+        assert not window.workspace.history.isHidden()
+        assert not window.workspace.conversation.isHidden()
+        assert not window.workspace.context.inputs.isHidden()
         assert not window.workspace.current_session.can_analyze
     finally:
         window.close()
@@ -254,7 +306,8 @@ def test_target_only_arbitrary_filename_builds_price_only_plan(
         assert plan is not None
         assert [step["tool"] for step in plan["steps"] if step["enabled"]] == [
             "data_quality",
-            "price_profile",
+            "price_tukey_outer_fence",
+            "price_calendar_group_profile",
         ]
     finally:
         window.close()
@@ -379,7 +432,7 @@ def test_old_session_plan_without_skill_and_tool_versions_is_invalidated(
 
     restored = store.load()[0]
 
-    assert restored.schema_version == 5
+    assert restored.schema_version == 7
     assert restored.current_plan is None
     assert restored.plan_stale
     assert restored.status == "idle"
@@ -403,23 +456,34 @@ def test_continuous_conversation_runs_plan_and_answers_followup(
         assert session.status == "awaiting_plan_approval"
         assert session.current_plan is not None
         assert workspace.conversation.current_plan_widget is not None
-        assert all(not checkbox.isEnabled() for checkbox in workspace.conversation.current_plan_widget.step_checks.values())
+        assert not hasattr(workspace.conversation.current_plan_widget, "editor_toggle")
+        assert all(
+            not hasattr(row, "setChecked")
+            for row in workspace.conversation.current_plan_widget.step_checks.values()
+        )
         assert "自动执行" in workspace.conversation.current_plan_widget.status_label.text()
-        assert workspace.context.plan.tree.topLevelItemCount() == 4
         assert session.inputs["actuals"].variables
         assert all(event.status != "running" for event in session.trace)
 
         approved = workspace.conversation.current_plan_widget.approved_plan()
         workspace.run_plan(approved)
         wait_until(qt_app, lambda: not workspace.is_busy)
-        assert session.status == "awaiting_user"
+        assert session.status == "completed"
         assert session.report_path and Path(session.report_path).is_file()
         assert any(message.kind == "result" for message in session.messages)
         assert any(event.category == "tool" and event.duration_ms is not None for event in session.trace)
 
         before = len(session.messages)
         workspace.submit_question("这个结果说明什么？")
-        wait_until(qt_app, lambda: not workspace.is_busy)
+        wait_until(
+            qt_app,
+            lambda: (
+                not workspace.is_busy
+                and session.messages
+                and session.messages[-1].role == "assistant"
+                and session.messages[-1].kind == "text"
+            ),
+        )
         assert len(session.messages) == before + 3
         assert session.messages[-1].role == "assistant"
         assert "描述性" in session.messages[-1].content
@@ -440,6 +504,116 @@ def test_continuous_conversation_runs_plan_and_answers_followup(
             assert len(restored_session.runs) == 1
         finally:
             restored.close()
+    finally:
+        if window.isVisible():
+            window.close()
+
+
+def test_thinking_process_is_visible_and_survives_a_restart(
+    qt_app: QApplication,
+    desktop_study: Path,
+    model_agent: ResearchCoordinator,
+    tmp_path: Path,
+):
+    store = SessionStore(tmp_path / "sessions.json")
+    window = MainWindow(config_path=desktop_study, agent=model_agent, session_store=store)
+    try:
+        workspace = window.workspace
+        workspace.submit_question("分析 actual_load 与电价 2 小时的滞后关系")
+        wait_until(qt_app, lambda: not workspace.is_busy)
+        session = workspace.current_session
+
+        planning_card = next(message for message in session.messages if message.kind == "thinking")
+        stages = [step["stage"] for step in planning_card.payload["steps"]]
+        titles = [step["title"] for step in planning_card.payload["steps"]]
+        assert planning_card.payload["state"] == "completed"
+        assert len(titles) >= 4
+        assert "解析问题" in stages and "生成方案" in stages
+        assert titles[0] == "解析研究问题"
+        assert titles == list(dict.fromkeys(titles))
+        assert all(step["status"] != "running" for step in planning_card.payload["steps"])
+
+        workspace.run_plan(workspace.conversation.current_plan_widget.approved_plan())
+        wait_until(qt_app, lambda: not workspace.is_busy)
+
+        execution_card = [message for message in session.messages if message.kind == "thinking"][-1]
+        steps = execution_card.payload["steps"]
+        computed = [step for step in steps if step["stage"] == "执行分析"]
+        assert execution_card.payload["state"] == "completed"
+        assert len(computed) == len(workspace.current_session.current_plan["steps"])
+        assert all(step["title"].startswith("已完成 · ") for step in computed)
+        assert all(step["function_name"] for step in computed)
+        assert any(step["stage"] == "评估结果" for step in steps)
+
+        window.close()
+        restored = MainWindow(agent=model_agent, session_store=store)
+        try:
+            restored.workspace.select_session(session.session_id)
+            widgets = [
+                widget
+                for widget in restored.workspace.conversation._message_widgets.values()
+                if isinstance(widget, ThinkingMessageWidget)
+            ]
+            assert len(widgets) == 2
+            assert widgets[-1].steps == steps
+            assert not widgets[-1].steps_container.isVisible()
+            widgets[-1].toggle_button.click()
+            assert widgets[-1].steps_container.isVisibleTo(widgets[-1])
+        finally:
+            restored.close()
+    finally:
+        if window.isVisible():
+            window.close()
+
+
+def test_run_trace_reads_as_a_professional_audit_log(
+    qt_app: QApplication,
+    desktop_study: Path,
+    model_agent: ResearchCoordinator,
+    tmp_path: Path,
+):
+    store = SessionStore(tmp_path / "sessions.json")
+    window = MainWindow(config_path=desktop_study, agent=model_agent, session_store=store)
+    try:
+        workspace = window.workspace
+        workspace.submit_question("分析 actual_load 与电价 2 小时的滞后关系")
+        wait_until(qt_app, lambda: not workspace.is_busy)
+        workspace.run_plan(workspace.conversation.current_plan_widget.approved_plan())
+        wait_until(qt_app, lambda: not workspace.is_busy)
+
+        tree = workspace.context.trace.tree
+        rows = [
+            (tree.topLevelItem(index).text(1), tree.topLevelItem(index).text(2))
+            for index in range(tree.topLevelItemCount())
+        ]
+        stages = [stage for stage, _text in rows]
+        texts = [text for _stage, text in rows]
+
+        # Every visible row is narrated: no internal identifiers, no second person.
+        assert rows
+        assert not any("_" in text and "[" in text for text in texts)
+        assert not any(word in text for text in texts for word in ("你", "plan_id", "run_id", "advance_tool"))
+        assert not any(text.startswith("系统事件") for text in texts)
+        assert set(stages) <= set(STAGE_LABELS.values())
+
+        # One function produces one "分析中" row and one "已完成" row, never a repeated title.
+        titles = [text.split(" — ")[0] for text in texts]
+        assert titles == list(dict.fromkeys(titles))
+        running = {title.removeprefix("分析中 · ") for title in titles if title.startswith("分析中 · ")}
+        finished = {title.removeprefix("已完成 · ") for title in titles if title.startswith("已完成 · ")}
+        enabled = {step["title"] for step in workspace.current_session.current_plan["steps"] if step["enabled"]}
+        assert running == finished == enabled
+
+        # A running row explains the method; the finished row only reports elapsed time.
+        started = next(text for text in texts if text.startswith("分析中 · 数据质量与时间对齐"))
+        completed = next(text for text in texts if text.startswith("已完成 · 数据质量与时间对齐"))
+        assert started.split(" — ")[1] == TOOL_CATALOG["data_quality"].description.rstrip("。")
+        assert completed.split(" — ")[1].endswith(("毫秒", "秒"))
+
+        # The locked batch is named by the research stages it covers.
+        locked = next(text for text in texts if text.startswith("锁定执行计划"))
+        assert "数据体检 1 项" in locked
+        assert locked.endswith(f"共 {len(enabled)} 项")
     finally:
         if window.isVisible():
             window.close()
@@ -478,14 +652,18 @@ def test_plan_can_be_revised_and_executed_through_dialogue(
         assert revised["selected_variables"] == ["actual_wind"]
         assert [step["tool"] for step in revised["steps"] if step["enabled"]] == [
             "data_quality",
-            "relationship_analysis",
+            "relationship_scipy_pearson_pairwise",
+            "relationship_scipy_spearman_pairwise",
+            "relationship_pearson_positive_lead_scan",
         ]
-        relationship = next(step for step in revised["steps"] if step["tool"] == "relationship_analysis")
+        relationship = next(
+            step for step in revised["steps"] if step["tool"] == "relationship_pearson_positive_lead_scan"
+        )
         assert relationship["parameters"]["max_lag"] == 4
 
         workspace.submit_question("按这个执行")
         wait_until(qt_app, lambda: not workspace.is_busy, timeout_seconds=20.0)
-        assert workspace.current_session.status == "awaiting_user"
+        assert workspace.current_session.status == "completed"
         assert workspace.current_session.runs
         assert workspace.current_session.latest_eda_summary is not None
         assert list(workspace.current_session.latest_eda_summary["relationships"]["series"]) == ["actual_wind"]
@@ -538,13 +716,13 @@ def test_model_plan_auto_executes_after_feedback_window(
         workspace.submit_question("分析 actual_load 与电价的滞后关系")
         wait_until(
             qt_app,
-            lambda: workspace.current_session.status == "awaiting_user" and not workspace.is_busy,
+            lambda: workspace.current_session.status == "completed" and not workspace.is_busy,
             timeout_seconds=20.0,
         )
 
         assert workspace.current_session.runs
-        assert any("未收到修改意见" in message.content for message in workspace.current_session.messages)
-        assert any(event.name == "方案反馈窗口结束" for event in workspace.current_session.trace)
+        assert any("没有收到修改意见" in message.content for message in workspace.current_session.messages)
+        assert any(event.name == "确认超时，自动执行方案" for event in workspace.current_session.trace)
     finally:
         window.close()
 
@@ -566,8 +744,8 @@ def test_invalid_external_skill_is_reported_in_new_session(
     window = MainWindow(agent=agent, session_store=SessionStore(tmp_path / "sessions.json"))
     try:
         session = window.workspace.current_session
-        assert any("外部 Skill 加载失败" in message.content for message in session.messages)
-        assert any(event.name == "外部 Skill 加载失败" for event in session.trace)
+        assert any("外部研究方法包没能加载" in message.content for message in session.messages)
+        assert any(event.name == "外部研究方法包加载失败" for event in session.trace)
     finally:
         window.close()
         qt_app.processEvents()
@@ -615,7 +793,7 @@ def test_expired_approval_restores_from_sqlite_and_requires_explicit_confirmatio
 
         restored.workspace.run_plan(restored.workspace.conversation.current_plan_widget.approved_plan())
         wait_until(qt_app, lambda: not restored.workspace.is_busy, timeout_seconds=20.0)
-        assert restored.workspace.current_session.status == "awaiting_user"
+        assert restored.workspace.current_session.status == "completed"
         assert restored.workspace.current_session.runs
     finally:
         restored.close()

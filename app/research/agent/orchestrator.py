@@ -13,11 +13,12 @@ from app.llm.gateway import ModelConfigurationError, ModelGateway, ModelGatewayE
 from app.research.agent.errors import ResearchModelUnavailableError, ResearchPlanValidationError
 from app.research.agent.schemas import ConversationMessage, EDAPlan, EDAToolName
 from app.research.schemas.study import StudyConfig
-from app.research.tools.catalog import TOOL_CATALOG, method_keys, tool_metadata
+from app.research.tools.catalog import TOOL_CATALOG, tool_metadata
+from app.research.tools.contracts import SegmentDefinition
 
 DialogueIntent = Literal["discussion", "new_plan", "revise_plan", "explain_result", "execute_plan"]
 TOOL_METADATA = tool_metadata()
-DIALOGUE_PROMPT_VERSION = "research-dialogue-v2"
+DIALOGUE_PROMPT_VERSION = "research-dialogue-v4"
 
 DIALOGUE_SYSTEM_PROMPT = """你负责一个离线、只读的电价与外生变量探索性数据分析对话。
 
@@ -31,11 +32,12 @@ DIALOGUE_SYSTEM_PROMPT = """你负责一个离线、只读的电价与外生变�
 - execute_plan：用户明确确认执行当前方案。
 
 边界：
-- 方案只能使用上下文提供的 Skill、工具、方法和变量；本地程序负责实际统计计算。
+- 方案只能使用上下文提供的 Skill、原子研究函数和变量；本地程序负责实际统计计算。
 - 用户可能用自然语言称呼目标序列；以 study.target 中的已配置名称作为目标序列。
 - 证据和解释只能引用上下文中的 evidence；没有证据时说明缺失，不补写数值或因果结论。
 - revise_plan 只填写用户要求改变的字段，其余字段返回 null。
 - 新方案从 available_skills 选择 skill_name；没有可执行数据时用 discussion 说明所需数据。
+- 用户要求峰谷、季节或事件前后比较但没有给出明确小时、月份或时间边界时，选择 discussion 请求补充，不能猜测 segments。
 
 路由判断：用户明确提出分析且 has_executable_data 为 true 时选择 new_plan；已有方案收到明确确认时选择 execute_plan；已有方案收到修改意见时选择 revise_plan；用户询问结果时选择 explain_result。
 
@@ -54,8 +56,9 @@ class DialogueDecision(BaseModel):
     hypotheses: list[str] | None = None
     enabled_tools: list[EDAToolName] | None = None
     selected_variables: list[str] | None = None
-    selected_methods: dict[str, list[str]] | None = None
     max_lag: int | None = Field(default=None, ge=0)
+    comparison_id: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]{0,31}$")
+    segments: list[SegmentDefinition] | None = None
 
 
 def compact_evidence(
@@ -173,19 +176,13 @@ class ModelResearchDialogue:
             "evidence": compact_evidence(summary, evaluation),
             "available_variables": variables,
             "available_skills": available_skills,
-            "allowed_tools": {
-                tool: {
+            "allowed_functions": {
+                function_name: {
                     "description": metadata[1],
-                    "methods": {
-                        method.key: {
-                            "description": method.description,
-                            "method_id": method.implementation_id,
-                            "version": method.version,
-                        }
-                        for method in TOOL_CATALOG[tool].methods
-                    },
+                    "display_name": TOOL_CATALOG[function_name].title,
+                    "version": TOOL_CATALOG[function_name].version,
                 }
-                for tool, metadata in TOOL_METADATA.items()
+                for function_name, metadata in TOOL_METADATA.items()
             },
             "intent_rules": {
                 "discussion": "方法讨论或当前方案说明，返回文字解释",
@@ -197,7 +194,7 @@ class ModelResearchDialogue:
             "revision_contract": {
                 "unchanged_fields": "null",
                 "mandatory_data_quality": "managed_by_compiler",
-                "method_selection": "catalog_keys_only",
+                "function_selection": "exact_allowed_function_names_only",
                 "revision_basis": "user_feedback",
             },
             "skill_contract": {
@@ -241,8 +238,9 @@ class MainResearchAgent:
             decision.hypotheses,
             decision.enabled_tools,
             decision.selected_variables,
-            decision.selected_methods,
             decision.max_lag,
+            decision.comparison_id,
+            decision.segments,
         )
         if all(value is None for value in changed_fields):
             raise ResearchPlanValidationError("大模型将回合标记为方案修订，但没有返回任何修改内容。")
@@ -252,9 +250,17 @@ class MainResearchAgent:
             enabled_tools = current_enabled
         else:
             enabled_tools = set(decision.enabled_tools).difference({"data_quality"})
-            unknown_tools = sorted(enabled_tools.difference(TOOL_CATALOG))
-            if unknown_tools:
-                raise ResearchPlanValidationError(f"大模型修订包含未知工具：{', '.join(unknown_tools)}")
+            unknown_functions = sorted(enabled_tools.difference(TOOL_CATALOG))
+            if unknown_functions:
+                raise ResearchPlanValidationError(f"大模型修订包含未知研究函数：{', '.join(unknown_functions)}")
+            if plan.research_protocol_function_order:
+                outside_protocol = sorted(
+                    enabled_tools.difference(plan.research_protocol_function_order)
+                )
+                if outside_protocol:
+                    raise ResearchPlanValidationError(
+                        f"大模型修订包含领域协议未授权函数：{', '.join(outside_protocol)}"
+                    )
 
         valid_names = {spec.name for spec in config.exogenous}
         selected_variables = (
@@ -266,25 +272,7 @@ class MainResearchAgent:
         if unknown_variables:
             raise ResearchPlanValidationError(f"大模型修订包含未知变量：{', '.join(unknown_variables)}")
 
-        selected_methods = {
-            step.tool: list(step.parameters.get("methods", []))
-            for step in plan.steps
-            if TOOL_CATALOG[step.tool].methods
-        }
-        if decision.selected_methods is not None:
-            for tool, methods in decision.selected_methods.items():
-                if tool not in TOOL_CATALOG:
-                    raise ResearchPlanValidationError(f"大模型修订包含未知工具：{tool}")
-                unknown_methods = sorted(set(methods).difference(method_keys(tool)))
-                if unknown_methods:
-                    raise ResearchPlanValidationError(
-                        f"大模型修订包含未注册方法 {tool}: {', '.join(unknown_methods)}"
-                    )
-                selected_methods[tool] = list(dict.fromkeys(methods))
-        for tool in enabled_tools:
-            if method_keys(tool) and not selected_methods.get(tool):
-                raise ResearchPlanValidationError(f"大模型启用了 {tool}，但没有选择具体方法")
-        if enabled_tools.intersection({"exogenous_profile", "relationship_analysis"}) and not selected_variables:
+        if any(TOOL_CATALOG[name].uses_variables for name in enabled_tools) and not selected_variables:
             raise ResearchPlanValidationError("修订方案启用了外生变量分析，但没有选择变量")
 
         current_lag = next(
@@ -304,7 +292,6 @@ class MainResearchAgent:
             enabled_step_ids=enabled_step_ids,
             selected_variables=selected_variables,
             max_lag=max_lag,
-            selected_methods=selected_methods,
             reason=f"用户反馈经大模型分析后形成修订：{question.strip()}",
             source="user_dialogue",
         ).model_copy(
@@ -315,6 +302,97 @@ class MainResearchAgent:
                 "planning_model": getattr(self.model_dialogue, "model_name", plan.planning_model),
             }
         )
+        from app.research.planning.compiler import FUNCTION_AGENDA_HYPOTHESES
+
+        enabled_agenda_hypotheses = {
+            FUNCTION_AGENDA_HYPOTHESES[step.tool]
+            for step in revised.enabled_steps
+            if step.tool in FUNCTION_AGENDA_HYPOTHESES
+        }
+        revised = revised.model_copy(
+            update={
+                "hypotheses": [
+                    *[
+                        hypothesis
+                        for hypothesis in plan.hypotheses
+                        if hypothesis not in FUNCTION_AGENDA_HYPOTHESES.values()
+                        or hypothesis in enabled_agenda_hypotheses
+                    ],
+                    *[
+                        hypothesis
+                        for hypothesis in FUNCTION_AGENDA_HYPOTHESES.values()
+                        if hypothesis in enabled_agenda_hypotheses and hypothesis not in plan.hypotheses
+                    ],
+                ]
+            }
+        )
+        segment_steps = [step for step in revised.steps if TOOL_CATALOG[step.tool].uses_segments]
+        existing_segments = next((step.parameters.get("segments") for step in segment_steps), None)
+        existing_comparison_id = next(
+            (step.parameters.get("comparison_id") for step in segment_steps),
+            None,
+        )
+        segments = (
+            [item.model_dump(mode="json") for item in decision.segments]
+            if decision.segments is not None
+            else existing_segments
+        )
+        comparison_id = decision.comparison_id or existing_comparison_id
+        if any(TOOL_CATALOG[name].uses_segments for name in enabled_tools) and (
+            not segments or not comparison_id
+        ):
+            raise ResearchPlanValidationError("分段比较修订必须提供 comparison_id 和至少两个 segments")
+        if segment_steps and (decision.segments is not None or decision.comparison_id is not None):
+            revised = revised.model_copy(
+                update={
+                    "steps": [
+                        step.model_copy(
+                            update={
+                                "parameters": {
+                                    **step.parameters,
+                                    "comparison_id": comparison_id,
+                                    "segments": segments,
+                                }
+                            }
+                        )
+                        if TOOL_CATALOG[step.tool].uses_segments
+                        else step
+                        for step in revised.steps
+                    ]
+                }
+            )
+        existing_functions = {step.tool for step in revised.steps}
+        missing_functions = [name for name in enabled_tools if name not in existing_functions]
+        if missing_functions:
+            from app.research.planning.compiler import compile_function_step
+            from app.research.planning.contracts import DraftStep
+
+            extra_steps = list(revised.steps)
+            for function_name in missing_functions:
+                parameters: dict[str, Any] = {}
+                spec = TOOL_CATALOG[function_name]
+                if spec.uses_variables:
+                    parameters["variables"] = selected_variables
+                if spec.uses_max_lag:
+                    parameters["max_lag"] = max_lag
+                if spec.uses_segments:
+                    parameters["comparison_id"] = comparison_id
+                    parameters["segments"] = segments
+                extra_steps.append(
+                    compile_function_step(
+                        len(extra_steps) + 1,
+                        DraftStep(
+                            tool=function_name,
+                            enabled=True,
+                            rationale=spec.description,
+                            parameters=parameters,
+                        ),
+                        selected_variables=selected_variables,
+                        config=config,
+                    )
+                )
+            revised = revised.model_copy(update={"steps": extra_steps})
+        revised = revised.ordered_by_research_protocol()
         enabled_titles = "、".join(step.title for step in revised.enabled_steps)
         variable_text = "、".join(revised.selected_variables) if revised.selected_variables else "无"
         response = decision.response.strip() or (

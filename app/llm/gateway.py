@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Protocol, TypeVar
+from typing import Any, Protocol, TypeVar
 
 from pydantic import BaseModel
 
 StructuredResult = TypeVar("StructuredResult", bound=BaseModel)
 ModelMessage = tuple[str, str]
+
+
+class ModelToolCall(BaseModel):
+    """Provider-neutral proposed function call; execution remains application-controlled."""
+
+    name: str
+    arguments: dict[str, Any]
+    call_id: str | None = None
 
 
 class ModelGatewayError(RuntimeError):
@@ -39,3 +47,10 @@ class ModelGateway(Protocol):
     ) -> StructuredResult: ...
 
     def invoke_text(self, *, messages: list[ModelMessage]) -> str: ...
+
+    def invoke_tool_calls(
+        self,
+        *,
+        messages: list[ModelMessage],
+        tools: list[dict[str, Any]],
+    ) -> list[ModelToolCall]: ...

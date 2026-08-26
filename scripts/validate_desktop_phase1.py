@@ -36,8 +36,6 @@ def _last_error(window: MainWindow) -> str:
 
 def main() -> int:
     settings = get_settings()
-    if settings.llm_structured_mode != "native":
-        raise SystemExit("VPP_LLM_STRUCTURED_MODE must be native.")
     root = Path(__file__).resolve().parents[1]
     acceptance_root = root / "artifacts" / "acceptance"
     acceptance_root.mkdir(parents=True, exist_ok=True)
@@ -119,7 +117,7 @@ def main() -> int:
         evidence = {
             "status": "passed",
             "model": settings.llm_model,
-            "structured_mode": settings.llm_structured_mode,
+            "structured_mode": "native",
             "session_id": session_id,
             "plan_revision": final_plan["revision"],
             "skill": {"name": final_plan["skill_name"], "version": final_plan["skill_version"]},

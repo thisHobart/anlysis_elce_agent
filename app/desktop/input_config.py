@@ -9,6 +9,7 @@ import pandas as pd
 
 from app.desktop.session import InputRole, ResearchSession
 from app.research.schemas.study import AnalysisSettings, SeriesSpec, StudyConfig, StudyDefinition, load_study_config
+from app.runtime_paths import default_research_output_directory
 
 ROLE_LABELS: dict[InputRole, str] = {
     "config": "研究配置",
@@ -142,7 +143,7 @@ def _frequency(frame: pd.DataFrame, timestamp_column: str) -> str:
     return f"{seconds}s"
 
 
-def _auto_config(session: ResearchSession) -> StudyConfig:
+def _auto_config(session: ResearchSession, *, output_directory: Path | None = None) -> StudyConfig:
     if not session.inputs["target"].path:
         raise ValueError("执行 EDA 前至少需要选择目标电价文件")
     target_path = validate_input_path("target", session.inputs["target"].path)
@@ -200,16 +201,20 @@ def _auto_config(session: ResearchSession) -> StudyConfig:
         ),
         target=target,
         exogenous=exogenous,
-        analysis=AnalysisSettings(output_directory=(Path.cwd() / "artifacts" / "research").resolve()),
+        analysis=AnalysisSettings(output_directory=output_directory or default_research_output_directory()),
     )
 
 
-def build_session_study_config(session: ResearchSession) -> StudyConfig:
+def build_session_study_config(
+    session: ResearchSession,
+    *,
+    output_directory: Path | None = None,
+) -> StudyConfig:
     """Use optional YAML metadata when present, otherwise infer a safe minimal config."""
 
     config_path = session.inputs["config"].path
     if not config_path:
-        return _auto_config(session)
+        return _auto_config(session, output_directory=output_directory)
 
     base = load_study_config(validate_input_path("config", config_path))
     target_path = (
@@ -229,4 +234,7 @@ def build_session_study_config(session: ResearchSession) -> StudyConfig:
             for spec in base.exogenous
             if spec.path in _role_paths(base, role)
         )
-    return base.model_copy(update={"target": target, "exogenous": exogenous})
+    analysis = base.analysis
+    if output_directory is not None:
+        analysis = analysis.model_copy(update={"output_directory": output_directory.resolve()})
+    return base.model_copy(update={"target": target, "exogenous": exogenous, "analysis": analysis})

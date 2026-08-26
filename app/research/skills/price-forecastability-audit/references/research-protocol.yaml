@@ -1,0 +1,82 @@
+protocol_id: price-forecastability-ladder
+version: "1.0.0"
+kind: domain-evidence-ladder
+objective: >-
+  只用目标电价序列，按形态、动态和建模就绪三层证据判断该序列的可预测性难度，
+  并给出后续算法实验必须超越的朴素基线误差底线。
+invariants:
+  - 预测问题必须区分市场产品、预测起点、预测范围、时间粒度和市场时区；未知项保持未知。
+  - 本协议不使用任何外生变量函数，selected_variables 始终为空。
+  - 时间戳对齐必须保留时区与夏令时语义，不用行号近似市场时间。
+  - 负价、价格上限附近值和尖峰默认保留；只识别和解释，不静默截尾、删除或插补。
+  - 平稳性、季节分解和偏自相关需要连续序列，只在这些方法内部做时间插值并报告插值比例。
+  - 朴素基线为全样本计算，只作为误差底线量级参考，不等于样本外预测精度。
+  - 可预测性判定只描述序列自身难度，不构成模型选择结论。
+stop_conditions:
+  - 目标序列不存在、时间轴不可解析或有效样本低于本地 EDA 门槛时停止动态分析。
+  - 有效样本不足两个完整日周期时不执行季节分解，改为标记限制。
+  - 市场产品、预测起点或预测范围缺失且会改变结论时，标记限制并请求用户补充。
+  - 连续迭代没有新增证据或达到已评估 Iteration 上限时，交还用户决定。
+stages:
+  - stage_id: market_frame
+    title: 市场任务与预测时钟
+    objective: 明确被预测的市场产品、目标单位、时间粒度、时区、预测起点和预测范围。
+    functions: []
+    function_rules: {}
+    exit_gate: 关键字段已知或被明确记录为限制；不得用默认常识替代具体市场规则。
+
+  - stage_id: data_readiness
+    title: 数据质量门禁
+    objective: 检查时间轴、覆盖、重复、缺失和数值有效性。
+    functions:
+      - data_quality
+    function_rules:
+      data_quality: 每个方案强制执行一次；由本地编译器加入，不由 API 模型提出。
+    exit_gate: 目标满足最低 EDA 样本要求；高风险问题进入限制清单。
+
+  - stage_id: price_shape
+    title: 价格形态与极端状态
+    objective: 建立价格水平、分布、集中度、极端阈值和尖峰负价状态的描述性证据。
+    functions:
+      - price_descriptive_distribution
+      - price_duration_curve
+      - price_tukey_outer_fence
+      - price_spike_regime_profile
+      - price_segment_distribution_comparison
+    function_rules:
+      price_descriptive_distribution: 研究价格水平、离散或偏态时选择。
+      price_duration_curve: 关注高价时段占比与价格集中度时选择。
+      price_tukey_outer_fence: 关注极端点阈值与具体时点时选择。
+      price_spike_regime_profile: 关注尖峰与负价的频率、持续时间、聚集性和出现时段时选择。
+      price_segment_distribution_comparison: 峰谷、季节或事件前后比较时，把所有子样本放入一次 segments 调用。
+    exit_gate: 已区分常态价格区间与极端状态，并说明极端事件是否成片出现。
+
+  - stage_id: price_dynamics
+    title: 波动、平稳性与记忆
+    objective: 建立波动状态、平稳性、趋势与季节成分和自相关记忆的证据。
+    functions:
+      - price_calendar_group_profile
+      - price_rolling_mean_std
+      - price_stationarity_tests
+      - price_seasonal_decomposition
+      - price_lag_autocorrelation
+      - price_partial_autocorrelation
+    function_rules:
+      price_calendar_group_profile: 关注小时、星期、工作日/周末或月份结构时选择。
+      price_rolling_mean_std: 关注波动聚集或状态切换时选择。
+      price_stationarity_tests: 关注趋势、漂移或差分需求时选择。
+      price_seasonal_decomposition: 关注趋势与日周季节成分占比、残差规模时选择。
+      price_lag_autocorrelation: 关注整体持续性与滞后衰减时选择。
+      price_partial_autocorrelation: 关注自回归阶数或是否接近随机游走时选择。
+    exit_gate: 已同时给出平稳性结论、季节成分强度和记忆结构，不用单一指标下结论。
+
+  - stage_id: modeling_readiness
+    title: 预处理建议与误差底线
+    objective: 给出方差稳定变换建议，并计算后续模型必须超越的朴素基线误差。
+    functions:
+      - price_variance_stabilization_check
+      - price_naive_baseline_benchmark
+    function_rules:
+      price_variance_stabilization_check: 关注厚尾或建模预处理必要性时选择。
+      price_naive_baseline_benchmark: 关注可预测性难度或后续模型达标线时选择。
+    exit_gate: 误差底线与预处理建议均已记录；进入预测阶段前仍需时间顺序切分与样本外验证。

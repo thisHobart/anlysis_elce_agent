@@ -109,6 +109,7 @@ class EDAPlanningService:
         progress: ProgressCallback | None = None,
         skill: SkillDefinition | None = None,
         feedback: list[FeedbackPacket] | None = None,
+        revision_context: dict[str, Any] | None = None,
     ) -> ResearchProposal:
         callback = progress or noop_progress
         callback(5, "读取研究配置")
@@ -130,6 +131,7 @@ class EDAPlanningService:
             history=history,
             skill=skill,
             feedback=feedback,
+            revision_context=revision_context,
         )
         inputs = input_file_manifest(config)
         plan = plan.model_copy(update={"data_fingerprint": study_fingerprint(config, inputs)})
@@ -152,6 +154,7 @@ class EDAPlanningService:
         conversation: list[ConversationMessage | dict[str, Any]] | None = None,
         source: str = "automatic_evaluation",
         progress: ProgressCallback | None = None,
+        authorization_envelope: dict[str, Any] | None = None,
     ) -> ResearchProposal:
         proposal = self.propose(
             question=current_plan.question,
@@ -160,6 +163,15 @@ class EDAPlanningService:
             progress=progress,
             skill=skill,
             feedback=feedback,
+            revision_context={
+                "current_plan": current_plan.model_dump(mode="json"),
+                "authorization_envelope": authorization_envelope,
+                "allowed_changes": {
+                    "selected_variables": "approved subset only",
+                    "max_lag": "decrease only within the approved per-function maximum",
+                    "enabled_functions": "remove approved functions only; do not add functions",
+                },
+            },
         )
         reason = "；".join(item.message for item in feedback) or "根据结构化反馈自动修订。"
         revised = proposal.plan.model_copy(

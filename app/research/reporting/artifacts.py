@@ -16,6 +16,7 @@ import numpy
 import pandas
 import pyarrow
 import scipy
+import statsmodels
 
 from app.research.data.snapshot import sha256_file
 from app.research.reporting.charts import render_eda_charts
@@ -41,7 +42,9 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def _git_state(worktree: Path) -> tuple[str | None, bool | None]:
+def _git_state(worktree: Path | None) -> tuple[str | None, bool | None]:
+    if worktree is None:
+        return None, None
     try:
         commit = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -64,6 +67,20 @@ def _git_state(worktree: Path) -> tuple[str | None, bool | None]:
         return None, None
 
 
+def _write_figures(directory: Path, figures: dict[str, Any]) -> dict[str, Path]:
+    """Persist every inline SVG figure so the package stays readable without the HTML."""
+
+    if not figures:
+        return {}
+    directory.mkdir(parents=True, exist_ok=False)
+    paths: dict[str, Path] = {}
+    for key, markup in figures.items():
+        path = directory / f"{key}.svg"
+        path.write_text(markup, encoding="utf-8")
+        paths[key] = path
+    return paths
+
+
 def _output_manifest(directory: Path) -> list[dict[str, Any]]:
     return [
         {
@@ -84,7 +101,7 @@ def write_research_package(
     aligned_frame: pandas.DataFrame,
     input_manifest: list[dict[str, Any]],
     fingerprint: str,
-    worktree: Path,
+    worktree: Path | None,
     run_id: str | None = None,
 ) -> ArtifactBundle:
     """Persist JSON evidence, aligned data, charts, narrative, and hashes."""
@@ -117,6 +134,7 @@ def write_research_package(
             "numpy": numpy.__version__,
             "pandas": pandas.__version__,
             "scipy": scipy.__version__,
+            "statsmodels": statsmodels.__version__,
             "matplotlib": matplotlib.__version__,
             "pyarrow": pyarrow.__version__,
         },
@@ -142,7 +160,7 @@ def write_agent_research_package(
     aligned_frame: pandas.DataFrame,
     input_manifest: list[dict[str, Any]],
     fingerprint: str,
-    worktree: Path,
+    worktree: Path | None,
     plan: Any,
     evaluation: Any,
     conversation: list[Any],
@@ -153,7 +171,8 @@ def write_agent_research_package(
     """Persist an Agent conversation, approved plan, evidence and evaluation."""
 
     from app.research.reporting.agent_report import build_agent_eda_report
-    from app.research.reporting.charts import render_agent_eda_charts
+    from app.research.reporting.html_report import build_html_report
+    from app.research.reporting.report_charts import build_report_figures
 
     created_at = datetime.now(UTC)
     resolved_run_id = run_id or f"agent-{created_at.strftime('%Y%m%dT%H%M%S%fZ')}-{fingerprint}"
@@ -162,7 +181,8 @@ def write_agent_research_package(
 
     directory = (config.analysis.output_directory / resolved_run_id).resolve()
     directory.mkdir(parents=True, exist_ok=False)
-    figure_paths = render_agent_eda_charts(aligned_frame, config, summary, directory / "figures")
+    figures = build_report_figures(aligned_frame, config, summary)
+    figure_paths = _write_figures(directory / "figures", figures)
 
     _write_json(directory / "study_config.json", config.model_dump(mode="json"))
     _write_json(directory / "conversation.json", [item.model_dump(mode="json") for item in conversation])
@@ -175,8 +195,21 @@ def write_agent_research_package(
         _write_json(directory / "research_loop.json", loop_context)
     aligned_frame.reset_index().to_parquet(directory / "aligned_data.parquet", index=False)
 
-    report_path = directory / "report.md"
+    report_path = directory / "report.html"
     report_path.write_text(
+        build_html_report(
+            config=config,
+            quality=quality,
+            summary=summary,
+            plan=plan,
+            evaluation=evaluation,
+            figures=figures,
+            run_id=resolved_run_id,
+            created_at=created_at,
+        ),
+        encoding="utf-8",
+    )
+    (directory / "report.md").write_text(
         build_agent_eda_report(
             config=config,
             quality=quality,
@@ -203,11 +236,17 @@ def write_agent_research_package(
             "planning_model": plan.planning_model,
             "planning_prompt_version": plan.planning_prompt_version,
             "skill": {"name": plan.skill_name, "version": plan.skill_version},
-            "approved_steps": [step.tool for step in plan.enabled_steps],
-            "tool_versions": {step.step_id: step.tool_version for step in plan.enabled_steps},
-            "method_versions": {
-                step.step_id: step.method_versions for step in plan.enabled_steps if step.method_versions
-            },
+            "research_protocol": (
+                {
+                    "protocol_id": plan.research_protocol_id,
+                    "version": plan.research_protocol_version,
+                    "function_order": plan.research_protocol_function_order,
+                }
+                if plan.research_protocol_id
+                else None
+            ),
+            "approved_functions": [step.tool for step in plan.enabled_steps],
+            "function_versions": {step.tool: step.tool_version for step in plan.enabled_steps},
         },
         "research_loop": loop_context,
         "git": {"commit": commit, "dirty": dirty},
@@ -216,6 +255,7 @@ def write_agent_research_package(
             "numpy": numpy.__version__,
             "pandas": pandas.__version__,
             "scipy": scipy.__version__,
+            "statsmodels": statsmodels.__version__,
             "matplotlib": matplotlib.__version__,
             "pyarrow": pyarrow.__version__,
         },

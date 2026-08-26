@@ -47,16 +47,20 @@ def build_agent_eda_report(
         f"- 规划模型：`{plan.planning_model or '未记录'}`",
         f"- 提示词版本：`{plan.planning_prompt_version}`",
         f"- 激活 Skill：`{plan.skill_name}@{plan.skill_version}`",
+        (
+            f"- 领域研究协议：`{plan.research_protocol_id}@{plan.research_protocol_version}`"
+            if plan.research_protocol_id
+            else "- 领域研究协议：`未记录`"
+        ),
         f"- 研究目标：{plan.objective}",
         f"- 所选变量：{', '.join(plan.selected_variables) if plan.selected_variables else '无'}",
         "",
-        "| 执行 | 步骤 | 工具 | 工具版本 | 方法版本 | Agent 理由 | 参数 |",
-        "|---|---|---|---|---|---|---|",
+        "| 执行 | 研究函数 | 调用名 | 函数版本 | Agent 理由 | 参数 |",
+        "|---|---|---|---|---|---|",
     ]
     for step in plan.steps:
         lines.append(
             f"| {'是' if step.enabled else '否'} | {step.title} | `{step.tool}` | `{step.tool_version}` | "
-            f"`{step.method_versions}` | "
             f"{step.rationale} | "
             f"`{step.parameters}` |"
         )
@@ -98,7 +102,7 @@ def build_agent_eda_report(
                 "",
                 "## 电价结构分析",
                 "",
-                f"- 观测数/覆盖率：**{price['observations']:,} / {price['coverage_rate']:.2%}**。",
+                f"- 观测数/覆盖率：**{price.get('observations', 0):,} / {price.get('coverage_rate', 0):.2%}**。",
                 f"- 本轮方法：**{', '.join(price.get('methods', [])) or '完整画像'}**。",
             ]
         )
@@ -122,7 +126,7 @@ def build_agent_eda_report(
             ("seasonal_patterns", "季节性"),
         ):
             if key in figure_names:
-                lines.extend(["", f"![{title}](figures/{key}.png)"])
+                lines.extend(["", f"![{title}](figures/{key}.svg)"])
 
     exogenous = summary.get("exogenous")
     if exogenous:
@@ -151,9 +155,9 @@ def build_agent_eda_report(
                 f"{_fmt(best.get('lag'))} | {_fmt(best.get('correlation'))} |"
             )
         if "correlation_matrix" in figure_names:
-            lines.extend(["", "![相关矩阵](figures/correlation_matrix.png)"])
+            lines.extend(["", "![相关矩阵](figures/correlation_matrix.svg)"])
         if "lag_relationships" in figure_names:
-            lines.extend(["", "![滞后关系](figures/lag_relationships.png)"])
+            lines.extend(["", "![滞后关系](figures/lag_relationships.svg)"])
 
     lines.extend(["", "## 评估器结论", "", f"**{evaluation.decision.upper()}** — {evaluation.summary}", ""])
     lines.extend(f"- [{check.status}] {check.name}：{check.message}" for check in evaluation.checks)

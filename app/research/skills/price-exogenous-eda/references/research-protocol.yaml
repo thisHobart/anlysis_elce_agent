@@ -1,0 +1,124 @@
+protocol_id: electricity-price-evidence-ladder
+version: "2.0.0"
+kind: domain-evidence-ladder
+objective: >-
+  在不依赖模型私有推理轨迹的前提下，把电价预测前置研究组织成可追踪的市场时间、
+  数据门禁、目标结构、驱动质量、关系稳定性和可预测性证据链。
+invariants:
+  - 预测问题必须区分市场产品、预测起点、预测范围、时间粒度和市场时区；未知项保持未知。
+  - 变量只有在预测起点前真实可获得时才能进入预测候选集；observed_only 与 unknown 只能形成描述性证据或泄漏风险提示。
+  - 时间戳对齐必须保留时区与夏令时语义，不用行号近似市场时间。
+  - 负价、价格上限附近值和尖峰默认保留；EDA 只识别和解释，不静默截尾、删除或插补。
+  - 平稳性、季节分解和偏自相关需要连续序列，只在这些方法内部做时间插值并报告插值比例。
+  - 正滞后固定表示 feature[t-lag] 与 price[t]，滞后范围受本地安全上限约束。
+  - 相关、秩相关、互信息与 Granger 前置性都不得表述为因果关系，也不得直接表述为样本外预测价值。
+  - 目标与驱动同时非平稳时，同期相关必须与平稳性结论一起解读。
+  - 只选择回答当前研究问题所需的最小函数集合。
+stop_conditions:
+  - 目标序列不存在、时间轴不可解析或有效样本低于本地 EDA 门槛时停止关系研究。
+  - 市场产品、预测起点或预测范围缺失且会改变可获得性判断时，标记限制并请求用户补充，而不是猜测。
+  - 候选变量为 observed_only、可获得时点未知或发布时间晚于预测起点时，不把该变量提升为预测候选。
+  - 成对有效样本低于门槛时，不扩大函数或滞后扫描范围以制造关系证据。
+  - 连续迭代没有新增证据或达到已评估 Iteration 上限时，交还用户决定，不自动重复同一方案。
+stages:
+  - stage_id: market_frame
+    title: 市场任务与预测时钟
+    objective: 明确被预测的市场产品、目标单位、时间粒度、时区、预测起点、预测范围和决策截止时点。
+    functions: []
+    function_rules: {}
+    exit_gate: 关键字段已知或被明确记录为限制；不得用默认常识替代具体市场规则。
+
+  - stage_id: data_readiness
+    title: 数据质量与可获得性门禁
+    objective: 检查时间轴、覆盖、重复、缺失、数值有效性和各变量在预测起点的可获得性。
+    functions:
+      - data_quality
+    function_rules:
+      data_quality: 每个方案强制执行一次；由本地编译器加入，不由 API 模型提出。
+    exit_gate: 目标满足最低 EDA 样本要求；高风险问题进入限制清单；存在前视风险的变量不得成为预测候选。
+
+  - stage_id: target_structure
+    title: 电价结构、状态与记忆
+    objective: 建立电价自身的水平、尾部、日历、波动、平稳性、季节成分和自相关记忆证据。
+    functions:
+      - price_descriptive_distribution
+      - price_duration_curve
+      - price_tukey_outer_fence
+      - price_spike_regime_profile
+      - price_calendar_group_profile
+      - price_rolling_mean_std
+      - price_stationarity_tests
+      - price_seasonal_decomposition
+      - price_lag_autocorrelation
+      - price_partial_autocorrelation
+      - price_segment_distribution_comparison
+    function_rules:
+      price_descriptive_distribution: 研究价格水平、离散、偏态或建立基线画像时选择。
+      price_duration_curve: 用户关注高价时段占比、价格集中度或收益结构时选择。
+      price_tukey_outer_fence: 用户关注单个极端点位置和阈值时选择；只标记不删除。
+      price_spike_regime_profile: 用户关注尖峰与负价的频率、持续时间、聚集性或出现时段时选择。
+      price_calendar_group_profile: 用户关注小时、工作日/周末、星期或月份结构时选择。
+      price_rolling_mean_std: 用户关注波动聚集、状态变化或滚动稳定性时选择。
+      price_stationarity_tests: 用户关注趋势、漂移、差分需求或伪回归风险时选择。
+      price_seasonal_decomposition: 用户关注趋势与日周季节成分各占多少、残差有多大时选择。
+      price_lag_autocorrelation: 用户关注整体持续性和日/周滞后衰减时选择。
+      price_partial_autocorrelation: 用户关注自回归阶数、直接记忆或是否接近随机游走时选择。
+      price_segment_distribution_comparison: 峰谷、季节或单一事件前后比较时，把所有子样本放入一次 segments 调用。
+    exit_gate: 已区分稳定日历结构、平稳性状态、季节成分强度、短期记忆、波动状态与极端事件，不把单一汇总统计当成完整价格机制。
+
+  - stage_id: driver_readiness
+    title: 外生驱动质量与冗余
+    objective: 研究候选驱动的覆盖、量纲、异常、漂移、冗余和自身平稳性，并保留预测时点可用性标签。
+    functions:
+      - exogenous_descriptive_distribution
+      - exogenous_iqr_outliers
+      - exogenous_linear_index_trend
+      - exogenous_stationarity_tests
+      - exogenous_pearson_collinearity
+      - exogenous_variance_inflation
+    function_rules:
+      exogenous_descriptive_distribution: 任何被选驱动首次进入研究范围时选择。
+      exogenous_iqr_outliers: 用户关注传感异常、天气/负荷极端或关系对异常点敏感时选择。
+      exogenous_linear_index_trend: 用户关注长期漂移、结构变化或共同趋势混杂时选择。
+      exogenous_stationarity_tests: 需要判断驱动自身是否非平稳、是否存在伪回归风险时选择。
+      exogenous_pearson_collinearity: 同时研究两个及以上候选驱动并关注两两冗余时选择。
+      exogenous_variance_inflation: 需要识别多个变量共同解释造成的冗余时选择；至少两个变量。
+    exit_gate: 每个变量均有覆盖与可获得性结论；异常和趋势没有被误当作预测信号；冗余与非平稳变量被标记。
+
+  - stage_id: relationship_evidence
+    title: 电价与驱动关系证据
+    objective: 在可获得性和样本门槛通过后，分层研究同期、单调、非线性、领先滞后、前置性、时段异质性与时间稳定性。
+    functions:
+      - relationship_scipy_pearson_pairwise
+      - relationship_scipy_spearman_pairwise
+      - relationship_mutual_information_scan
+      - relationship_pearson_positive_lead_scan
+      - relationship_granger_causality_scan
+      - relationship_pearson_by_hour
+      - relationship_pearson_by_month
+      - relationship_feature_quartile_response
+      - relationship_rolling_correlation_stability
+      - relationship_pearson_segment_comparison
+    function_rules:
+      relationship_scipy_pearson_pairwise: 明确研究同期线性关系时选择，同时提示趋势和季节混杂。
+      relationship_scipy_spearman_pairwise: 研究单调关系、排序稳定性或降低极端值影响时选择。
+      relationship_mutual_information_scan: 怀疑存在线性相关无法捕捉的非线性依赖时选择。
+      relationship_pearson_positive_lead_scan: 仅研究 feature[t-lag] 对 price[t] 的正领先候选；不得使用未来实现值。
+      relationship_granger_causality_scan: 需要判断变量历史是否优于纯自回归基线时选择；结论仅限样本内前置性。
+      relationship_pearson_by_hour: 研究关系是否随交割小时变化时选择。
+      relationship_pearson_by_month: 研究关系是否随月份或季节变化时选择。
+      relationship_feature_quartile_response: 研究驱动水平变化对应的价格响应形状时选择，不作因果解释。
+      relationship_rolling_correlation_stability: 研究关系是否长期成立、是否出现阶段性反号时选择。
+      relationship_pearson_segment_comparison: 比较多个明确子样本中的 Pearson 关系时，把所有子样本放入一次 segments 调用。
+    exit_gate: 候选关系至少说明方向、效应量、样本量、滞后语义、时段稳定性、时间稳定性限制和可获得性风险。
+
+  - stage_id: forecast_readiness
+    title: 可预测性与建模就绪判定
+    objective: 给出朴素基线误差底线与预处理建议，并把证据归类为可进入算法实验、仅可描述、存在泄漏风险或证据不足。
+    functions:
+      - price_variance_stabilization_check
+      - price_naive_baseline_benchmark
+    function_rules:
+      price_variance_stabilization_check: 用户关注厚尾、建模预处理或方差稳定变换必要性时选择。
+      price_naive_baseline_benchmark: 用户关注可预测性、误差底线或后续模型的达标线时选择。
+    exit_gate: 不以相关性直接批准特征；进入预测阶段前仍需时间顺序切分、朴素基线和样本外增量验证。

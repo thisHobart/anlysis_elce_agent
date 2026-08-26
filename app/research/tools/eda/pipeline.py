@@ -15,6 +15,7 @@ from app.research.schemas.study import StudyConfig, load_study_config
 from app.research.tools.eda.exogenous import analyze_exogenous
 from app.research.tools.eda.price import analyze_price
 from app.research.tools.eda.relationships import analyze_relationships
+from app.runtime_paths import source_worktree
 
 
 def _load_all_series(config: StudyConfig):
@@ -94,7 +95,6 @@ def run_eda_pipeline(
     summary = _build_summary(resolved_config, aligned.frame)
     inputs = input_file_manifest(resolved_config)
     fingerprint = study_fingerprint(resolved_config, inputs)
-    worktree = Path(__file__).resolve().parents[3]
     bundle = write_research_package(
         config=resolved_config,
         quality=quality,
@@ -102,7 +102,7 @@ def run_eda_pipeline(
         aligned_frame=aligned.frame,
         input_manifest=inputs,
         fingerprint=fingerprint,
-        worktree=worktree,
+        worktree=source_worktree(),
         run_id=run_id,
     )
     return PipelineRunResult(

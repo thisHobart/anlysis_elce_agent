@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from app.runtime_paths import application_data_directory
+
 SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -17,6 +19,8 @@ def write_loop_record(*, thread_id: str, state: dict[str, Any], outcome: str) ->
     payload = {
         "graph_schema_version": state.get("graph_schema_version"),
         "thread_id": thread_id,
+        "loop_cursor": state.get("loop_cursor"),
+        "episode_history": state.get("episode_history", []),
         "outcome": outcome,
         "phase": state.get("phase"),
         "active_skill": state.get("active_skill"),
@@ -29,14 +33,14 @@ def write_loop_record(*, thread_id: str, state: dict[str, Any], outcome: str) ->
         "budget": state.get("budget", {}),
         "stop_reason": state.get("stop_reason"),
     }
-    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False).encode("utf-8")
     fingerprint = hashlib.sha256(canonical).hexdigest()[:16]
-    root = Path(__file__).resolve().parents[3] / "artifacts" / "research" / "loops" / thread_id
+    root = application_data_directory() / "research" / "loops" / thread_id
     root.mkdir(parents=True, exist_ok=True)
     destination = root / f"{fingerprint}.json"
     if destination.is_file():
         return destination
     temporary = destination.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
     temporary.replace(destination)
     return destination

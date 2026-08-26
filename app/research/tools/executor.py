@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime
 from time import perf_counter
 
 from app.research.tools.contracts import ToolCall, ToolContext, ToolResult
@@ -35,20 +36,25 @@ class ToolExecutor:
             )
         try:
             arguments = spec.arguments_model.model_validate(call.arguments)
+            wall_started = datetime.now(UTC).isoformat()
             started = perf_counter()
             output = spec.handler(context, arguments)
+            wall_finished = datetime.now(UTC).isoformat()
         except (TypeError, ValueError) as exc:
             raise ToolExecutionError(f"工具 {call.name} 调用失败：{exc}") from exc
         output_payload = json.dumps(
             output.model_dump(mode="json"),
             ensure_ascii=False,
             sort_keys=True,
-            default=str,
+            allow_nan=False,
+            separators=(",", ":"),
         ).encode("utf-8")
         return ToolResult(
             call=call,
             status="completed",
             output=output,
+            started_at=wall_started,
+            finished_at=wall_finished,
             duration_ms=round((perf_counter() - started) * 1000, 3),
             provider=spec.provider,
             tool_version=spec.version,

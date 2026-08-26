@@ -1,7 +1,6 @@
 import sys
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,7 +23,6 @@ class Settings(BaseSettings):
     llm_model: str = ""
     llm_timeout_seconds: float = 20.0
     llm_max_retries: int = 1
-    llm_structured_mode: Literal["json_prompt", "native"] = "native"
     llm_history_messages: int = 8
     skill_paths: str = ""
     model_config = SettingsConfigDict(

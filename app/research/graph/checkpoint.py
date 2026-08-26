@@ -13,9 +13,15 @@ from langgraph.checkpoint.memory import InMemorySaver
 class CheckpointerHandle:
     """Own an optional SQLite connection for the lifetime of a coordinator."""
 
-    def __init__(self, saver: Any, connection: sqlite3.Connection | None = None) -> None:
+    def __init__(
+        self,
+        saver: Any,
+        connection: sqlite3.Connection | None = None,
+        path: Path | None = None,
+    ) -> None:
         self.saver = saver
         self.connection = connection
+        self.path = path
 
     @classmethod
     def memory(cls) -> CheckpointerHandle:
@@ -34,7 +40,7 @@ class CheckpointerHandle:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA busy_timeout=30000")
         saver = SqliteSaver(connection)
-        return cls(saver, connection)
+        return cls(saver, connection, database.resolve())
 
     def close(self) -> None:
         if self.connection is not None:

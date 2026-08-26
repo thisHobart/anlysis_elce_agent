@@ -27,8 +27,8 @@
 - 统计、特征、回测和评估必须由可测试、确定性的 Python 实现。
 - 每次研究必须保存配置、输入哈希、代码版本、方法、结果、负结果和限制。
 - 桌面研究入口只使用 `app/research/graph`；旧 VPP 问答 Graph 和专属服务已移除，不保留第二套 Agent 编排。
-- 主 Agent 与各领域 Subagent 共用 `app/llm` 模型网关，通过不同提示词和结构化契约区分职责。
-- 内置与外部专业 Skill 使用 `SKILL.md`；外部 Skill 只提供指令和工具许可，不自动执行随附脚本。
+- 主 Agent 与各领域 Subagent 共用 `app/llm` 模型网关，通过不同提示词和结构化契约区分职责；模型接口不请求或保存私有思考链。
+- 内置与外部专业 Skill 使用 `SKILL.md`；领域研究顺序、门禁和停止条件可由 Skill 内的版本化本地 YAML 协议声明，外部 Skill 不自动执行随附脚本。
 - 工具以 Function Schema 暴露给 Agent，锁定方案只能通过注册表和权限策略调用确定性函数。
 - 对话、审批、执行和评估统一进入持久化 `ResearchLoopGraph`；SQLite checkpoint 是运行状态权威来源。
 
@@ -61,11 +61,14 @@ app/
 
 - 提供一个统一的三栏研究会话：历史会话、连续对话、用户文件输入/方案/运行轨迹。
 - 大模型统一处理研究讨论、新方案、用户反馈修订、证据解释和执行确认；不存在本地规则规划路径。
-- Agent 根据研究问题和数据画像生成结构化 `EDAPlan`，同时选择工具内部的具体分析方法，而不是运行固定分析清单。
+- Agent 根据研究问题、数据画像和 `electricity-price-evidence-ladder` 生成结构化 `EDAPlan`，通过 Function Calling 从 30 个原子研究函数中选择最小集合；本地编译器负责领域排序、权限和参数门禁。
+- 内置两个核心 Skill：`price-exogenous-eda`（电价 + 外生变量）与 `price-forecastability-audit`（仅目标序列的可预测性审计）。
+- 统计实现基于 numpy / pandas / scipy / statsmodels；ADF、KPSS、MSTL、PACF 与 Ljung-Box 直接调用成熟实现，不自行重写。
 - 模型方案只读展示 30 秒；用户通过自然语言反馈要求修改，模型生成新版本后重新进入反馈窗口。
-- 计划、工具结果和评估均生成结构化反馈；评估修订在原审批范围内最多自动执行第二轮，之后转 `need_user`。
+- 计划、函数结果和评估均生成结构化反馈；规划失败转 `plan_error`，评估修订在当前 Episode 的独立 Iteration 中进行，并受无进展检测与已评估 Iteration 上限约束。
 - 确定性工具负责计算，评估器检查证据和风险。
-- 保存对话、计划版本、数据指纹、多轮运行血缘、执行轨迹、结构化结果、图表及哈希。
+- 界面上的“研究过程”由 `app/research/graph/narration.py` 把已发生的循环事件翻译成用户语言，不展示也不保存任何模型私有思考链。
+- 保存对话、计划版本、数据指纹、多轮运行血缘、执行轨迹、结构化结果、自包含 HTML 报告、SVG 图表及哈希。
 
 详细设计与运行方法见 [phase1-price-exogenous-eda.md](phase1-price-exogenous-eda.md)。
 
@@ -94,5 +97,5 @@ app/
 
 - 将第一阶段的单域 EDA Agent 扩展为读取历史实验并提出受约束 `ExperimentSpec` 的跨域 Agent。
 - 算法引擎和评估器不由 LLM 替代。
-- 设置最大轮次、计算预算、重复假设检测和停止条件。
-- 复用第一阶段已建立的持久化 checkpointer、interrupt、反馈和预算机制。
+- 在循环效果稳定后再设计计算预算；当前先使用最大评估轮次、重复假设检测和停止条件。
+- 复用第一阶段已建立的持久化 checkpointer、interrupt、反馈和迭代控制机制。

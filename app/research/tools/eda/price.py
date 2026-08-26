@@ -7,13 +7,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-
-def _number(value: Any) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return round(number, 6) if np.isfinite(number) else None
+from app.research.tools.eda.support import base_metadata
+from app.research.tools.eda.support import number as _number
 
 
 def _group_profile(values: pd.Series, grouper: pd.Index, labels: dict[int, str] | None = None) -> list[dict[str, Any]]:
@@ -104,12 +99,7 @@ def analyze_price(
 
     result: dict[str, Any] = {
         "methods": sorted(selected_methods),
-        "unit": unit,
-        "observations": int(clean.size),
-        "missing_observations": int(values.isna().sum()),
-        "coverage_rate": round(float(values.notna().mean()), 6),
-        "start_time": clean.index.min().isoformat(),
-        "end_time": clean.index.max().isoformat(),
+        **base_metadata(values, unit=unit),
     }
     if "distribution" in selected_methods:
         result["distribution"] = {

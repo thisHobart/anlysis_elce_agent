@@ -46,8 +46,6 @@ def main() -> int:
     settings = get_settings()
     if not settings.llm_base_url or not settings.llm_model:
         raise SystemExit("Real model Base URL and model name are required.")
-    if settings.llm_structured_mode != "native":
-        raise SystemExit("VPP_LLM_STRUCTURED_MODE must be native for Function Calling acceptance.")
 
     config = load_study_config(args.config)
     coordinator = ResearchCoordinator()
@@ -71,7 +69,7 @@ def main() -> int:
         raise RuntimeError("The real loop did not produce an approved user revision.")
 
     outcome = coordinator.resume(session_id=thread_id, action="approve", progress=_progress)
-    if outcome.interrupt and outcome.interrupt.kind == "need_user":
+    if outcome.interrupt and outcome.interrupt.kind == "result_limitations":
         outcome = coordinator.resume(
             session_id=thread_id,
             action="accept_limitations",
@@ -95,15 +93,16 @@ def main() -> int:
     evidence = {
         "status": "passed",
         "model": settings.llm_model,
-        "structured_mode": settings.llm_structured_mode,
+        "structured_mode": "native",
         "thread_id": thread_id,
         "skill": {"name": plan["skill_name"], "version": plan["skill_version"]},
         "plan_id": plan["plan_id"],
         "plan_revision": plan["revision"],
-        "enabled_tools": [step["tool"] for step in plan["steps"] if step["enabled"]],
+        "enabled_functions": [step["tool"] for step in plan["steps"] if step["enabled"]],
         "selected_variables": plan["selected_variables"],
         "run_id": latest["run_id"],
-        "research_iterations": values["budget"]["research_iterations_used"],
+        "episode_id": values["loop_cursor"]["episode_id"],
+        "evaluated_iterations": values["budget"]["evaluated_iterations"],
         "evaluation": latest["evaluation"]["decision"],
         "report_path": latest["report_path"],
         "artifact_directory": latest["artifact_directory"],
