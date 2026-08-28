@@ -5,15 +5,19 @@ from app.llm.gateway import (
     ModelConfigurationError,
     ModelGateway,
     ModelGatewayError,
+    ModelMessage,
+    ModelProtocolError,
     ModelResponseError,
 )
-from app.llm.openai_compatible import OpenAICompatibleGateway
+from app.llm.openai_compatible import ResearchModelGateway
 
 __all__ = [
     "ModelConfigurationError",
     "ModelGateway",
     "ModelGatewayError",
+    "ModelMessage",
+    "ModelProtocolError",
     "ModelResponseError",
-    "OpenAICompatibleGateway",
+    "ResearchModelGateway",
     "build_model_gateway",
 ]

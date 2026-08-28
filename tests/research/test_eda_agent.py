@@ -23,6 +23,7 @@ from app.research.agent.subagents.eda import (
 )
 from app.research.application.coordinator import ResearchCoordinator
 from app.research.application.execution import EDAExecutionService
+from app.research.application.planning import prepare_research_data
 from app.research.data.loader import ResearchDataError
 from app.research.data.snapshot import input_file_manifest, study_fingerprint
 from app.research.evaluation.eda import evaluate_agent_run
@@ -444,6 +445,64 @@ def test_an_agenda_only_answer_produces_the_data_quality_only_plan(synthetic_stu
     assert plan.hypotheses == []
 
 
+def test_agenda_cannot_name_analysis_functions_without_calling_them(synthetic_study: Path):
+    gateway = _AgendaGateway(
+        [],
+        {
+            "objective": "分析电价周期结构",
+            "hypotheses": [
+                "电价存在日内结构；由 price_calendar_group_profile 与 price_seasonal_decomposition 判定。"
+            ],
+        },
+    )
+
+    with pytest.raises(ResearchPlanValidationError, match="议程引用了未选择的研究函数"):
+        _agenda_coordinator(gateway).propose(question="分析电价周期结构", config_path=synthetic_study)
+
+
+def test_agenda_hypotheses_require_at_least_one_analysis_function(synthetic_study: Path):
+    gateway = _AgendaGateway(
+        [],
+        {
+            "objective": "分析电价周期结构",
+            "hypotheses": ["电价可能存在显著的日内与月份周期结构。"],
+        },
+    )
+
+    with pytest.raises(ResearchPlanValidationError, match="没有选择任何研究函数"):
+        _agenda_coordinator(gateway).propose(question="分析电价周期结构", config_path=synthetic_study)
+
+
+def test_agenda_auto_recommend_compiles_all_eligible_variables_into_a_screening_plan(
+    synthetic_study: Path,
+):
+    gateway = _AgendaGateway(
+        [
+            ModelToolCall(
+                name="relationship_pearson_by_hour",
+                arguments={"variables": ["load"]},
+            )
+        ],
+        {
+            "objective": "筛查值得深入研究的外生变量",
+            "hypotheses": [],
+            "variable_selection_mode": "auto_recommend",
+        },
+    )
+
+    plan = _agenda_coordinator(gateway).propose(
+        question="我不知道选什么外生变量，请先推荐",
+        config_path=synthetic_study,
+    ).plan
+
+    assert plan.variable_selection_stage == "screening"
+    assert plan.selected_variables == ["load", "wind", "temperature"]
+    assert plan.deferred_functions == ["relationship_pearson_by_hour"]
+    assert "relationship_scipy_pearson_pairwise" in {
+        step.function for step in plan.enabled_steps
+    }
+
+
 def test_a_model_that_skips_the_agenda_still_yields_a_usable_plan(synthetic_study: Path):
     class SilentAgendaGateway(_AgendaGateway):
         def invoke_tool_calls(self, *, messages, tools):
@@ -527,27 +586,30 @@ def test_model_revision_controls_the_executable_plan(synthetic_study: Path, tmp_
     assert list(result.eda_summary["relationships"]["series"]) == ["wind"]
     assert set(result.figure_paths) == {"correlation_matrix", "correlation_ranking", "lag_relationships"}
     assert all(path.suffix == ".svg" and path.is_file() for path in result.figure_paths.values())
-    assert result.report_path.name == "report.html"
+    assert result.report_path.name == "report.md"
     assert result.evaluation.decision == "accept"
     assert any(check.name == "时间序列混杂控制" and check.status == "warning" for check in result.evaluation.checks)
     assert not result.evaluation.feedback_packets
 
     package_files = {path.name for path in result.artifact_directory.iterdir()}
-    assert {"conversation.json", "research_plan.json", "execution_trace.json", "manifest.json"}.issubset(
-        package_files
+    assert {"report.md", "methods.md", "manifest.json"}.issubset(package_files)
+    assert {"conversation.json", "research_plan.json", "execution_trace.json"}.issubset(
+        {path.name for path in (result.artifact_directory / "provenance").iterdir()}
     )
     manifest = json.loads((result.artifact_directory / "manifest.json").read_text(encoding="utf-8"))
-    trace = json.loads((result.artifact_directory / "execution_trace.json").read_text(encoding="utf-8"))
+    trace = json.loads(
+        (result.artifact_directory / "provenance" / "execution_trace.json").read_text(encoding="utf-8")
+    )
     assert all(item["started_at"] and item["finished_at"] for item in trace)
     assert all(
         datetime.fromisoformat(item["started_at"]) <= datetime.fromisoformat(item["finished_at"])
         for item in trace
     )
     assert manifest["research_agent"]["planning_model"] == "scripted-test-model"
-    assert manifest["research_agent"]["skill"] == {"name": "price-exogenous-eda", "version": "3.2.0"}
+    assert manifest["research_agent"]["skill"] == {"name": "price-exogenous-eda", "version": "3.2.1"}
     assert manifest["research_agent"]["research_protocol"] == {
         "protocol_id": "electricity-price-evidence-ladder",
-        "version": "2.2.0",
+        "version": "2.2.1",
         "function_order": revised.research_protocol_function_order,
     }
     assert manifest["research_agent"]["function_versions"] == {
@@ -568,6 +630,82 @@ def test_model_revision_controls_the_executable_plan(synthetic_study: Path, tmp_
     assert incomplete.decision == "revise"
     assert next(check for check in incomplete.checks if check.name == "计划执行完整性").scope == "within_envelope"
     assert packet.recommendation == "补齐缺少的确定性结果步骤：relationships，然后重新执行。"
+
+
+def test_auto_recommend_screens_all_eligible_variables_before_deep_analysis(
+    synthetic_study: Path,
+    tmp_path: Path,
+):
+    agent = _model_agent()
+    proposal = agent.propose(question="先分析电价分布", config_path=synthetic_study)
+    config = load_study_config(synthetic_study)
+    quality = prepare_research_data(config).quality
+
+    revised, _ = agent.main_agent.revise_plan(
+        question="我不知道该选哪些外生变量，请先筛查后推荐",
+        plan=proposal.plan,
+        config=config,
+        quality_report=quality,
+        decision=DialogueDecision(
+            intent="revise_plan",
+            variable_selection_mode="auto_recommend",
+            enabled_functions=[
+                "relationship_scipy_pearson_pairwise",
+                "relationship_pearson_by_hour",
+                "relationship_pearson_by_month",
+            ],
+        ),
+    )
+
+    assert revised.variable_selection_mode == "auto_recommend"
+    assert revised.variable_selection_stage == "screening"
+    assert revised.selected_variables == ["load", "wind", "temperature"]
+    assert set(revised.deferred_functions) == {
+        "relationship_pearson_by_hour",
+        "relationship_pearson_by_month",
+    }
+    assert {step.function for step in revised.enabled_steps} == {
+        "data_quality",
+        "exogenous_descriptive_distribution",
+        "exogenous_pearson_collinearity",
+        "exogenous_stationarity_tests",
+        "relationship_scipy_pearson_pairwise",
+        "relationship_scipy_spearman_pairwise",
+    }
+
+    result = agent.execute(
+        plan=revised,
+        config_path=synthetic_study,
+        output_directory=tmp_path / "auto-variable-screening",
+        run_id="auto-variable-screening",
+    )
+
+    recommendations = result.evaluation.variable_recommendations
+    assert result.evaluation.decision == "need_user"
+    assert recommendations is not None
+    assert recommendations["screened_variable_count"] == 3
+    assert "load" in recommendations["recommended_variables"]
+    assert "外生变量自动筛查已完成" in result.evaluation.summary
+    assert "深入方法尚未执行" in result.evaluation.summary
+    assert "请确认、增删变量" not in result.evaluation.summary
+
+    deep_plan, _ = agent.main_agent.revise_plan(
+        question="接受推荐变量并继续深入分析",
+        plan=revised,
+        config=config,
+        quality_report=quality,
+        previous_evaluation=result.evaluation.model_dump(mode="json"),
+        decision=DialogueDecision(
+            intent="revise_plan",
+            selected_variables=recommendations["recommended_variables"],
+        ),
+    )
+    assert deep_plan.variable_selection_stage == "recommended"
+    assert deep_plan.deferred_functions == []
+    assert {
+        "relationship_pearson_by_hour",
+        "relationship_pearson_by_month",
+    }.issubset({step.function for step in deep_plan.enabled_steps})
 
 
 def test_evaluator_scopes_unselected_variable_risks(synthetic_study: Path, tmp_path: Path):
@@ -748,7 +886,10 @@ def test_calendar_evidence_settles_its_own_agenda_item(synthetic_study: Path, tm
         item for item in result.evaluation.hypothesis_assessments if "季节" in item.hypothesis
     )
     assert assessment.status in {"candidate_support", "not_supported"}
-    assert "分组解释了" in assessment.evidence
+    # Wording is reviewed separately; what matters here is that the calendar item is
+    # settled by its own grouped evidence rather than by another item's numbers.
+    assert assessment.item_id == "price.seasonality"
+    assert "分组能解释" in assessment.evidence
     assert result.evaluation.decision == "accept"
     assert "全部得到明确结论" in result.evaluation.summary
 

@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
 from typing import Any
+from uuid import uuid4
 
 from langgraph.types import Command
 
@@ -20,6 +21,7 @@ from app.research.agent.schemas import (
     ResearchTurnResult,
 )
 from app.research.agent.subagents.eda import EDASubagent, ModelEDAPlanner
+from app.research.application.commands import resolve_text_action
 from app.research.application.execution import EDAExecutionService
 from app.research.application.planning import EDAPlanningService, ProgressCallback
 from app.research.graph.checkpoint import CheckpointerHandle
@@ -31,15 +33,23 @@ from app.research.graph.contracts import (
     ResearchLoopSnapshot,
     ResumePayload,
 )
-from app.research.graph.migrations import archive_incompatible_state, safe_incompatible_state
-from app.research.graph.narration import SILENT_NODES, narrate_event, narrate_node, progress_message
+from app.research.graph.migrations import safe_incompatible_state
+from app.research.graph.narration import (
+    HUMAN_GATE_NODES,
+    SILENT_NODES,
+    narrate_event,
+    narrate_node,
+    progress_message,
+)
+from app.research.graph.tool_result_store import FileToolResultStore, InMemoryToolResultStore, ToolResultStore
 from app.research.graph.workflow import build_research_workflow
 from app.research.schemas.study import StudyConfig
 from app.research.skills.registry import SkillRegistry
 from app.research.tools.eda.functions import build_eda_tool_registry
 from app.research.tools.registry import ToolRegistry
 
-GRAPH_SCHEMA_VERSION = 9
+GRAPH_SCHEMA_VERSION = 11
+GRAPH_RECURSION_LIMIT = 1000
 
 
 class ResearchCoordinator:
@@ -55,6 +65,7 @@ class ResearchCoordinator:
         tools: ToolRegistry | None = None,
         checkpoint_path: str | Path | None = None,
         checkpointer_handle: CheckpointerHandle | None = None,
+        result_store: ToolResultStore | None = None,
     ) -> None:
         self.skills = skills or SkillRegistry.default()
         self.skill_load_errors = list(self.skills.load_errors)
@@ -72,6 +83,11 @@ class ResearchCoordinator:
         self.checkpointer_handle = checkpointer_handle or (
             CheckpointerHandle.sqlite(checkpoint_path) if checkpoint_path is not None else CheckpointerHandle.memory()
         )
+        self.result_store = result_store or (
+            FileToolResultStore.beside_checkpoint(self.checkpointer_handle.path)
+            if self.checkpointer_handle.path is not None
+            else InMemoryToolResultStore()
+        )
         self.graph = build_research_workflow(
             main_agent=self.main_agent,
             planning=self.planning,
@@ -79,13 +95,19 @@ class ResearchCoordinator:
             skills=self.skills,
             tools=self.tools,
             checkpointer=self.checkpointer_handle.saver,
+            result_store=self.result_store,
         )
         self.workflow = self.graph
         self._lock = RLock()
 
     @staticmethod
     def _config(thread_id: str) -> dict[str, Any]:
-        return {"configurable": {"thread_id": thread_id}}
+        # Business budgets stop all expected cycles first.  This explicit
+        # framework ceiling is the final guard against an accidental route loop.
+        return {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": GRAPH_RECURSION_LIMIT,
+        }
 
     def _run_graph(
         self,
@@ -104,6 +126,12 @@ class ResearchCoordinator:
             for node_name in update:
                 if str(node_name).startswith("__"):
                     continue
+                if node_name in HUMAN_GATE_NODES:
+                    # The corresponding event is still persisted in the graph
+                    # and synchronized into the audit trace.  The conversation
+                    # presents the gate through its plan/result/notice card once
+                    # the worker returns, instead of pretending it is Agent work.
+                    continue
                 value, step = narrate_node(str(node_name))
                 node_update = update.get(node_name)
                 source_event = ""
@@ -121,9 +149,12 @@ class ResearchCoordinator:
         *,
         thread_id: str,
         message: str,
+        message_id: str,
+        turn_id: str,
         study_config: StudyConfig | None,
         conversation: list[ConversationMessage] | None,
         approval_timeout_seconds: int,
+        automatic_approval_enabled: bool,
         imported: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         base = {
@@ -133,9 +164,14 @@ class ResearchCoordinator:
             "session_id": thread_id,
             "phase": "idle",
             "control": "understand",
+            "return_to_gate": None,
             "loop_cursor": LoopCursor().model_dump(mode="json"),
             "episode_history": [],
+            "episode_summaries": [],
             "pending_user_message": message,
+            "pending_message_id": message_id,
+            "pending_turn_id": turn_id,
+            "active_turn_id": None,
             "user_request": "",
             "latest_turn": "",
             "explanation_request": "",
@@ -151,9 +187,12 @@ class ResearchCoordinator:
             "planning_failure_fingerprints": [],
             "user_interrupt_kind": None,
             "plan_origin": "initial",
+            "revision_cycle_id": uuid4().hex[:12],
+            "progress_records": [],
             "authorization_envelope": None,
             "approval_state": ApprovalState().model_dump(mode="json"),
             "approval_timeout_seconds": max(1, int(approval_timeout_seconds)),
+            "automatic_approval_enabled": bool(automatic_approval_enabled),
             "tool_queue": [],
             "tool_cursor": 0,
             "tool_records": {},
@@ -179,14 +218,24 @@ class ResearchCoordinator:
             base["graph_schema_version"] = GRAPH_SCHEMA_VERSION
             base["schema_upgrade_required"] = False
             base.setdefault("planning_failure_fingerprints", [])
+            base.setdefault("revision_cycle_id", uuid4().hex[:12])
+            base.setdefault("progress_records", [])
             base.setdefault("control", "understand")
+            base.setdefault("return_to_gate", None)
             base.setdefault("user_interrupt_kind", None)
             base.setdefault("latest_turn", base.get("user_request", ""))
+            base.setdefault("pending_message_id", message_id)
+            base.setdefault("pending_turn_id", turn_id)
+            base.setdefault("active_turn_id", None)
             base.setdefault("explanation_request", "")
             base.setdefault("loop_cursor", LoopCursor().model_dump(mode="json"))
             base.setdefault("episode_history", [])
+            base.setdefault("episode_summaries", [])
             base.setdefault("agenda_fingerprints", [])
+            base.setdefault("automatic_approval_enabled", False)
             base["pending_user_message"] = message
+            base["pending_message_id"] = message_id
+            base["pending_turn_id"] = turn_id
             base["study_config"] = study_config.model_dump(mode="json") if study_config is not None else base.get(
                 "study_config"
             )
@@ -241,6 +290,28 @@ class ResearchCoordinator:
             events=list(values.get("events", [])),
         )
 
+    def _snapshot_after_run(self, thread_id: str) -> ResearchLoopSnapshot:
+        """Capture the user-visible state, then discard obsolete step history."""
+
+        snapshot = self.get_snapshot(thread_id)
+        if snapshot.values.get("graph_schema_version") == GRAPH_SCHEMA_VERSION:
+            self.checkpointer_handle.compact_thread(thread_id)
+            storage_keys: set[str] = set()
+
+            def collect(value: Any) -> None:
+                if isinstance(value, dict):
+                    if value.get("kind") == "tool_result_ref_v1" and value.get("storage_key"):
+                        storage_keys.add(str(value["storage_key"]))
+                    for child in value.values():
+                        collect(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        collect(child)
+
+            collect(snapshot.values)
+            self.result_store.prune_thread(thread_id, storage_keys)
+        return snapshot
+
     def has_thread(self, thread_id: str) -> bool:
         return bool(self.graph.get_state(self._config(thread_id)).values)
 
@@ -249,117 +320,73 @@ class ResearchCoordinator:
         *,
         session_id: str,
         message: str,
+        message_id: str | None = None,
+        turn_id: str | None = None,
         study_config: StudyConfig | None = None,
         conversation: list[ConversationMessage] | None = None,
         approval_timeout_seconds: int = 30,
+        automatic_approval_enabled: bool = False,
         imported_state: dict[str, Any] | None = None,
         progress: Callable[[int, str], None] | None = None,
     ) -> ResearchLoopSnapshot:
         text = message.strip()
         if not text:
             raise ValueError("用户消息不能为空")
+        resolved_message_id = message_id or uuid4().hex
+        resolved_turn_id = turn_id or uuid4().hex
         with self._lock:
             has_compatible_thread = self.has_thread(session_id)
             if has_compatible_thread:
                 existing = self.get_snapshot(session_id)
                 if existing.values.get("graph_schema_version") != GRAPH_SCHEMA_VERSION:
-                    normalized = "".join(text.split())
-                    legacy_request = str(existing.values.get("user_request") or "").strip()
-                    if legacy_request and normalized in {
-                        "接受",
-                        "同意",
-                        "重试",
-                        "重新尝试",
-                        "直接研究",
-                        "直接用你给的方案研究",
-                        "按这个执行",
-                    }:
-                        text = legacy_request
-                    raw_values = dict(self.graph.get_state(self._config(session_id)).values or {})
-                    try:
-                        archive_incompatible_state(
-                            thread_id=session_id,
-                            values=raw_values,
-                            checkpoint_path=self.checkpointer_handle.path,
-                        )
-                    except OSError:
-                        pass
-                    self.checkpointer_handle.saver.delete_thread(session_id)
-                    has_compatible_thread = False
+                    return existing
             if not has_compatible_thread:
                 payload = self._initial_state(
                     thread_id=session_id,
                     message=text,
+                    message_id=resolved_message_id,
+                    turn_id=resolved_turn_id,
                     study_config=study_config,
                     conversation=conversation,
                     approval_timeout_seconds=approval_timeout_seconds,
+                    automatic_approval_enabled=automatic_approval_enabled,
                     imported=imported_state,
                 )
                 self._run_graph(payload, thread_id=session_id, progress=progress)
             else:
                 snapshot = self.get_snapshot(session_id)
                 if snapshot.interrupt is not None:
-                    if snapshot.interrupt.kind == "plan_approval":
-                        normalized = "".join(text.split())
-                        action = (
-                            "approve"
-                            if normalized
-                            in {
-                                "接受",
-                                "同意",
-                                "按这个执行",
-                                "立即执行",
-                                "确认执行",
-                                "执行当前方案",
-                                "直接用你给的方案研究",
-                            }
-                            else "modify"
-                        )
-                    elif snapshot.interrupt.kind == "result":
-                        action = "stop" if "".join(text.split()) in {"结束", "停止", "结束研究"} else "followup"
-                    elif snapshot.interrupt.kind == "plan_error":
-                        normalized = "".join(text.split())
-                        if normalized in {"结束", "停止", "结束研究"}:
-                            action = "stop"
-                        elif normalized in {"重试", "重新尝试", "再试一次"}:
-                            action = "retry"
-                        elif normalized in {
-                            "接受",
-                            "同意",
-                            "直接研究",
-                            "直接用你给的方案研究",
-                            "按这个执行",
-                            "执行当前方案",
-                        }:
-                            action = "clarify"
-                        else:
-                            action = "modify"
-                    elif snapshot.interrupt.kind in {"response_error", "finalization_error"}:
-                        normalized = "".join(text.split())
-                        action = "stop" if normalized in {"结束", "停止", "结束研究"} else "retry"
-                    elif snapshot.interrupt.kind == "result_rejected":
-                        normalized = "".join(text.split())
-                        action = "stop" if normalized in {"结束", "停止", "结束研究"} else "modify"
-                    else:
-                        normalized = "".join(text.split())
-                        if normalized in {"接受", "同意", "接受当前限制", "接受限制", "按当前结果完成"}:
-                            action = "accept_limitations"
-                        elif normalized in {"结束", "停止", "结束研究"}:
-                            action = "stop"
-                        else:
-                            action = "modify"
+                    action = resolve_text_action(
+                        kind=snapshot.interrupt.kind,
+                        choices=snapshot.interrupt.choices,
+                        message=text,
+                    )
                     self._run_graph(
-                        Command(resume=ResumePayload(action=action, message=text).model_dump(mode="json")),
+                        Command(
+                            resume=ResumePayload(
+                                action=action,
+                                message=text,
+                                message_id=resolved_message_id,
+                                turn_id=resolved_turn_id,
+                                interrupt_id=snapshot.interrupt.interrupt_id or None,
+                                state_revision=snapshot.interrupt.state_revision,
+                            ).model_dump(mode="json")
+                        ),
                         thread_id=session_id,
                         progress=progress,
                     )
                 else:
                     self._run_graph(
-                        {"pending_user_message": text, "study_config": study_config.model_dump(mode="json") if study_config else None},
+                        {
+                            "pending_user_message": text,
+                            "pending_message_id": resolved_message_id,
+                            "pending_turn_id": resolved_turn_id,
+                            "study_config": study_config.model_dump(mode="json") if study_config else None,
+                        },
                         thread_id=session_id,
                         progress=progress,
                     )
-            return self.get_snapshot(session_id)
+            return self._snapshot_after_run(session_id)
 
     def resume(
         self,
@@ -367,20 +394,46 @@ class ResearchCoordinator:
         session_id: str,
         action: str,
         message: str = "",
+        message_id: str | None = None,
+        turn_id: str | None = None,
+        interrupt_id: str | None = None,
+        state_revision: int | None = None,
         foreground_timeout: bool = False,
         progress: Callable[[int, str], None] | None = None,
     ) -> ResearchLoopSnapshot:
-        payload = ResumePayload(action=action, message=message, automatic_timeout=foreground_timeout)
+        payload = ResumePayload(
+            action=action,
+            message=message,
+            message_id=message_id or (uuid4().hex if message.strip() else None),
+            turn_id=turn_id or (uuid4().hex if message.strip() else None),
+            interrupt_id=interrupt_id,
+            state_revision=state_revision,
+            automatic_timeout=foreground_timeout,
+        )
         with self._lock:
             snapshot = self.get_snapshot(session_id)
             if snapshot.values.get("graph_schema_version") != GRAPH_SCHEMA_VERSION:
-                raise ValueError("旧版本研究循环已失效，请重新提交研究问题。")
+                raise ValueError("旧版本研究循环已失效，请新建对话并重新提交研究问题。")
             if snapshot.interrupt is None:
                 raise ValueError("当前研究任务没有等待用户恢复的 interrupt。")
+            if interrupt_id and interrupt_id != snapshot.interrupt.interrupt_id:
+                raise ValueError("当前操作对应的交互状态已经失效，请使用最新界面重试。")
+            if state_revision is not None and state_revision != snapshot.interrupt.state_revision:
+                raise ValueError("当前操作对应的状态版本已经失效，请使用最新界面重试。")
+            payload = payload.model_copy(
+                update={
+                    "interrupt_id": snapshot.interrupt.interrupt_id or None,
+                    "state_revision": snapshot.interrupt.state_revision,
+                }
+            )
             approval = ApprovalState.model_validate(snapshot.values.get("approval_state", {}))
             if action == "timeout_accept" and approval.status == "expired" and not foreground_timeout:
                 raise ValueError("审批已过期，必须由用户明确确认。")
-            foreground_timeout_accept = payload.action == "timeout_accept" and foreground_timeout
+            foreground_timeout_accept = (
+                payload.action == "timeout_accept"
+                and foreground_timeout
+                and bool(snapshot.values.get("automatic_approval_enabled", False))
+            )
             if payload.action not in snapshot.interrupt.choices and not foreground_timeout_accept:
                 raise ValueError(
                     f"当前 interrupt 不允许操作 {payload.action}；可选操作："
@@ -391,20 +444,7 @@ class ResearchCoordinator:
                 thread_id=session_id,
                 progress=progress,
             )
-            return self.get_snapshot(session_id)
-
-    def expire_approval(self, *, session_id: str) -> ResearchLoopSnapshot:
-        with self._lock:
-            snapshot = self.get_snapshot(session_id)
-            approval = ApprovalState.model_validate(snapshot.values.get("approval_state", {}))
-            approval.status = "expired"
-            approval.deadline = None
-            approval.remaining_seconds = 0
-            self.graph.update_state(self._config(session_id), {"approval_state": approval.model_dump(mode="json")})
-            return self.get_snapshot(session_id)
-
-    def get_history(self, thread_id: str) -> list[dict[str, Any]]:
-        return [dict(item.values or {}) for item in self.graph.get_state_history(self._config(thread_id))]
+            return self._snapshot_after_run(session_id)
 
     def continue_thread(self, thread_id: str) -> ResearchLoopSnapshot:
         """Resume a non-interrupted checkpoint, including one left inside a tool node."""
@@ -414,7 +454,7 @@ class ResearchCoordinator:
             raw = self.graph.get_state(config)
             values = dict(raw.values or {})
             if values.get("graph_schema_version") != GRAPH_SCHEMA_VERSION:
-                raise ValueError("旧版本研究循环已失效，请重新提交研究问题。")
+                raise ValueError("旧版本研究循环已失效，请新建对话并重新提交研究问题。")
             if "execute_tool" in getattr(raw, "next", ()):
                 cursor = int(values.get("tool_cursor", 0))
                 queue = values.get("tool_queue", [])
@@ -422,39 +462,45 @@ class ResearchCoordinator:
                     call_id = queue[cursor]["call_id"]
                     records = dict(values.get("tool_records", {}))
                     record = dict(records[call_id])
-                    budget = LoopBudget.model_validate(values.get("budget", {}))
-                    attempts = int(record.get("attempts", 0))
-                    if attempts >= budget.max_function_attempts_per_call:
-                        raise RuntimeError("工具崩溃恢复次数已耗尽")
-                    record["status"] = "running"
-                    record["attempts"] = attempts + 1
+                    # ``mark_tool_running`` already persisted and counted the
+                    # interrupted attempt before the process entered the tool
+                    # node.  Route the abandoned attempt back through the
+                    # graph's normal retry edge instead of counting it twice or
+                    # raising outside the durable state machine.  The mark node
+                    # owns the retry-budget decision and will expose an
+                    # interrupt when the budget is exhausted.
+                    record["status"] = "failed"
                     records[call_id] = record
                     self.graph.update_state(
                         config,
                         {
+                            "control": "retry",
                             "tool_records": records,
                         },
-                        as_node="mark_tool_running",
+                        as_node="execute_tool",
                     )
             self._run_graph(None, thread_id=thread_id)
-            return self.get_snapshot(thread_id)
+            return self._snapshot_after_run(thread_id)
 
     def delete_thread(self, thread_id: str) -> None:
         self.execution.evict_prepared()
-        self.checkpointer_handle.saver.delete_thread(thread_id)
+        self.checkpointer_handle.delete_thread(thread_id)
+        self.result_store.delete_thread(thread_id)
 
     def cancel(self, thread_id: str) -> None:
         """Stop an active local loop at a safe node boundary and remove its resumable cursor."""
 
         with self._lock:
             self.execution.evict_prepared()
-            self.checkpointer_handle.saver.delete_thread(thread_id)
+            self.checkpointer_handle.delete_thread(thread_id)
+            self.result_store.delete_thread(thread_id)
 
     def close(self) -> None:
         self.execution.evict_prepared()
+        self.result_store.close()
         self.checkpointer_handle.close()
 
-    # Compatibility boundaries retained for CLI and deterministic regression tests.
+    # Direct service boundaries retained for deterministic regression tests.
     def propose(
         self,
         *,
@@ -508,6 +554,9 @@ class ResearchCoordinator:
         eda_summary: dict[str, Any] | None = None,
         evaluation: dict[str, Any] | None = None,
         conversation: list[ConversationMessage] | None = None,
+        active_gate: str | None = None,
+        episode_goal: str | None = None,
+        latest_run: dict[str, Any] | None = None,
         progress: ProgressCallback | None = None,
     ) -> ResearchTurnResult:
         callback = progress or (lambda _value, _message: None)
@@ -522,6 +571,9 @@ class ResearchCoordinator:
             evaluation=evaluation,
             history=conversation or [],
             available_skills=self.skills.metadata(),
+            active_gate=active_gate,
+            episode_goal=episode_goal,
+            latest_run=latest_run,
         )
         if decision.intent == "new_plan":
             if study_config is None:

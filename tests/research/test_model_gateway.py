@@ -1,17 +1,56 @@
-"""Verify structured output uses provider function calling."""
+"""Verify the native model protocol, optional degradation, and reasoning policy."""
 
 from types import SimpleNamespace
 
 import pytest
+from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
 
 from app.config import Settings
-from app.llm.gateway import ModelResponseError
-from app.llm.openai_compatible import OpenAICompatibleGateway
+from app.llm import compat
+from app.llm.gateway import (
+    ModelConfigurationError,
+    ModelMessage,
+    ModelProtocolError,
+    ModelResponseError,
+)
+from app.llm.openai_compatible import ResearchModelGateway
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "price_descriptive_distribution",
+            "description": "计算电价分布。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+]
 
 
 class StructuredAnswer(BaseModel):
     value: str
+
+
+class RejectedRequest(Exception):
+    """Stand-in for the provider 400 raised when a request field is unsupported."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.status_code = 400
+
+
+def _settings(**overrides) -> Settings:
+    return Settings(
+        _env_file=None,
+        llm_base_url=overrides.pop("llm_base_url", "http://model.invalid/v1"),
+        llm_model=overrides.pop("llm_model", "test-model"),
+        **overrides,
+    )
+
+
+def _messages(content: str = "test") -> list[ModelMessage]:
+    return [ModelMessage(role="user", content=content)]
 
 
 class BoundModel:
@@ -57,10 +96,10 @@ class RecordingModel:
         self.last_messages = messages
         return self.response
 
-    def bind_tools(self, tools, *, tool_choice, parallel_tool_calls):
+    def bind_tools(self, tools, **options):
         self.bound_tools = tools
-        self.tool_choice = tool_choice
-        self.parallel_tool_calls = parallel_tool_calls
+        self.tool_choice = options.get("tool_choice")
+        self.parallel_tool_calls = options.get("parallel_tool_calls")
 
         class ProposedCalls:
             def invoke(_self, messages):
@@ -70,109 +109,262 @@ class RecordingModel:
         return ProposedCalls()
 
 
-def test_structured_output_uses_function_calling():
-    gateway = OpenAICompatibleGateway(
-        Settings(
-            llm_base_url="http://model.invalid/v1",
-            llm_model="test-model",
-        )
-    )
+def test_structured_output_uses_native_function_calling_and_typed_messages():
+    gateway = ResearchModelGateway(_settings())
     model = RecordingModel()
     gateway._model = model
 
-    result = gateway.invoke_structured(messages=[("human", "test")], schema=StructuredAnswer)
+    result = gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
 
     assert result.value == "ok"
     assert model.method == "function_calling"
     assert model.include_raw is True
+    assert isinstance(model.last_messages[0], HumanMessage)
 
 
 def test_research_function_calls_are_proposed_without_execution():
-    gateway = OpenAICompatibleGateway(
-        Settings(
-            llm_base_url="http://model.invalid/v1",
-            llm_model="test-model",
-        )
-    )
+    gateway = ResearchModelGateway(_settings())
     model = RecordingModel()
     gateway._model = model
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "price_descriptive_distribution",
-                "description": "计算电价分布。",
-                "parameters": {"type": "object", "properties": {}},
-            },
-        }
-    ]
 
-    calls = gateway.invoke_tool_calls(messages=[("human", "分析电价分布")], tools=tools)
+    calls = gateway.invoke_tool_calls(messages=_messages("分析电价分布"), tools=TOOLS)
 
     assert [call.name for call in calls] == ["price_descriptive_distribution"]
     assert calls[0].call_id == "call-1"
-    assert model.bound_tools == tools
+    assert model.bound_tools == TOOLS
     assert model.tool_choice == "required"
     assert model.parallel_tool_calls is True
 
 
-def test_custom_openai_compatible_endpoint_disables_thinking_in_request_body():
-    gateway = OpenAICompatibleGateway(
-        Settings(
-            llm_base_url="http://127.0.0.1:8000/v1",
-            llm_model="Qwen3-8B",
-        )
-    )
+def test_custom_endpoint_sends_no_reasoning_control_by_default():
+    gateway = ResearchModelGateway(_settings())
 
-    assert gateway._model_options()["extra_body"] == {
-        "enable_thinking": False,
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
+    options = gateway._model_options()
+    assert options["use_responses_api"] is False
+    assert "extra_body" not in options
+    assert "reasoning_effort" not in options
+    assert "reasoning" not in options
 
 
 @pytest.mark.parametrize("model_name", ["deepseek-chat", "deepseek-reasoner", "future-deepseek-model"])
 def test_all_deepseek_models_disable_thinking_with_request_parameter(model_name: str):
-    gateway = OpenAICompatibleGateway(
-        Settings(
-            llm_base_url="https://api.deepseek.com/v1",
-            llm_model=model_name,
-        )
+    gateway = ResearchModelGateway(
+        _settings(llm_provider="deepseek", llm_model=model_name)
     )
+
+    assert gateway._model_options()["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+def test_qwen_chat_uses_its_documented_thinking_toggle():
+    gateway = ResearchModelGateway(_settings(llm_provider="qwen"))
 
     assert gateway._model_options()["extra_body"] == {"enable_thinking": False}
 
 
-def test_gateway_rejects_reasoning_content_even_when_tool_call_is_valid():
-    gateway = OpenAICompatibleGateway(
-        Settings(
-            llm_base_url="http://model.invalid/v1",
-            llm_model="test-model",
+@pytest.mark.parametrize("provider", ["deepseek", "qwen"])
+def test_provider_responses_api_uses_reasoning_effort(provider: str):
+    gateway = ResearchModelGateway(
+        _settings(llm_provider=provider, llm_api_style="responses")
+    )
+
+    options = gateway._model_options()
+    assert options["use_responses_api"] is True
+    assert options["reasoning"] == {"effort": "none"}
+    assert "extra_body" not in options
+
+
+@pytest.mark.parametrize(
+    ("api_style", "expected"),
+    [
+        ("chat", {"reasoning_effort": "none"}),
+        ("responses", {"reasoning": {"effort": "none"}}),
+    ],
+)
+def test_custom_reasoning_effort_is_only_sent_when_backend_configures_it(
+    api_style: str,
+    expected: dict,
+):
+    gateway = ResearchModelGateway(
+        _settings(
+            llm_provider="custom",
+            llm_api_style=api_style,
+            llm_reasoning_effort="none",
         )
     )
+
+    options = gateway._model_options()
+    for key, value in expected.items():
+        assert options[key] == value
+
+
+def test_strict_policy_rejects_reasoning_content_even_when_tool_call_is_valid():
+    gateway = ResearchModelGateway(_settings(llm_thinking_policy="reject"))
     gateway._model = RecordingModel(reasoning_content="private reasoning")
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "price_descriptive_distribution",
-                "description": "计算电价分布。",
-                "parameters": {"type": "object", "properties": {}},
-            },
-        }
-    ]
 
     with pytest.raises(ModelResponseError, match="思考模式禁用失败"):
-        gateway.invoke_tool_calls(messages=[("human", "test")], tools=tools)
+        gateway.invoke_tool_calls(messages=_messages(), tools=TOOLS)
 
 
-def test_gateway_rejects_nonempty_think_block_in_structured_response():
-    gateway = OpenAICompatibleGateway(
-        Settings(
-            llm_base_url="http://model.invalid/v1",
-            llm_model="test-model",
-        )
-    )
+def test_strict_policy_rejects_nonempty_think_block_in_structured_response():
+    gateway = ResearchModelGateway(_settings(llm_thinking_policy="reject"))
     gateway._model = RecordingModel(content="<think>still thinking</think>")
 
     with pytest.raises(ModelResponseError, match="思考模式禁用失败"):
-        gateway.invoke_structured(messages=[("human", "test")], schema=StructuredAnswer)
+        gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
+
+
+def test_default_policy_discards_reasoning_instead_of_failing():
+    gateway = ResearchModelGateway(_settings())
+    gateway._model = RecordingModel(
+        reasoning_content="private reasoning",
+        content="<think>still thinking</think>可以开始分析。",
+    )
+
+    assert gateway.invoke_text(messages=_messages()) == "可以开始分析。"
+
+
+def test_structured_output_does_not_switch_protocol_when_function_calling_is_refused():
+    class NoStructuredToolsModel(RecordingModel):
+        def with_structured_output(self, schema, *, method, include_raw):
+            raise RejectedRequest("Thinking mode does not support this tool_choice")
+
+    gateway = ResearchModelGateway(_settings(llm_api_style="responses"))
+    gateway._model = NoStructuredToolsModel()
+
+    with pytest.raises(ModelProtocolError, match="API Style=responses"):
+        gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
+
+
+def test_structured_output_never_recovers_json_from_prose():
+    class ProseModel(RecordingModel):
+        def with_structured_output(self, schema, *, method, include_raw):
+            class Bound:
+                def invoke(_self, messages):
+                    return {
+                        "raw": SimpleNamespace(
+                            content='<think>weighing</think>\n```json\n{"value": "ok"}\n```',
+                            additional_kwargs={},
+                            tool_calls=[],
+                        ),
+                        "parsed": None,
+                        "parsing_error": "no tool call returned",
+                    }
+
+            return Bound()
+
+    gateway = ResearchModelGateway(_settings())
+    gateway._model = ProseModel()
+
+    with pytest.raises(ModelProtocolError, match="不会用提示词 JSON"):
+        gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
+
+
+def test_refused_provider_reasoning_option_is_dropped_and_retried():
+    """An auto-added provider option may degrade; an explicit custom option may not."""
+
+    class PickyModel(RecordingModel):
+        def __init__(self, gateway) -> None:
+            super().__init__()
+            self.gateway = gateway
+            self.attempts = 0
+
+        def with_structured_output(self, schema, *, method, include_raw):
+            self.attempts += 1
+            if "provider_reasoning" not in self.gateway._disabled:
+                raise RejectedRequest("Unrecognized request argument supplied: enable_thinking")
+            return BoundModel(schema, self)
+
+    gateway = ResearchModelGateway(_settings(llm_provider="qwen"))
+    model = PickyModel(gateway)
+    gateway._get_model = lambda: model
+
+    result = gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
+
+    assert result.value == "ok"
+    assert model.attempts == 2
+    assert "extra_body" not in gateway._model_options()
+
+
+def test_parallel_tool_calls_is_optional_but_tool_choice_remains_required():
+    class ParallelPickyModel(RecordingModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.bind_options: list[dict] = []
+
+        def bind_tools(self, tools, **options):
+            self.bind_options.append(options)
+            if "parallel_tool_calls" in options:
+                raise RejectedRequest("parallel_tool_calls is not supported")
+            return super().bind_tools(tools, **options)
+
+    gateway = ResearchModelGateway(_settings())
+    model = ParallelPickyModel()
+    gateway._model = model
+
+    calls = gateway.invoke_tool_calls(messages=_messages(), tools=TOOLS)
+
+    assert len(calls) == 1
+    assert model.bind_options == [
+        {"tool_choice": "required", "parallel_tool_calls": True},
+        {"tool_choice": "required"},
+    ]
+
+
+def test_tool_calls_fail_closed_when_native_tools_are_unsupported():
+    class NoToolsModel(RecordingModel):
+        def bind_tools(self, tools, **options):
+            raise RejectedRequest("This model does not support tools or tool_choice")
+
+    gateway = ResearchModelGateway(_settings(llm_provider="custom"))
+    gateway._model = NoToolsModel(content='{"calls": []}')
+
+    with pytest.raises(ModelProtocolError, match="Provider=custom"):
+        gateway.invoke_tool_calls(messages=_messages("分析电价分布"), tools=TOOLS)
+    assert "tools" not in gateway._disabled
+    assert "tool_choice" not in gateway._disabled
+
+
+def test_tool_calls_reject_function_names_not_in_the_request():
+    gateway = ResearchModelGateway(_settings())
+    model = RecordingModel()
+    model.response.tool_calls[0]["name"] = "unregistered_function"
+    gateway._model = model
+
+    with pytest.raises(ModelResponseError, match="未提供的研究函数"):
+        gateway.invoke_tool_calls(messages=_messages(), tools=TOOLS)
+
+
+def test_provider_shaped_tuple_messages_are_rejected_at_the_boundary():
+    gateway = ResearchModelGateway(_settings())
+    gateway._model = RecordingModel()
+
+    with pytest.raises(ModelConfigurationError, match="ModelMessage"):
+        gateway.invoke_text(messages=[("human", "test")])  # type: ignore[list-item]
+
+
+def test_double_encoded_response_body_is_unwrapped():
+    assert compat.unwrap_double_encoded_body(b'"{\\"choices\\": []}"') == b'{"choices": []}'
+    assert compat.unwrap_double_encoded_body(b'{"choices": []}') is None
+    assert compat.unwrap_double_encoded_body(b"not json") is None
+
+
+def test_unsupported_feature_only_reports_optional_fields():
+    rejected_core = RejectedRequest("Thinking mode does not support this tool_choice")
+    rejected_optional = RejectedRequest("parallel_tool_calls is not supported")
+
+    assert (
+        compat.unsupported_feature(
+            rejected_core,
+            set(),
+            compat.OPTIONAL_TOOL_CALL_FEATURES,
+        )
+        is None
+    )
+    assert (
+        compat.unsupported_feature(
+            rejected_optional,
+            set(),
+            compat.OPTIONAL_TOOL_CALL_FEATURES,
+        )
+        == "parallel_tool_calls"
+    )

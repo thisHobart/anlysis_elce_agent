@@ -1,0 +1,24 @@
+flowchart TB
+    USER(["用户动作"])
+    M01["M01 桌面交互<br/>app/desktop"]
+    M02["M02 应用协调<br/>research/application"]
+    M03["M03 持久化研究循环<br/>research/graph"]
+
+    subgraph CAP["Graph 编排的结构化能力"]
+        direction LR
+        M04["M04 决策、Skill 与计划<br/>agent · llm · skills · planning"]
+        M05["M05 数据与确定性执行<br/>data · tools"]
+        M06["M06 评估与交付<br/>evaluation · reporting"]
+    end
+
+    M07["M07 状态与契约基础<br/>schemas · checkpoint · session · filesystem"]
+
+    USER --> M01 --> M02 --> M03
+    M03 <-->|决策、计划、修订、解释| M04
+    M03 <-->|准备、ToolCall、ToolResult| M05
+    M03 <-->|证据、四态决策、研究包| M06
+    M03 -.->|权威状态| M07
+    M01 -.->|会话展示投影| M07
+    M06 -.->|证据资产| M07
+    M02 -.->|快照与结果引用| M01
+

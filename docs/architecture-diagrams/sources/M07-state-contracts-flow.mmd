@@ -1,0 +1,37 @@
+flowchart TB
+    IN(["入口：结构化对象、状态更新、投影和资产写入"])
+
+    subgraph M07["M07 状态与契约基础"]
+        direction LR
+        A["Pydantic schemas / contracts<br/>校验配置、反馈、结果和 Graph 状态"]
+
+        subgraph AUTH["运行权威"]
+            B["SQLite checkpoint<br/>保存 ResearchLoopState"]
+            C["migrations<br/>检查和归档不兼容状态"]
+            B --> C
+        end
+
+        subgraph VIEW["展示投影"]
+            D["SessionStore<br/>会话、消息、trace 和备份"]
+        end
+
+        subgraph ASSET["证据资产"]
+            E["ArtifactLayout / runtime_paths"]
+            F["研究包、manifest 和文件哈希"]
+            E --> F
+        end
+
+        A --> B
+        A --> D
+        A --> E
+    end
+
+    OUT1(["出口：恢复后的 Graph 权威状态"])
+    OUT2(["出口：可重建 UI 投影"])
+    OUT3(["出口：可复核研究资产路径"])
+
+    IN --> A
+    C --> OUT1
+    D --> OUT2
+    F --> OUT3
+

@@ -1,0 +1,26 @@
+flowchart LR
+    UIN(["入口：用户问题、文件与审批动作"])
+    GIN(["入口：Graph 快照、事件与报告路径"])
+
+    subgraph M01["M01 桌面交互 · app/desktop"]
+        direction LR
+        A["MainWindow<br/>创建工作站"]
+        B["ResearchWorkspace<br/>管理会话与当前状态"]
+        C["Input / Plan / Composer<br/>收集用户动作"]
+        D["FunctionWorker<br/>后台调用 Coordinator"]
+        E["Conversation / Trace / Result<br/>投影过程和结果"]
+        F["SessionStore<br/>保存展示投影"]
+
+        A --> B --> C --> D
+        B --> E
+        E --> F
+    end
+
+    OUT(["出口：submit / resume / cancel 命令"])
+    UOUT(["出口：方案卡、过程卡、结果卡和报告阅读器"])
+
+    UIN --> C
+    D --> OUT
+    GIN --> E
+    E --> UOUT
+

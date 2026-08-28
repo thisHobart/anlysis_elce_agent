@@ -9,6 +9,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.research.agent.prompts import PLANNING_PROMPT_VERSION
+from app.research.planning.variables import VariableSelectionMode, VariableSelectionStage
 from app.research.schemas.feedback import FeedbackPacket
 from app.research.schemas.results import DataQualityReport
 from app.research.tools.catalog import FUNCTION_CATALOG, LEGACY_METHOD_TO_FUNCTION, ResearchFunctionName
@@ -28,6 +30,9 @@ class ConversationMessage(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    message_id: str = Field(default_factory=lambda: uuid4().hex)
+    turn_id: str | None = None
+    episode_id: str | None = None
     role: Literal["user", "assistant", "system"]
     content: str = Field(min_length=1)
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -85,7 +90,7 @@ class EDAPlan(BaseModel):
     study_name: str = Field(min_length=1)
     planner: Literal["llm"]
     planning_model: str | None = None
-    planning_prompt_version: str = "eda-plan-v9"
+    planning_prompt_version: str = PLANNING_PROMPT_VERSION
     skill_name: str = Field(min_length=1)
     skill_version: str = Field(min_length=1)
     research_protocol_id: str | None = None
@@ -93,7 +98,12 @@ class EDAPlan(BaseModel):
     research_protocol_function_order: list[EDAToolName] = Field(default_factory=list)
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     hypotheses: list[str] = Field(default_factory=list)
+    unverifiable_hypotheses: list[str] = Field(default_factory=list)
     selected_variables: list[str] = Field(default_factory=list)
+    variable_selection_mode: VariableSelectionMode = "explicit"
+    variable_selection_stage: VariableSelectionStage = "direct"
+    deferred_functions: list[EDAToolName] = Field(default_factory=list)
+    variable_recommendation_limit: int = Field(default=8, ge=1, le=32)
     steps: list[EDAPlanStep] = Field(min_length=1)
     assumptions: list[str] = Field(default_factory=list)
     planning_notes: list[str] = Field(default_factory=list)
@@ -173,6 +183,10 @@ class EDAPlan(BaseModel):
             raise ValueError("plan step ids must be unique")
         if len(tools) != len(set(tools)):
             raise ValueError("each research function may appear at most once")
+        if len(self.deferred_functions) != len(set(self.deferred_functions)):
+            raise ValueError("deferred research functions must not contain duplicates")
+        if self.variable_selection_stage == "screening" and self.variable_selection_mode != "auto_recommend":
+            raise ValueError("variable screening stage requires auto_recommend mode")
         quality = next((step for step in self.steps if step.function == "data_quality"), None)
         if quality is None or not quality.required or not quality.enabled:
             raise ValueError("data_quality must be an enabled, required plan step")
@@ -369,6 +383,7 @@ class AgentEvaluation(BaseModel):
     findings: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     suggested_followups: list[str] = Field(default_factory=list)
+    variable_recommendations: dict[str, Any] | None = None
     feedback_packets: list[FeedbackPacket] = Field(default_factory=list)
     agenda_fingerprint: str = ""
 

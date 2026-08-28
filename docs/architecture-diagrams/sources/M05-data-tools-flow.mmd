@@ -1,0 +1,26 @@
+flowchart TB
+    IN1(["入口：StudyConfig 与本地文件"])
+    IN2(["入口：已锁定 EDAPlan / ToolCall"])
+
+    subgraph M05["M05 数据与确定性执行"]
+        direction TB
+        A["load_series<br/>读取并解析序列"]
+        B["align_loaded_series<br/>统一时间轴和时区"]
+        C["build_quality_report<br/>质量报告"]
+        D["snapshot / fingerprint<br/>固定输入身份"]
+        E["compile_tool_queue<br/>生成稳定 call_id / work_id"]
+        F["ToolPolicy + ToolRegistry<br/>许可、schema 和版本校验"]
+        G["ToolExecutor<br/>调用注册式原子 EDA 函数"]
+        H["validate_tool_result<br/>身份、版本和输出哈希校验"]
+
+        A --> B --> C --> D --> E
+        E --> F --> G --> H
+    end
+
+    OUT1(["出口：PreparedExecution / DataQualityReport"])
+    OUT2(["出口：ToolResult / 结构化证据 / 输出哈希"])
+
+    IN1 --> A
+    IN2 --> E
+    D --> OUT1
+    H --> OUT2

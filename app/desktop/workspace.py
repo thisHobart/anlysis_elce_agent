@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from math import ceil
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import QMessageBox, QSplitter, QWidget
@@ -17,21 +18,21 @@ from app.desktop.session import (
     ResearchSession,
     SessionMessage,
     SessionRunRecord,
+    SessionStatus,
     SessionStore,
     TraceEvent,
     VariableEvidence,
 )
 from app.desktop.worker import FunctionWorker
+from app.research.agent.context import MAX_PERSISTED_CONVERSATION_MESSAGES, bounded_recent_history
 from app.research.agent.schemas import (
-    AgentRunResult,
     ConversationMessage,
     EDAPlan,
     ResearchDataProfile,
     ResearchProposal,
-    ResearchTurnResult,
 )
 from app.research.application.coordinator import ResearchCoordinator
-from app.research.graph.contracts import ApprovalState, ResearchLoopSnapshot
+from app.research.graph.contracts import ApprovalState, EpisodeSummary, ResearchLoopSnapshot
 from app.research.graph.narration import (
     STAGE_LABELS,
     narrate_event,
@@ -54,6 +55,7 @@ class ResearchWorkspace(QSplitter):
         agent: ResearchCoordinator | None = None,
         store: SessionStore | None = None,
         plan_feedback_seconds: int = 30,
+        auto_execute_plan: bool = False,
     ) -> None:
         super().__init__(Qt.Orientation.Horizontal)
         self.setObjectName("researchWorkspace")
@@ -69,6 +71,7 @@ class ResearchWorkspace(QSplitter):
             checkpoint_path=self.store.path.with_name("research_graph.sqlite3")
         )
         self.plan_feedback_seconds = max(1, int(plan_feedback_seconds))
+        self.auto_execute_plan = bool(auto_execute_plan)
         self.sessions = [
             session
             for session in self.store.load(self._installed_skill_versions())
@@ -80,14 +83,15 @@ class ResearchWorkspace(QSplitter):
         self._thread: QThread | None = None
         self._worker: FunctionWorker | None = None
         self._task_kind: str | None = None
-        self._task_session_id: str | None = None
-        self._success_handler: Any | None = None
         self._thinking_widget: ThinkingMessageWidget | None = None
         self._thinking_message_id: str | None = None
         self._thinking_placeholder = False
         self._thinking_function: str | None = None
         self._last_progress_message = ""
         self._task_previous_status = "idle"
+        self._active_interrupt_id: str | None = None
+        self._active_state_revision: int | None = None
+        self._active_interrupt_kind: str | None = None
         self._pending_execute_plan: EDAPlan | None = None
         self._pre_trace_sizes: list[int] | None = None
         self._plan_feedback_timer = QTimer(self)
@@ -120,6 +124,8 @@ class ResearchWorkspace(QSplitter):
         self.conversation.send_requested.connect(self.submit_question)
         self.conversation.cancel_requested.connect(self.cancel_current_task)
         self.conversation.plan_run_requested.connect(self.run_plan)
+        self.conversation.plan_reject_requested.connect(self.reject_plan)
+        self.conversation.end_research_requested.connect(self.end_current_research)
         self.conversation.draft_changed.connect(self._composer_draft_changed)
         self.context.file_selected.connect(self.set_input_file)
         self.context.file_cleared.connect(self.clear_input_file)
@@ -324,6 +330,8 @@ class ResearchWorkspace(QSplitter):
     def _invalidate_plan_for_input_change(self) -> None:
         self._cancel_plan_feedback_window()
         session = self.current_session
+        for run in session.runs:
+            run.memory_status = "stale"
         if self.agent.has_thread(session.session_id):
             self.agent.delete_thread(session.session_id)
         if session.current_plan is not None:
@@ -353,7 +361,8 @@ class ResearchWorkspace(QSplitter):
         session = self.current_session
         self._cancel_plan_feedback_window()
         session.derive_title(question)
-        self._append_message(SessionMessage(role="user", kind="text", content=question))
+        user_message = SessionMessage(role="user", kind="text", content=question, turn_id=uuid4().hex)
+        self._append_message(user_message)
         question_label = " ".join(question.split())
         if len(question_label) > 52:
             question_label = f"{question_label[:51]}…"
@@ -378,14 +387,18 @@ class ResearchWorkspace(QSplitter):
             operation=lambda progress: self.agent.submit_user_message(
                 session_id=session.session_id,
                 message=question,
+                message_id=user_message.message_id,
+                turn_id=user_message.turn_id,
                 study_config=study_config,
                 conversation=conversation,
                 approval_timeout_seconds=self.plan_feedback_seconds,
+                automatic_approval_enabled=self.auto_execute_plan,
                 imported_state=imported_state,
                 progress=progress,
             ),
             success_handler=self._loop_completed,
         )
+        self.conversation.scroll_to_bottom()
 
     def _legacy_graph_import(self, session: ResearchSession) -> dict[str, Any]:
         latest_run = None
@@ -397,9 +410,45 @@ class ResearchWorkspace(QSplitter):
                 "report_path": session.report_path,
                 "figure_paths": {},
                 "evaluation": session.latest_evaluation,
-                "eda_summary": session.latest_eda_summary,
-                "quality_report": session.quality_report,
             }
+        episode_summaries = []
+        run_history = []
+        for number, run in enumerate(session.runs[-48:], start=max(1, len(session.runs) - 47)):
+            evaluation = run.evaluation or {}
+            decision = evaluation.get("decision")
+            episode_summaries.append(
+                EpisodeSummary(
+                    episode_id=run.episode_id or f"legacy-{run.run_id}",
+                    episode_number=number,
+                    goal=run.question,
+                    status={"accept": "accepted", "reject": "rejected"}.get(decision, "limited"),
+                    run_id=run.run_id,
+                    plan_id=run.plan_id,
+                    evaluation_decision=decision,
+                    summary=str(evaluation.get("summary") or ""),
+                    findings=[str(item) for item in evaluation.get("findings", [])[:8]],
+                    warnings=[str(item) for item in evaluation.get("warnings", [])[:8]],
+                    report_path=run.report_path,
+                    data_fingerprint=run.data_fingerprint,
+                    study_name=run.study_name,
+                    target_name=run.target_name,
+                    study_start_time=run.study_start_time,
+                    study_end_time=run.study_end_time,
+                    skill_name=run.skill_name,
+                    skill_version=run.skill_version,
+                    memory_status=run.memory_status,
+                    updated_at=run.created_at,
+                ).model_dump(mode="json")
+            )
+            run_history.append(
+                {
+                    "run_id": run.run_id,
+                    "plan_id": run.plan_id,
+                    "artifact_directory": run.artifact_directory,
+                    "report_path": run.report_path,
+                    "evaluation_decision": decision,
+                }
+            )
         return {
             "current_plan": session.current_plan,
             "plan_history": [session.current_plan] if session.current_plan else [],
@@ -409,7 +458,8 @@ class ResearchWorkspace(QSplitter):
             "eda_summary": session.latest_eda_summary,
             "evaluation": session.latest_evaluation,
             "latest_run": latest_run,
-            "run_history": [latest_run] if latest_run else [],
+            "run_history": run_history or ([latest_run] if latest_run else []),
+            "episode_summaries": episode_summaries,
             "phase": "completed" if session.run_id else "idle",
         }
 
@@ -417,7 +467,12 @@ class ResearchWorkspace(QSplitter):
         session = self.current_session
         self._complete_active_tool("研究循环已到达用户交互点")
         values = snapshot.values
+        self._active_interrupt_id = snapshot.interrupt.interrupt_id or None if snapshot.interrupt else None
+        self._active_state_revision = snapshot.interrupt.state_revision if snapshot.interrupt else None
+        self._active_interrupt_kind = snapshot.interrupt.kind if snapshot.interrupt else None
+        self.conversation.set_interaction_context(self._active_interrupt_kind)
         self._sync_graph_events(session, snapshot.events)
+        self._sync_assistant_text(session, values)
         if (
             snapshot.interrupt is None
             and snapshot.phase in {"planning", "validating_plan", "executing_tools", "validating_result", "evaluating"}
@@ -487,30 +542,38 @@ class ResearchWorkspace(QSplitter):
             session.run_id = latest["run_id"]
             session.artifact_directory = latest.get("artifact_directory")
             session.report_path = latest.get("report_path")
+            plan_value = values.get("current_plan") or session.current_plan or {}
+            study_value = values.get("study_config") or {}
+            study_definition = study_value.get("study") or {}
+            target_definition = study_value.get("target") or {}
             session.runs.append(
                 SessionRunRecord(
                     run_id=latest["run_id"],
+                    episode_id=(values.get("loop_cursor") or {}).get("episode_id"),
                     plan_id=latest.get("plan_id") or (session.current_plan or {}).get("plan_id", "unknown"),
                     parent_run_id=session.runs[-1].run_id if session.runs else None,
                     question=(session.current_plan or {}).get("question", "研究循环"),
                     artifact_directory=latest.get("artifact_directory") or "",
                     report_path=latest.get("report_path") or "",
                     evaluation=evaluation,
+                    data_fingerprint=plan_value.get("data_fingerprint"),
+                    study_name=study_definition.get("name"),
+                    target_name=target_definition.get("name"),
+                    study_start_time=(
+                        str(study_definition["start_time"])
+                        if study_definition.get("start_time") is not None
+                        else None
+                    ),
+                    study_end_time=(
+                        str(study_definition["end_time"])
+                        if study_definition.get("end_time") is not None
+                        else None
+                    ),
+                    skill_name=plan_value.get("skill_name"),
+                    skill_version=plan_value.get("skill_version"),
                 )
             )
             self._set_plan_message_state("completed")
-
-        assistant_message = values.get("assistant_message", "").strip()
-        matching_indexes = [
-            index
-            for index, message in enumerate(session.messages)
-            if message.role == "assistant" and message.kind == "text" and message.content == assistant_message
-        ]
-        has_new_user_message = bool(matching_indexes) and any(
-            message.role == "user" for message in session.messages[matching_indexes[-1] + 1 :]
-        )
-        if assistant_message and (not matching_indexes or has_new_user_message):
-            self._append_message(SessionMessage(role="assistant", kind="text", content=assistant_message))
 
         if interrupt_payload and interrupt_payload.kind in {
             "plan_error",
@@ -519,12 +582,27 @@ class ResearchWorkspace(QSplitter):
             "response_error",
             "finalization_error",
         }:
-            session.status = "awaiting_user"
+            feedback_codes = {
+                str(item.get("code") or "") for item in values.get("feedback_packets", [])
+            }
             if interrupt_payload.kind == "plan_error":
-                notice = (
-                    f"{interrupt_payload.message}\n"
-                    "还没有可执行的方案，也没有跑任何计算。你可以回复“重试”，换个说法提问，或者回复“停止”。"
-                )
+                if "session_skill_version_mismatch" in feedback_codes:
+                    notice = (
+                        f"{interrupt_payload.message}\n"
+                        "请点击左侧“新建研究”重新提交问题；旧对话和此前报告仍可查看。"
+                    )
+                elif values.get("latest_run"):
+                    notice = (
+                        f"{interrupt_payload.message}\n"
+                        "此前的数据质量或研究结果仍然保留；本次新增分析尚未执行。"
+                        "你可以修改要求、回复“重试”或“停止”。"
+                    )
+                else:
+                    notice = (
+                        f"{interrupt_payload.message}\n"
+                        "本次尚未形成可执行方案，也没有启动计算。"
+                        "你可以回复“重试”，换个说法提问，或者回复“停止”。"
+                    )
             elif interrupt_payload.kind in {"response_error", "finalization_error"}:
                 notice = f"{interrupt_payload.message}\n你可以回复“重试”或“停止”。"
             elif interrupt_payload.kind == "result_rejected":
@@ -532,20 +610,80 @@ class ResearchWorkspace(QSplitter):
             else:
                 notice = (
                     f"{interrupt_payload.message}\n"
-                    "你可以回复“接受当前限制”、直接说要改什么，或者回复“停止”。"
+                    "在下方输入下一步研究要求，例如“按推荐变量继续”，或说明要增删的变量。"
                 )
             recent_notices = {
                 message.content for message in session.messages[-8:] if message.role == "system" and message.kind == "notice"
             }
             if notice not in recent_notices:
                 self._append_message(SessionMessage(role="system", kind="notice", content=notice))
-        elif interrupt_payload and interrupt_payload.kind == "result":
-            session.status = "completed"
-        elif snapshot.phase in {"failed", "stopped", "completed"}:
-            session.status = snapshot.phase  # type: ignore[assignment]
-        else:
-            session.status = "idle"
+        session.status = self._projected_session_status(snapshot)
         self._persist_and_render(keep_timeline=True)
+
+    @staticmethod
+    def _projected_session_status(snapshot: ResearchLoopSnapshot) -> SessionStatus:
+        """Derive UI status from the authoritative Graph snapshot."""
+
+        if snapshot.interrupt is not None:
+            if snapshot.interrupt.kind == "plan_approval":
+                return "awaiting_plan_approval"
+            if snapshot.interrupt.kind == "result":
+                return "completed"
+            return "awaiting_user"
+        return {
+            "idle": "idle",
+            "understanding": "understanding",
+            "planning": "understanding",
+            "validating_plan": "understanding",
+            "awaiting_approval": "awaiting_plan_approval",
+            "executing_tools": "running",
+            "validating_result": "running",
+            "evaluating": "evaluating",
+            "awaiting_user": "awaiting_user",
+            "completed": "completed",
+            "stopped": "stopped",
+            "failed": "failed",
+        }[snapshot.phase]
+
+    def _sync_assistant_text(self, session: ResearchSession, values: dict[str, Any]) -> None:
+        """Project one Graph assistant message exactly once using its durable ID."""
+
+        assistant_message = str(values.get("assistant_message") or "").strip()
+        if not assistant_message:
+            return
+        graph_message = next(
+            (
+                item
+                for item in reversed(values.get("messages", []))
+                if item.get("role") == "assistant" and str(item.get("content") or "").strip() == assistant_message
+            ),
+            None,
+        )
+        graph_message_id = str((graph_message or {}).get("message_id") or "")
+        if graph_message_id:
+            if any(item.message_id == graph_message_id for item in session.messages):
+                return
+        else:
+            # Compatibility for Graph messages created before message IDs existed.
+            matching_indexes = [
+                index
+                for index, message in enumerate(session.messages)
+                if message.role == "assistant" and message.kind == "text" and message.content == assistant_message
+            ]
+            if matching_indexes and not any(
+                message.role == "user" for message in session.messages[matching_indexes[-1] + 1 :]
+            ):
+                return
+        self._append_message(
+            SessionMessage(
+                message_id=graph_message_id or uuid4().hex,
+                turn_id=(graph_message or {}).get("turn_id"),
+                episode_id=(graph_message or {}).get("episode_id"),
+                role="assistant",
+                kind="text",
+                content=assistant_message,
+            )
+        )
 
     def _sync_graph_events(self, session: ResearchSession, events: list[dict[str, Any]]) -> None:
         sequenced = [
@@ -604,6 +742,11 @@ class ResearchWorkspace(QSplitter):
         approval = ApprovalState.model_validate(snapshot.values.get("approval_state", {}))
         session.plan_feedback_deadline = approval.deadline
         session.plan_feedback_remaining_seconds = approval.remaining_seconds
+        if not self.auto_execute_plan or not bool(snapshot.values.get("automatic_approval_enabled", False)):
+            self._plan_feedback_timer.stop()
+            if self.conversation.current_plan_widget is not None:
+                self.conversation.current_plan_widget.set_explicit_approval()
+            return
         if approval.status == "expired":
             if self.conversation.current_plan_widget is not None:
                 self.conversation.current_plan_widget.set_feedback_paused("审批已过期，请明确确认")
@@ -619,70 +762,7 @@ class ResearchWorkspace(QSplitter):
                 if self.conversation.current_plan_widget is not None:
                     self.conversation.current_plan_widget.set_feedback_paused("等待时间已过，请重新确认")
                 return
-            self._start_plan_feedback_window(remaining, persist_graph=False)
-
-    def _turn_completed(self, turn: ResearchTurnResult) -> None:
-        session = self.current_session
-        if turn.action == "proposal":
-            if turn.proposal is None:  # pragma: no cover - guarded by ResearchTurnResult
-                raise RuntimeError("proposal turn is missing proposal payload")
-            if self._task_previous_status == "awaiting_plan_approval" and session.current_plan is not None:
-                self._set_plan_message_state("stale")
-            self._proposal_completed(turn.proposal)
-            return
-        self._complete_active_tool("研究意图处理完成")
-        if turn.action == "reply":
-            self._append_message(SessionMessage(role="assistant", kind="text", content=turn.assistant_message))
-            session.status = self._restored_dialogue_status()
-            if session.status == "awaiting_plan_approval" and session.current_plan is not None:
-                self._start_plan_feedback_window()
-            self._add_trace(
-                "agent",
-                "生成回复",
-                "completed",
-                turn.assistant_message,
-            )
-            self._persist_and_render(keep_timeline=True)
-            return
-        if turn.action == "plan_revision":
-            if turn.revised_plan is None:  # pragma: no cover - guarded by ResearchTurnResult
-                raise RuntimeError("revision turn is missing a plan")
-            self._set_plan_message_state("stale")
-            self._append_message(SessionMessage(role="assistant", kind="text", content=turn.assistant_message))
-            self._append_plan_message(turn.revised_plan, turn.available_variables)
-            session.current_plan = turn.revised_plan.model_dump(mode="json")
-            session.plan_stale = False
-            session.status = "awaiting_plan_approval"
-            self._start_plan_feedback_window()
-            self._add_trace(
-                "plan",
-                f"修订分析方案：第 {turn.revised_plan.revision} 版",
-                "completed",
-                turn.revised_plan.revision_reason or "按对话反馈调整方案",
-            )
-            self._persist_and_render(keep_timeline=True)
-            return
-        if turn.revised_plan is None:  # pragma: no cover - guarded by ResearchTurnResult
-            raise RuntimeError("execution confirmation is missing a plan")
-        plan_to_run = turn.revised_plan
-        if self.conversation.current_plan_widget is not None:
-            try:
-                plan_to_run = self.conversation.current_plan_widget.approved_plan()
-            except ValueError as exc:
-                self._append_message(SessionMessage(role="assistant", kind="error", content=str(exc)))
-                session.status = "awaiting_plan_approval"
-                self._persist_and_render(keep_timeline=True)
-                return
-        self._append_message(SessionMessage(role="assistant", kind="text", content=turn.assistant_message))
-        session.status = "awaiting_plan_approval"
-        self._pending_execute_plan = plan_to_run
-        self._add_trace(
-            "plan",
-            "方案已确认",
-            "completed",
-            f"共 {len(plan_to_run.enabled_steps)} 项分析待执行",
-        )
-        self._persist_and_render(keep_timeline=True)
+            self._start_plan_feedback_window(remaining)
 
     def _proposal_completed(self, proposal: ResearchProposal) -> None:
         session = self.current_session
@@ -695,7 +775,10 @@ class ResearchWorkspace(QSplitter):
         session.data_profile = proposal.data_profile.model_dump(mode="json")
         session.quality_report = proposal.quality_report.model_dump(mode="json")
         session.status = "awaiting_plan_approval"
-        self._start_plan_feedback_window()
+        if self.auto_execute_plan:
+            self._start_plan_feedback_window()
+        elif self.conversation.current_plan_widget is not None:
+            self.conversation.current_plan_widget.set_explicit_approval()
         self._persist_and_render(keep_timeline=True)
 
     def _append_plan_message(self, plan: EDAPlan, available_variables: list[str]) -> None:
@@ -717,9 +800,9 @@ class ResearchWorkspace(QSplitter):
             return self._task_previous_status
         return "idle"
 
-    def _start_plan_feedback_window(self, seconds: int | None = None, *, persist_graph: bool = False) -> None:
+    def _start_plan_feedback_window(self, seconds: int | None = None) -> None:
         session = self.current_session
-        if session.status != "awaiting_plan_approval" or session.current_plan is None:
+        if not self.auto_execute_plan or session.status != "awaiting_plan_approval" or session.current_plan is None:
             return
         duration = max(1, int(seconds or self.plan_feedback_seconds))
         self._plan_feedback_timer.stop()
@@ -749,7 +832,12 @@ class ResearchWorkspace(QSplitter):
 
     def _composer_draft_changed(self, has_text: bool) -> None:
         session = self.current_session
-        if session.status != "awaiting_plan_approval" or session.current_plan is None or self.is_busy:
+        if (
+            not self.auto_execute_plan
+            or session.status != "awaiting_plan_approval"
+            or session.current_plan is None
+            or self.is_busy
+        ):
             return
         if has_text and self._plan_feedback_timer.isActive():
             remaining = max(1, self._remaining_plan_feedback_seconds())
@@ -766,7 +854,7 @@ class ResearchWorkspace(QSplitter):
         """Pause auto-execution while another modal UI needs the user's attention."""
 
         session = self.current_session
-        if session.status != "awaiting_plan_approval" or not self._plan_feedback_timer.isActive():
+        if not self.auto_execute_plan or session.status != "awaiting_plan_approval" or not self._plan_feedback_timer.isActive():
             return
         remaining = max(1, self._remaining_plan_feedback_seconds())
         self._plan_feedback_timer.stop()
@@ -779,12 +867,12 @@ class ResearchWorkspace(QSplitter):
         """Resume a paused plan window without resetting its remaining time."""
 
         session = self.current_session
-        if session.status == "awaiting_plan_approval" and session.current_plan and not self.is_busy:
+        if self.auto_execute_plan and session.status == "awaiting_plan_approval" and session.current_plan and not self.is_busy:
             self._start_plan_feedback_window(session.plan_feedback_remaining_seconds)
 
     def _plan_feedback_tick(self) -> None:
         session = self.current_session
-        if session.status != "awaiting_plan_approval" or session.current_plan is None:
+        if not self.auto_execute_plan or session.status != "awaiting_plan_approval" or session.current_plan is None:
             self._cancel_plan_feedback_window()
             return
         remaining = self._remaining_plan_feedback_seconds()
@@ -867,6 +955,8 @@ class ResearchWorkspace(QSplitter):
                 lambda progress: self.agent.resume(
                     session_id=session.session_id,
                     action="approve",
+                    interrupt_id=self._active_interrupt_id,
+                    state_revision=self._active_state_revision,
                     progress=progress,
                 )
                 if self.agent.has_thread(session.session_id)
@@ -879,12 +969,39 @@ class ResearchWorkspace(QSplitter):
                     ),
                     conversation=self._agent_conversation(session),
                     approval_timeout_seconds=self.plan_feedback_seconds,
+                    automatic_approval_enabled=self.auto_execute_plan,
                     imported_state=self._legacy_graph_import(session),
                     progress=progress,
                 )
             ),
             success_handler=self._loop_completed,
         )
+        self.conversation.scroll_to_bottom()
+
+    def reject_plan(self) -> None:
+        """Reject the plan through the typed Graph command instead of chat text."""
+
+        if self.is_busy or not self.agent.has_thread(self.current_session.session_id):
+            return
+        self._cancel_plan_feedback_window()
+        self._set_plan_message_state("stopped")
+        if self.conversation.current_plan_widget is not None:
+            self.conversation.current_plan_widget.set_finished("已拒绝")
+        self._resume_graph(action="reject", task_kind="dialogue")
+
+    def end_current_research(self) -> None:
+        """End a limited result explicitly while preserving completed artifacts."""
+
+        if (
+            self.is_busy
+            or self._active_interrupt_kind != "result_limitations"
+            or not self.agent.has_thread(self.current_session.session_id)
+        ):
+            return
+        self._append_message(SessionMessage(role="user", kind="text", content="结束本轮研究"))
+        self._add_trace("user", "结束本轮研究", "completed", "保留当前结果，不再执行后续深入分析")
+        self.conversation.set_interaction_context(None)
+        self._resume_graph(action="stop", task_kind="dialogue")
 
     def _resume_graph(
         self,
@@ -904,82 +1021,13 @@ class ResearchWorkspace(QSplitter):
                 session_id=session.session_id,
                 action=action,
                 message=message,
+                interrupt_id=self._active_interrupt_id,
+                state_revision=self._active_state_revision,
                 foreground_timeout=foreground_timeout,
                 progress=progress,
             ),
             success_handler=self._loop_completed,
         )
-
-    def _execution_completed(self, result: AgentRunResult) -> None:
-        session = self.current_session
-        parent_run_id = session.run_id
-        self._complete_active_tool("分析与研究包生成完成")
-        if self.conversation.current_plan_widget is not None:
-            self.conversation.current_plan_widget.set_finished()
-        self._set_plan_message_state("completed")
-        result_payload = {
-            "run_id": result.run_id,
-            "report_path": str(result.report_path),
-            "artifact_directory": str(result.artifact_directory),
-            "figure_count": len(result.figure_paths),
-            "evaluation": result.evaluation.model_dump(mode="json"),
-        }
-        self._append_message(
-            SessionMessage(role="assistant", kind="result", content=result.evaluation.summary, payload=result_payload)
-        )
-        session.run_id = result.run_id
-        session.artifact_directory = str(result.artifact_directory)
-        session.report_path = str(result.report_path)
-        session.quality_report = result.quality_report.model_dump(mode="json")
-        session.latest_eda_summary = result.eda_summary
-        session.latest_evaluation = result.evaluation.model_dump(mode="json")
-        session.runs.append(
-            SessionRunRecord(
-                run_id=result.run_id,
-                plan_id=result.plan.plan_id,
-                parent_run_id=parent_run_id,
-                question=result.plan.question,
-                artifact_directory=str(result.artifact_directory),
-                report_path=str(result.report_path),
-                evaluation=result.evaluation.model_dump(mode="json"),
-            )
-        )
-        session.status = "completed"
-        self._add_trace(
-            "evaluation",
-            "评估分析证据",
-            "completed",
-            result.evaluation.summary,
-        )
-        trace_path = Path(result.artifact_directory) / "execution_trace.json"
-        if trace_path.is_file():
-            try:
-                import json
-
-                execution_rows = json.loads(trace_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, TypeError):
-                execution_rows = []
-            for row in execution_rows:
-                self.current_session.trace.append(
-                    TraceEvent(
-                        category="tool",
-                        name=(
-                            f"函数执行完成：{row.get('title') or row.get('tool') or 'unknown'} "
-                            f"[{row.get('tool') or 'unknown'}]"
-                        ),
-                        status="completed",
-                        duration_ms=float(row["duration_ms"]) if row.get("duration_ms") is not None else None,
-                        summary=str(row.get("result_key", "")),
-                        details=dict(row.get("parameters", {})),
-                    )
-                )
-        self._add_trace(
-            "artifact",
-            "生成研究报告与结果文件",
-            "completed",
-            str(result.artifact_directory),
-        )
-        self._persist_and_render(keep_timeline=True)
 
     def cancel_current_task(self) -> None:
         if self._worker is None:
@@ -1040,22 +1088,24 @@ class ResearchWorkspace(QSplitter):
         self._thread = thread
         self._worker = worker
         self._task_kind = kind
-        self._task_session_id = self.current_session.session_id
         self._last_progress_message = ""
         self._set_busy(True)
         thread.start()
 
     def _task_progress(self, value: int, message: str) -> None:
         session = self.current_session
-        if self._task_kind == "execute" and value >= 78:
-            session.status = "evaluating"
-        elif self._task_kind == "execute":
-            session.status = "running"
-        elif self._task_kind == "dialogue":
-            session.status = "inspecting_data" if any(word in message for word in ("数据", "加载", "对齐")) else "understanding"
-        else:
-            session.status = "inspecting_data" if value < 65 else "understanding"
         source_event, step = split_progress_message(message)
+        del value
+        session.status = {
+            "setup": "inspecting_data",
+            "read": "understanding",
+            "design": "understanding",
+            "confirm": "understanding",
+            "compute": "running",
+            "review": "evaluating",
+            "answer": "evaluating",
+            "issue": "understanding",
+        }.get(step.stage, "running" if self._task_kind == "execute" else "understanding")  # type: ignore[assignment]
         if message != self._last_progress_message:
             self._append_thinking_step(step.stage, step.title, step.detail, step.function_name)
             self._close_latest_running_trace("completed")
@@ -1064,6 +1114,7 @@ class ResearchWorkspace(QSplitter):
             self._last_progress_message = message
         elif self._thinking_widget is not None:
             self._thinking_widget.update_current(detail=step.detail)
+            self.conversation.scroll_to_bottom()
         self.conversation.set_status(session.status)
         self.status_changed.emit(step.title)
 
@@ -1085,7 +1136,6 @@ class ResearchWorkspace(QSplitter):
         self._thread = None
         self._worker = None
         self._task_kind = None
-        self._task_session_id = None
         if self._thinking_widget is not None:
             self._set_active_tool_status("completed", "")
         self.conversation.send_button.setEnabled(True)
@@ -1155,6 +1205,7 @@ class ResearchWorkspace(QSplitter):
         self._thinking_placeholder = False
         self._thinking_function = function_name
         self._store_thinking_steps()
+        self.conversation.scroll_to_bottom()
 
     def _store_thinking_steps(self, state: str | None = None) -> None:
         if not self._thinking_message_id or self._thinking_widget is None:
@@ -1201,11 +1252,22 @@ class ResearchWorkspace(QSplitter):
             message.payload["plan"] = plan.model_dump(mode="json")
 
     def _agent_conversation(self, session: ResearchSession) -> list[ConversationMessage]:
-        return [
-            ConversationMessage(role=message.role, content=message.content, created_at=message.created_at)
+        messages = [
+            ConversationMessage(
+                message_id=message.message_id,
+                turn_id=message.turn_id,
+                episode_id=message.episode_id,
+                role=message.role,
+                content=message.content,
+                created_at=message.created_at,
+            )
             for message in session.messages
             if message.kind == "text" and message.role in {"user", "assistant"} and message.content
-        ][-16:]
+        ]
+        return bounded_recent_history(
+            messages,
+            max_messages=MAX_PERSISTED_CONVERSATION_MESSAGES,
+        )
 
     def _persist_and_render(self, *, keep_timeline: bool = False) -> None:
         self.current_session.touch()

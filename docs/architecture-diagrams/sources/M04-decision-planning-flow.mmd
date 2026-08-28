@@ -1,0 +1,27 @@
+flowchart TB
+    IN(["入口：有界对话、数据画像、当前计划、反馈"])
+
+    subgraph M04["M04 决策、Skill 与计划"]
+        direction TB
+        A{"请求类型"}
+        B["MainResearchAgent<br/>对话路由或结果解释"]
+        C["SkillRegistry<br/>加载 Skill、协议和函数许可"]
+        D["EDASubagent<br/>提出原子函数计划"]
+        E["ModelGateway<br/>结构化输出与能力降级"]
+        F["OpenAI 兼容端点"]
+        G["EDAPlanCompiler<br/>函数、参数、变量和顺序校验"]
+        H["本地契约校验<br/>拒绝无效或越权输出"]
+
+        A -->|讨论、路由、解释| B --> E
+        A -->|新计划或修订| C --> D --> E
+        E --> F --> E
+        E --> H
+        H -->|计划草案| G
+    end
+
+    OUT1(["出口：DialogueDecision / 文字解释"])
+    OUT2(["出口：EDAPlanDraft → EDAPlan"])
+
+    IN --> A
+    H --> OUT1
+    G --> OUT2

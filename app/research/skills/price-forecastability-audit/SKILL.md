@@ -2,7 +2,7 @@
 name: price-forecastability-audit
 description: Audit whether an electricity-price series is forecastable at all, using only the target series. Use when the question is about price shape, spikes and negative prices, volatility regimes, stationarity and differencing, trend and seasonal structure, autoregressive memory, how hard the series is to predict, what naive benchmark a model has to beat, or when no exogenous driver data has been loaded yet.
 metadata:
-  version: "1.2.0"
+  version: "1.2.1"
   domain: eda
   protocol-file: references/research-protocol.yaml
 allowed-tools: data_quality price_descriptive_distribution price_duration_curve price_tukey_outer_fence price_spike_regime_profile price_calendar_group_profile price_rolling_mean_std price_stationarity_tests price_seasonal_decomposition price_lag_autocorrelation price_partial_autocorrelation price_segment_distribution_comparison price_variance_stabilization_check price_naive_baseline_benchmark

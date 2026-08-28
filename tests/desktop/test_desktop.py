@@ -13,17 +13,22 @@ import numpy as np
 import pandas as pd
 import pytest
 import yaml
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import QTextDocument
+from PySide6.QtWidgets import QApplication, QLabel
 
 from app.config import Settings
 from app.desktop.input_config import build_runtime_study
 from app.desktop.main_window import MainWindow
-from app.desktop.message_widgets import ThinkingMessageWidget
+from app.desktop.message_widgets import ResultMessageWidget, ThinkingMessageWidget
+from app.desktop.panes import ConversationPane
+from app.desktop.report_view import ReportBrowser, ReportWindow
 from app.desktop.session import (
     SESSION_SCHEMA_VERSION,
     STALE_PLAN_NOTICE,
     ResearchSession,
     SessionMessage,
+    SessionRunRecord,
     SessionStore,
 )
 from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
@@ -153,6 +158,112 @@ class DesktopModelDialogue:
         return DialogueDecision(intent="new_plan", skill_name="price-exogenous-eda")
 
 
+SAMPLE_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" width="760" height="300">'
+    '<rect width="760" height="300" fill="#EEF0FB"/></svg>'
+)
+
+
+def test_report_reader_renders_markdown_figures_inside_the_app(qt_app: QApplication, tmp_path: Path):
+    """Figures rendering badly in Markdown is the reason the report used to be HTML."""
+
+    package = tmp_path / "run-1"
+    (package / "figures").mkdir(parents=True)
+    (package / "figures" / "price_timeseries.svg").write_text(SAMPLE_SVG, encoding="utf-8")
+    report = package / "report.md"
+    report.write_text(
+        "# 报告标题\n\n## 电价自身规律\n\n![电价时间序列](figures/price_timeseries.svg)\n",
+        encoding="utf-8",
+    )
+
+    window = ReportWindow(report)
+    window.resize(1000, 780)
+    window.show()
+    qt_app.processEvents()
+
+    text = window.browser.toPlainText()
+    assert "报告标题" in text and "电价自身规律" in text
+
+    image = window.browser.loadResource(
+        QTextDocument.ResourceType.ImageResource.value, QUrl("figures/price_timeseries.svg")
+    )
+    assert image is not None and not image.isNull()
+    assert image.width() > 0
+
+    # The report must fit its window; a document wider than the viewport scrolls sideways.
+    assert window.browser.document().size().width() <= window.browser.viewport().width() + 1
+    window.close()
+
+
+def test_report_reader_renders_svg_in_logical_pixels_on_high_dpi(qt_app: QApplication, tmp_path: Path):
+    """The device ratio must not scale and crop SVG content a second time."""
+
+    class HighDpiReportBrowser(ReportBrowser):
+        def devicePixelRatioF(self) -> float:
+            return 1.5
+
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 50">'
+        '<rect width="100" height="50" fill="#FFFFFF"/>'
+        '<rect x="90" width="10" height="50" fill="#FF0000"/></svg>'
+    )
+    path = tmp_path / "right-edge.svg"
+    path.write_text(svg, encoding="utf-8")
+    browser = HighDpiReportBrowser(tmp_path)
+
+    image = browser._render_svg(path)
+
+    assert image is not None
+    assert image.devicePixelRatio() == pytest.approx(1.5)
+    assert image.pixelColor(image.width() - 2, image.height() // 2).red() > 240
+    assert image.pixelColor(image.width() - 2, image.height() // 2).green() < 20
+
+
+def test_ranked_bar_labels_never_land_on_the_category_name():
+    """A long negative bar used to print its value on top of the variable name."""
+
+    import re
+
+    from app.research.reporting.svg_charts import LABEL_CHARACTER_WIDTH, ranked_bar_chart
+
+    rows = [
+        ("sys_reserve_type_3", 0.7416),
+        ("sys_reserve_type_2", -0.7297),
+        ("fcst_new_energy_type_13", -0.6536),
+        ("act_new_energy_type_12", -0.5689),
+        ("actual_load", 0.4696),
+        ("fcst_new_energy_type_1", -0.258),
+    ]
+    markup = ranked_bar_chart(rows, title="电价—因素同期相关排序", subtitle="同期 Pearson 相关系数")
+
+    # Two variables whose names share a prefix must stay distinguishable.
+    names = re.findall(r'font-size="11" fill="#1F2430">([^<]+)</text>', markup)
+    assert len(names) == len(set(names)) == len(rows)
+
+    names_end_at = 156.0
+    pattern = r'<text x="([\d.]+)" y="[\d.]+" text-anchor="(\w+)" font-size="10.5" fill="(#\w+)">([^<]+)</text>'
+    values = [
+        (float(x), anchor, fill, label)
+        for x, anchor, fill, label in re.findall(pattern, markup)
+        if re.fullmatch(r"-?[\d.,]+", label)
+    ]
+    assert len(values) == len(rows)
+    for x, anchor, fill, label in values:
+        left_edge = x - len(label) * LABEL_CHARACTER_WIDTH if anchor == "end" else x
+        assert left_edge > names_end_at, (label, left_edge)
+        # A label pushed inside the bar has to be readable against the fill.
+        assert fill in {"#667085", "#FFFFFF"}
+
+
+def test_report_svg_prefers_a_font_with_chinese_glyphs():
+    from app.research.reporting.svg_charts import stem_chart
+
+    markup = stem_chart([1], [0.5], title="电价自相关")
+
+    assert "font-family:'Microsoft YaHei'" in markup
+    assert "font-family:'Microsoft YaHei'," not in markup
+
+
 @pytest.fixture(scope="module")
 def qt_app() -> QApplication:
     return QApplication.instance() or QApplication([])
@@ -164,6 +275,57 @@ def model_agent() -> ResearchCoordinator:
         eda_subagent=EDASubagent(model_planner=DesktopModelPlanner()),
         main_agent=MainResearchAgent(model_dialogue=DesktopModelDialogue()),
     )
+
+
+def test_result_limitations_composer_offers_natural_language_continue_or_end(
+    qt_app: QApplication,
+):
+    pane = ConversationPane()
+    ended: list[bool] = []
+    pane.end_research_requested.connect(lambda: ended.append(True))
+
+    pane.set_interaction_context("result_limitations")
+
+    assert "输入下一步研究要求" in pane.input.placeholderText()
+    assert "按推荐变量继续" in pane.input.placeholderText()
+    assert not pane.end_research_button.isHidden()
+    assert pane.end_research_button.text() == "结束本轮研究"
+
+    pane.end_research_button.click()
+    qt_app.processEvents()
+    assert ended == [True]
+
+    pane.set_interaction_context(None)
+    assert pane.end_research_button.isHidden()
+    assert "说说你想研究什么" in pane.input.placeholderText()
+    pane.close()
+
+
+def test_end_research_button_sends_typed_stop_and_preserves_result_context(
+    qt_app: QApplication,
+    model_agent: ResearchCoordinator,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
+    calls: list[dict] = []
+    try:
+        workspace = window.workspace
+        monkeypatch.setattr(model_agent, "has_thread", lambda _session_id: True)
+        monkeypatch.setattr(workspace, "_resume_graph", lambda **kwargs: calls.append(kwargs))
+        workspace._active_interrupt_kind = "result_limitations"
+        workspace.conversation.set_interaction_context("result_limitations")
+
+        workspace.conversation.end_research_button.click()
+        qt_app.processEvents()
+
+        assert calls == [{"action": "stop", "task_kind": "dialogue"}]
+        assert workspace.current_session.messages[-1].content == "结束本轮研究"
+        assert workspace.current_session.messages[-1].role == "user"
+        assert workspace.conversation.end_research_button.isHidden()
+        assert workspace.current_session.trace[-1].summary == "保留当前结果，不再执行后续深入分析"
+    finally:
+        window.close()
 
 
 @pytest.fixture
@@ -252,6 +414,59 @@ def select_desktop_data(window: MainWindow, desktop_study: Path) -> None:
         ("forecasts", "predictions.csv"),
     ):
         window.workspace.set_input_file(role, str(desktop_study.parent / filename))
+
+
+def test_trace_keeps_every_loaded_data_file_visible(
+    qt_app: QApplication,
+    desktop_study: Path,
+    model_agent: ResearchCoordinator,
+    tmp_path: Path,
+):
+    window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
+    try:
+        select_desktop_data(window, desktop_study)
+        qt_app.processEvents()
+
+        tree = window.workspace.context.trace.tree
+        loaded = [
+            tree.topLevelItem(index).text(2)
+            for index in range(tree.topLevelItemCount())
+            if tree.topLevelItem(index).text(2).startswith("载入数据文件")
+        ]
+
+        assert loaded == [
+            "载入数据文件 — market_prices.csv",
+            "载入数据文件 — measurements.csv",
+            "载入数据文件 — predictions.csv",
+        ]
+    finally:
+        window.close()
+
+
+def test_conversation_follows_the_bottom_while_a_sent_question_progresses(
+    qt_app: QApplication,
+    model_agent: ResearchCoordinator,
+    tmp_path: Path,
+):
+    window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
+    try:
+        window.resize(1100, 620)
+        window.show()
+        workspace = window.workspace
+        for index in range(60):
+            workspace._append_message(
+                SessionMessage(role="assistant", kind="text", content=f"历史消息 {index}\n用于形成可滚动的长对话内容。")
+            )
+        workspace._start_thinking("read", "解析研究问题", "识别本轮处理方式")
+
+        scrollbar = workspace.conversation.scroll.verticalScrollBar()
+        wait_until(qt_app, lambda: scrollbar.maximum() > 0)
+        scrollbar.setValue(0)
+
+        workspace._append_thinking_step("design", "生成分析方案", "继续处理新问题")
+        wait_until(qt_app, lambda: scrollbar.value() == scrollbar.maximum())
+    finally:
+        window.close()
 
 
 def test_main_window_uses_one_three_pane_workspace(qt_app: QApplication, tmp_path: Path):
@@ -494,6 +709,67 @@ def test_a_current_plan_survives_reopening(
     assert restored.messages[0].kind == "plan"
 
 
+def test_result_card_summarises_instead_of_repeating_the_report(qt_app: QApplication):
+    """Everything the card drops is written in full to report.md and methods.md."""
+
+    payload = {
+        "report_path": "run/report.md",
+        "artifact_directory": "run",
+        "figure_count": 6,
+        "evaluation": {
+            "decision": "accept",
+            "summary": "本轮登记的 7 条判断全部得到明确结论。",
+            "findings": [f"发现 {index}" for index in range(1, 6)],
+            "warnings": ["load：缺少预测发布或可获得时间。", "关系系数可能受到共同趋势影响。"],
+            "suggested_followups": ["进入预测实验前排除仅事后可得的变量。"],
+            "hypothesis_assessments": [
+                {"hypothesis": "电价存在日内结构。", "status": "candidate_support", "evidence": "解释 33.9% 方差。"}
+            ],
+            "checks": [{"name": "数据风险", "status": "warning", "message": "检测到 3 个风险。", "scope": "inherent"}],
+        },
+    }
+
+    card = ResultMessageWidget.from_payload(payload)
+    texts = [widget.text() for widget in card.findChildren(QLabel)]
+    body = " | ".join(texts)
+
+    assert "7 条判断全部得到明确结论" in body
+    assert sum(1 for text in texts if text.startswith("· ")) == ResultMessageWidget.MAXIMUM_FINDINGS
+    assert "发现 4" not in body and "发现 5" not in body
+    # Limitations, hypothesis verdicts and validity checks live in the package, not the card.
+    assert "缺少预测发布" not in body
+    assert "电价存在日内结构" not in body
+    assert "检测到 3 个风险" not in body
+    assert "报告含 6 张图表，2 条适用边界，1 条下一步建议" in body
+
+
+def test_result_card_names_open_items_only_when_a_decision_is_needed(qt_app: QApplication):
+    payload = {
+        "report_path": "run/report.md",
+        "artifact_directory": "run",
+        "figure_count": 2,
+        "evaluation": {
+            "decision": "need_user",
+            "summary": "需要你决定是否补充数据。",
+            "findings": [],
+            "warnings": [],
+            "suggested_followups": [],
+            "hypothesis_assessments": [],
+            "checks": [
+                {"name": "目标覆盖率", "status": "fail", "message": "覆盖率过低。", "scope": "needs_data"},
+                {"name": "数据风险", "status": "warning", "message": "可获得性限制。", "scope": "inherent"},
+            ],
+        },
+    }
+
+    body = " | ".join(widget.text() for widget in ResultMessageWidget.from_payload(payload).findChildren(QLabel))
+
+    assert "需要你决定：目标覆盖率" in body
+    # Inherent limitations are not decisions the user has to make.
+    assert "数据风险" not in body
+    assert "覆盖率过低" not in body
+
+
 def test_retiring_a_stale_plan_keeps_the_conversation_and_past_reports(
     desktop_study: Path, model_agent: ResearchCoordinator, tmp_path: Path
 ):
@@ -502,9 +778,9 @@ def test_retiring_a_stale_plan_keeps_the_conversation_and_past_reports(
     session = _session_with_plan(plan)
     session.messages.insert(0, SessionMessage(role="user", kind="text", content="负荷对电价影响有多大？"))
     session.messages.append(
-        SessionMessage(role="assistant", kind="result", content="已完成", payload={"report_path": "r/report.html"})
+        SessionMessage(role="assistant", kind="result", content="已完成", payload={"report_path": "r/report.md"})
     )
-    session.report_path = "r/report.html"
+    session.report_path = "r/report.md"
     store = SessionStore(tmp_path / "sessions.json")
     store.save([session])
 
@@ -512,7 +788,7 @@ def test_retiring_a_stale_plan_keeps_the_conversation_and_past_reports(
 
     assert [message.kind for message in restored.messages] == ["text", "notice", "result"]
     assert restored.messages[0].content == "负荷对电价影响有多大？"
-    assert restored.report_path == "r/report.html"
+    assert restored.report_path == "r/report.md"
 
 
 def test_old_session_plan_without_skill_and_tool_versions_is_invalidated(
@@ -719,12 +995,14 @@ def test_continuous_conversation_runs_plan_and_answers_followup(
         assert session.status == "awaiting_plan_approval"
         assert session.current_plan is not None
         assert workspace.conversation.current_plan_widget is not None
+        assert not workspace.conversation.current_plan_widget.reject_button.isHidden()
         assert not hasattr(workspace.conversation.current_plan_widget, "editor_toggle")
         assert all(
             not hasattr(row, "setChecked")
             for row in workspace.conversation.current_plan_widget.step_checks.values()
         )
-        assert "自动执行" in workspace.conversation.current_plan_widget.status_label.text()
+        assert "明确确认" in workspace.conversation.current_plan_widget.status_label.text()
+        assert not workspace._plan_feedback_timer.isActive()
         assert session.inputs["actuals"].variables
         assert all(event.status != "running" for event in session.trace)
 
@@ -772,6 +1050,61 @@ def test_continuous_conversation_runs_plan_and_answers_followup(
             window.close()
 
 
+def test_plan_reject_button_stops_without_running_research(
+    qt_app: QApplication,
+    desktop_study: Path,
+    model_agent: ResearchCoordinator,
+    tmp_path: Path,
+):
+    window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
+    select_desktop_data(window, desktop_study)
+    try:
+        workspace = window.workspace
+        workspace.submit_question("分析电价分布")
+        wait_until(qt_app, lambda: not workspace.is_busy)
+        widget = workspace.conversation.current_plan_widget
+        assert widget is not None
+
+        widget.reject_button.click()
+        wait_until(qt_app, lambda: not workspace.is_busy)
+
+        assert workspace.current_session.status == "stopped"
+        assert workspace.current_session.runs == []
+        assert widget.run_button.isHidden()
+    finally:
+        window.close()
+
+
+def test_repeated_assistant_text_projects_once_per_turn_by_message_id(
+    qt_app: QApplication,
+    model_agent: ResearchCoordinator,
+    tmp_path: Path,
+):
+    window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
+    try:
+        workspace = window.workspace
+        expected = "先检查时间轴和季节性，再选择具体 EDA 方法。"
+        for question in ("先解释研究方法", "请再解释一次"):
+            workspace.submit_question(question)
+            wait_until(qt_app, lambda: not workspace.is_busy)
+
+        replies = [
+            message
+            for message in workspace.current_session.messages
+            if message.role == "assistant" and message.kind == "text" and message.content == expected
+        ]
+        user_turns = [
+            message.turn_id
+            for message in workspace.current_session.messages
+            if message.role == "user" and message.kind == "text"
+        ]
+        assert len(replies) == 2
+        assert len({message.message_id for message in replies}) == 2
+        assert [message.turn_id for message in replies] == user_turns
+    finally:
+        window.close()
+
+
 def test_thinking_process_is_visible_and_survives_a_restart(
     qt_app: QApplication,
     desktop_study: Path,
@@ -795,6 +1128,7 @@ def test_thinking_process_is_visible_and_survives_a_restart(
         assert "解析问题" in stages and "生成方案" in stages
         assert titles[0] == "解析研究问题"
         assert titles == list(dict.fromkeys(titles))
+        assert not any(title in {"等待方案确认", "等待用户决策"} for title in titles)
         assert all(step["status"] != "running" for step in planning_card.payload["steps"])
 
         workspace.run_plan(workspace.conversation.current_plan_widget.approved_plan())
@@ -808,6 +1142,7 @@ def test_thinking_process_is_visible_and_survives_a_restart(
         assert all(step["title"].startswith("已完成 · ") for step in computed)
         assert all(step["function_name"] for step in computed)
         assert any(step["stage"] == "评估结果" for step in steps)
+        assert not any(step["title"] == "等待用户决策" for step in steps)
 
         window.close()
         restored = MainWindow(agent=model_agent, session_store=store)
@@ -861,9 +1196,16 @@ def test_run_trace_reads_as_a_professional_audit_log(
         assert not any(text.startswith("系统事件") for text in texts)
         assert set(stages) <= set(STAGE_LABELS.values())
 
-        # One function produces one "分析中" row and one "已完成" row, never a repeated title.
+        # Every loaded input stays visible; only duplicate lifecycle rows for the
+        # same completed function are collapsed.
         titles = [text.split(" — ")[0] for text in texts]
-        assert titles == list(dict.fromkeys(titles))
+        assert titles.count("载入数据文件") == 3
+        function_titles = [
+            title
+            for title in titles
+            if title.startswith(("分析中 · ", "已完成 · ", "已复用 · "))
+        ]
+        assert function_titles == list(dict.fromkeys(function_titles))
         running = {title.removeprefix("分析中 · ") for title in titles if title.startswith("分析中 · ")}
         finished = {title.removeprefix("已完成 · ") for title in titles if title.startswith("已完成 · ")}
         enabled = {step["title"] for step in workspace.current_session.current_plan["steps"] if step["enabled"]}
@@ -877,7 +1219,7 @@ def test_run_trace_reads_as_a_professional_audit_log(
 
         # The locked batch is named by the research stages it covers.
         locked = next(text for text in texts if text.startswith("锁定执行计划"))
-        assert "数据体检 1 项" in locked
+        assert "数据可用性核验 1 项" in locked
         assert locked.endswith(f"共 {len(enabled)} 项")
     finally:
         if window.isVisible():
@@ -952,6 +1294,17 @@ def test_replacing_input_invalidates_existing_plan(
         workspace.submit_question("分析电价与预测发电的关系")
         wait_until(qt_app, lambda: not workspace.is_busy)
         assert workspace.current_session.current_plan is not None
+        plan = workspace.current_session.current_plan
+        workspace.current_session.runs.append(
+            SessionRunRecord(
+                run_id="historical-run",
+                plan_id=plan["plan_id"],
+                question=plan["question"],
+                artifact_directory="historical",
+                report_path="historical/report.md",
+                data_fingerprint=plan["data_fingerprint"],
+            )
+        )
 
         replacement = tmp_path / "replacement" / "alternate_predictions.csv"
         replacement.parent.mkdir()
@@ -959,6 +1312,9 @@ def test_replacing_input_invalidates_existing_plan(
         workspace.set_input_file("forecasts", str(replacement))
         assert workspace.current_session.current_plan is None
         assert workspace.current_session.plan_stale
+        assert workspace.current_session.runs[0].memory_status == "stale"
+        imported = workspace._legacy_graph_import(workspace.current_session)
+        assert imported["episode_summaries"][0]["memory_status"] == "stale"
         assert workspace.current_session.messages[-1].kind == "notice"
     finally:
         window.close()
@@ -974,6 +1330,7 @@ def test_model_plan_auto_executes_after_feedback_window(
         agent=model_agent,
         session_store=SessionStore(tmp_path / "sessions.json"),
         plan_feedback_seconds=1,
+        auto_execute_plan=True,
     )
     select_desktop_data(window, desktop_study)
     try:
@@ -1033,6 +1390,7 @@ def test_expired_approval_restores_from_sqlite_and_requires_explicit_confirmatio
         agent=first_agent,
         session_store=store,
         plan_feedback_seconds=1,
+        auto_execute_plan=True,
     )
     select_desktop_data(first, desktop_study)
     session_id = first.workspace.current_session.session_id
@@ -1048,7 +1406,12 @@ def test_expired_approval_restores_from_sqlite_and_requires_explicit_confirmatio
         eda_subagent=model_agent.eda_subagent,
         checkpoint_path=checkpoint,
     )
-    restored = MainWindow(agent=restored_agent, session_store=store, plan_feedback_seconds=1)
+    restored = MainWindow(
+        agent=restored_agent,
+        session_store=store,
+        plan_feedback_seconds=1,
+        auto_execute_plan=True,
+    )
     try:
         restored.workspace.select_session(session_id)
         session = restored.workspace.current_session

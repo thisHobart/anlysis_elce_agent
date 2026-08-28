@@ -2,7 +2,7 @@
 name: price-exogenous-eda
 description: Build forecast-readiness evidence for electricity prices together with their exogenous drivers. Use when the question involves market-time alignment, price level and shape, spikes and negative prices, stationarity, seasonality, price memory, driver data quality, multicollinearity, contemporaneous or lagged price-driver relationships, nonlinear dependence, relationship stability, leakage risk, or which candidate features deserve a forecasting experiment.
 metadata:
-  version: "3.2.0"
+  version: "3.2.1"
   domain: eda
   protocol-file: references/research-protocol.yaml
 allowed-tools: data_quality price_descriptive_distribution price_rolling_mean_std price_tukey_outer_fence price_lag_autocorrelation price_calendar_group_profile price_stationarity_tests price_seasonal_decomposition price_partial_autocorrelation price_spike_regime_profile price_duration_curve price_segment_distribution_comparison exogenous_descriptive_distribution exogenous_iqr_outliers exogenous_linear_index_trend exogenous_pearson_collinearity exogenous_variance_inflation exogenous_stationarity_tests relationship_scipy_pearson_pairwise relationship_scipy_spearman_pairwise relationship_pearson_positive_lead_scan relationship_pearson_by_hour relationship_pearson_by_month relationship_feature_quartile_response relationship_mutual_information_scan relationship_granger_causality_scan relationship_rolling_correlation_stability relationship_pearson_segment_comparison price_variance_stabilization_check price_naive_baseline_benchmark
@@ -18,7 +18,7 @@ allowed-tools: data_quality price_descriptive_distribution price_rolling_mean_st
 
 - 写得出对应函数的才写。「碳配额成本可能传导到批发市场」这类猜想没有对应的确定性检验，不要列入。
 - 一条假设对应一个判据。不要把「电价有季节结构且负荷领先两小时」写成一条。
-- 只想确认数据能不能用时，可以不提任何假设，只做数据体检。
+- 只想确认数据能不能用时，可以不提任何假设，只做数据可用性核验。
 
 ## 跨阶段裁决
 
@@ -30,7 +30,7 @@ allowed-tools: data_quality price_descriptive_distribution price_rolling_mean_st
 - **依赖 > 线性缺失**：Pearson 接近 0 而 `nonlinearity_flagged` 为 true 时，结论写"存在非线性依赖"，不写"无关系"。
 - **样本量 > 扫描范围**：成对有效样本不足时缩小结论，不通过扩大 `max_lag` 或变量集来制造关系证据。
 
-## 数据门禁
+## 数据可用性核验
 
 `data_quality` 每个方案强制执行一次，从中读三件事：
 

@@ -11,7 +11,7 @@
 
 本项目面向电价研究场景，构建一个由大模型辅助、确定性统计工具负责计算、LangGraph 负责流程编排的研究型 Agent。用户用自然语言提出研究问题，Agent 结合数据画像推荐分析方案；用户可以确认或调整方案；系统随后调用受约束的统计函数执行分析，并对结果进行结构化评价、补充规划和可复现归档。
 
-项目的长期目标是从“电价与外生变量探索”逐步演进到“预测实验、新闻事件研究和跨域研究闭环”。当前版本聚焦第一阶段：先建立可靠的数据体检、关系分析、结果评价和研究留痕基础。
+项目的长期目标是从“电价与外生变量探索”逐步演进到“预测实验、新闻事件研究和跨域研究闭环”。当前版本聚焦第一阶段：先建立可靠的数据可用性核验、关系分析、结果评价和研究留痕基础。
 
 ### 1.2 当前阶段结论
 
@@ -24,7 +24,7 @@
 - 通过工具注册表、权限策略和确定性执行器调用本地统计函数，禁止模型直接执行任意 Python 或自由代码。
 - 方案审批、自然语言修订、逐函数执行、结果校验、确定性评估和有限自动修订。
 - 记录计划版本、数据指纹、工具版本、执行时间、结果哈希和运行轨迹。
-- 输出自包含 HTML 报告、Markdown 报告、SVG 图表和结构化 JSON/Parquet 研究包。
+- 输出桌面端可直接阅读的 Markdown 报告、SVG 图表和结构化 JSON/Parquet 研究包。
 - 使用 LangGraph checkpoint 支持审批、执行异常和结果交互后的恢复。
 
 当前仍属于 EDA 阶段，不包含正式预测模型训练、新闻事件抽取、因果识别和跨实验历史库。最近一次功能升级后，真实模型、真实数据和 Windows EXE 需要重新进行完整验收；仓库中的验收记录说明自动化回归曾达到 `142 passed`，但该数字应以升级后的最新复验结果为准。
@@ -66,7 +66,7 @@
 │ Compatible Endpoint     │  ┌──────────────────────────────┐
 │ Function Calling        │  │ Evaluation & Reporting         │
 │ Thinking 关闭           │  │ accept/revise/need_user/reject │
-└────────────────────────┘  │ HTML/Markdown/SVG/JSON/Parquet │
+└────────────────────────┘  │ Markdown/SVG/JSON/Parquet      │
                             └──────────────────────────────┘
 ```
 
@@ -96,7 +96,7 @@
 | 中间连续对话 | 用户问题、助手回复、方案卡、研究过程卡、结果卡和追问处于同一时间线 |
 | 右侧上下文 | 选择研究配置、目标电价、实际外生变量、预测外生变量，并查看数据状态和完整运行轨迹 |
 | 模型配置 | DeepSeek 官方接口、自定义 OpenAI 兼容接口、Base URL、API Key、模型名、超时、重试和历史消息数配置 |
-| 运行控制 | 方案确认、自然语言修改、30 秒反馈窗口、停止当前任务、结果追问和会话重启恢复 |
+| 运行控制 | 明确方案确认、自然语言讨论与修改、方案拒绝、停止当前任务、结果追问和会话重启恢复 |
 
 当前不再以 FastAPI、Nginx 或 Docker 作为项目运行入口，主要产品形态是本地桌面应用；原有服务端部署文件已从当前项目路径中移除。
 
@@ -108,8 +108,8 @@
 - `OpenAICompatibleGateway` 通过 `langchain-openai` 创建懒加载的 `ChatOpenAI` 客户端。
 - `factory.py` 为主 Agent 和 EDA Subagent 注入同一个模型网关，避免每个 Agent 各自维护连接。
 - 支持 DeepSeek 官方 Base URL 和自定义 OpenAI 兼容 Base URL。
-- 通过 `extra_body` 关闭 thinking，并对 `reasoning_content`、reasoning block 和 `<think>` 内容执行 fail-closed 检查。
-- 结构化计划固定使用 Function Calling；模型返回无效调用、空回复或非授权内容时，流程暂停并提示重试。
+- 通过 `extra_body` 关闭 thinking；端点拒绝该参数时自动去掉后重试，仍返回思考内容时按 `VPP_LLM_THINKING_POLICY` 丢弃（默认 `strip`）或 fail-closed（`reject`）。
+- 结构化输出优先使用 Function Calling，端点拒绝 `tool_choice` 或不支持函数调用时按 JSON Schema → JSON 模式 → 提示词 JSON 顺序降级；模型返回无效调用、空回复或非授权内容时，流程暂停并提示重试。
 
 当前 Agent 角色划分如下：
 
@@ -131,7 +131,7 @@ Skill 由 `SKILL.md` 和版本化 YAML 研究协议组成。协议固定阶段�
 `price-exogenous-eda` 当前的证据顺序为：
 
 1. 市场时钟与研究范围
-2. 数据体检
+2. 数据可用性核验
 3. 电价自身规律
 4. 外生变量质量
 5. 电价与外生变量关系证据
@@ -166,7 +166,7 @@ Skill 由 `SKILL.md` 和版本化 YAML 研究协议组成。协议固定阶段�
 
 | 类别 | 主要能力 |
 |---|---|
-| 数据体检 | 时间对齐、覆盖率、缺失、重复、数值有效性和可获得性风险 |
+| 数据可用性核验 | 时间对齐、覆盖率、缺失、重复、数值有效性和可获得性风险 |
 | 电价自身规律 | 分布、持续曲线、极端值、负价、尖峰状态、日历规律、滚动波动、平稳性、趋势季节分解、自相关、偏自相关、分段比较 |
 | 外生变量质量 | 分布、IQR 异常值、长期漂移、两两相关、VIF、驱动平稳性 |
 | 关系证据 | Pearson、Spearman、领先滞后、互信息、Granger 样本内前置性、分小时/月份、分位响应、滚动稳定性、分段比较 |
@@ -251,18 +251,20 @@ Session
 
 ```text
 agent-<timestamp>-<fingerprint>/
-├── report.html              # 自包含主报告，内联 SVG
-├── report.md                # Markdown 版本
+├── report.md                # 桌面内置阅读器展示的主报告
+├── methods.md               # 本轮方法、参数、判据、边界与证据位置
 ├── figures/*.svg            # 图表源文件
-├── conversation.json       # 对话记录
-├── research_plan.json      # 计划、Skill、协议、版本和参数
-├── execution_trace.json    # 函数执行时间和结果引用
-├── study_config.json       # 解析后的研究配置
-├── data_quality.json       # 数据质量证据
-├── eda_summary.json        # 完整结构化分析结果
-├── agent_evaluation.json   # 评估结论和反馈
-├── research_loop.json      # 循环上下文
-├── aligned_data.parquet   # 固定的对齐数据快照
+├── evidence/
+│   ├── data_quality.json    # 数据质量证据
+│   ├── eda_summary.json     # 完整结构化分析结果
+│   └── agent_evaluation.json # 评估结论和反馈
+├── provenance/
+│   ├── conversation.json    # 对话记录
+│   ├── research_plan.json   # 计划、Skill、协议、版本和参数
+│   ├── execution_trace.json # 函数执行时间和结果引用
+│   ├── research_loop.json   # 循环上下文
+│   └── study_context.json   # 自动识别的数据与时间轴上下文
+├── data/aligned_data.parquet # 固定的对齐数据快照
 └── manifest.json           # 输入/输出哈希、Git 和运行环境
 ```
 
@@ -280,7 +282,7 @@ agent-<timestamp>-<fingerprint>/
 | [`app/research/tools`](../app/research/tools) | 工具契约、注册表、策略、执行器和 EDA 原子函数 |
 | [`app/research/data`](../app/research/data) | 数据加载、时间对齐、质量检查、快照和输入指纹 |
 | [`app/research/evaluation`](../app/research/evaluation) | EDA 证据评价、假设判断、反馈和下一步建议 |
-| [`app/research/reporting`](../app/research/reporting) | HTML/Markdown 报告、SVG 图表、研究包和 manifest |
+| [`app/research/reporting`](../app/research/reporting) | Markdown 报告、SVG 图表、研究包和 manifest |
 | [`app/research/schemas`](../app/research/schemas) | 研究配置、数据质量、反馈和结果的 Pydantic 契约 |
 | [`configs/research`](../configs/research) | 可复现研究配置样例 |
 | [`tests`](../tests) | 数据层、统计工具、Agent、Graph、桌面和模型网关测试 |
@@ -335,7 +337,7 @@ agent-<timestamp>-<fingerprint>/
 
 ### 6.2 近期应优先处理的问题
 
-1. **完成升级后的真实验收**：覆盖两个内置 Skill、真实模型、真实数据、桌面重启恢复、HTML 报告和 EXE。
+1. **完成升级后的真实验收**：覆盖两个内置 Skill、真实模型、真实数据、桌面重启恢复、内置报告阅读器和 EXE。
 2. **统一 LLM 开关语义**：当前配置仍保留 `VPP_LLM_ENABLED`，但模型网关的可用性主要由 Base URL 和模型名判断；后续应统一确认启用开关、界面状态和运行时判断。
 3. **完善元数据校验**：市场、单位、预测发布时间、可获得性和目标定义应在进入预测阶段前变成显式门禁。
 4. **分离测试替身与真实验收**：自动化测试证明边界和确定性逻辑，真实模型验收证明 Function Calling、模型兼容性和桌面体验，两者需要分别维护。
@@ -351,8 +353,8 @@ agent-<timestamp>-<fingerprint>/
 
 - 完成真实模型 + 真实数据的两个 Skill 端到端验收。
 - 验证模型配置、thinking 关闭、Function Calling 和失败提示。
-- 验证桌面会话恢复、30 秒审批、停止、删除会话和结果追问。
-- 验证 30 个函数的代表性场景、报告 HTML 排版和 SVG 图表。
+- 验证桌面会话恢复、显式审批、停止、删除会话和结果追问。
+- 验证 30 个函数的代表性场景、Markdown 报告排版和 SVG 图表。
 - 验证 onedir EXE，再验证 onefile EXE；确认内置 Skill 和用户目录可写。
 - 补齐市场、单位和可获得性元数据示例。
 
@@ -435,12 +437,6 @@ agent-<timestamp>-<fingerprint>/
 python -m venv venv
 .\venv\Scripts\python.exe -m pip install -e ".[dev]"
 .\venv\Scripts\python.exe -m app.desktop
-```
-
-确定性命令行回归入口：
-
-```powershell
-.\venv\Scripts\python.exe -m app.research.cli --config configs/research/price_exogenous_eda.yaml
 ```
 
 ### 9.2 检查与测试

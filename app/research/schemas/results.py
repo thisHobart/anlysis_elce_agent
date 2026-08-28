@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -75,17 +74,3 @@ class DataQualityReport(BaseModel):
     series: dict[str, SeriesQualityReport]
     alignment: AlignmentQualityReport
     issues: list[QualityIssue] = Field(default_factory=list)
-
-
-class PipelineRunResult(BaseModel):
-    """Public return value for one completed EDA pipeline run."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    run_id: str
-    status: Literal["completed"] = "completed"
-    artifact_directory: Path
-    report_path: Path
-    aligned_rows: int
-    quality_report: DataQualityReport
-    eda_summary: dict[str, Any]

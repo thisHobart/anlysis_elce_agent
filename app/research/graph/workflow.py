@@ -8,6 +8,7 @@ from typing import Any, Literal
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
+from app.research.agent.context import MAX_EPISODE_SUMMARIES, MAX_PERSISTED_CONVERSATION_MESSAGES
 from app.research.agent.errors import (
     DataFingerprintMismatchError,
     InsufficientDataError,
@@ -15,6 +16,7 @@ from app.research.agent.errors import (
     RepairablePlanError,
     ResearchModelUnavailableError,
     ResearchPlanValidationError,
+    SkillVersionMismatchError,
 )
 from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
 from app.research.agent.schemas import ConversationMessage, EDAPlan
@@ -24,6 +26,8 @@ from app.research.data.loader import ResearchDataError
 from app.research.graph.contracts import (
     ApprovalState,
     AuthorizationEnvelope,
+    EpisodeSummary,
+    InterruptKind,
     InterruptPayload,
     LoopBudget,
     LoopCursor,
@@ -40,10 +44,11 @@ from app.research.graph.guards import (
     validate_automatic_revision,
 )
 from app.research.graph.state import ResearchLoopState
+from app.research.graph.tool_result_store import ToolResultStore
 from app.research.reporting.loop_history import write_loop_record
 from app.research.schemas.feedback import FeedbackPacket
+from app.research.schemas.results import DataQualityReport
 from app.research.schemas.study import StudyConfig
-from app.research.skills.contracts import SkillDefinition
 from app.research.skills.loader import SkillLoadError
 from app.research.skills.registry import SkillRegistry
 from app.research.tools.catalog import FUNCTION_CATALOG, FUNCTION_CATALOG_VERSION
@@ -56,9 +61,9 @@ MAX_TOOL_RESULT_CACHE = 64
 MAX_STATE_EVENTS = 160
 MAX_ACTIVE_FEEDBACK = 24
 MAX_FEEDBACK_HISTORY = 128
-MAX_GRAPH_MESSAGES = 80
+MAX_GRAPH_MESSAGES = MAX_PERSISTED_CONVERSATION_MESSAGES
 MAX_RUN_HISTORY = 48
-MAX_EPISODE_HISTORY = 48
+MAX_EPISODE_HISTORY = MAX_EPISODE_SUMMARIES
 
 
 def _now() -> str:
@@ -91,19 +96,6 @@ def _compact_event_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
-def _tool_result_reference(result: ToolResult) -> dict[str, Any]:
-    return {
-        "call_id": result.call.call_id,
-        "work_id": result.call.work_id,
-        "result_key": result.output.result_key,
-        "output_hash": result.output_hash,
-        "data_fingerprint": result.data_fingerprint,
-        "started_at": result.started_at,
-        "finished_at": result.finished_at,
-        "duration_ms": result.duration_ms,
-    }
-
-
 def _event(
     state: ResearchLoopState,
     name: str,
@@ -132,6 +124,24 @@ def _messages(state: ResearchLoopState) -> list[ConversationMessage]:
     return [ConversationMessage.model_validate(item) for item in state.get("messages", [])]
 
 
+def _conversation_message(
+    *,
+    role: Literal["user", "assistant", "system"],
+    content: str,
+    message_id: str | None = None,
+    turn_id: str | None = None,
+    episode_id: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"role": role, "content": content}
+    if message_id:
+        payload["message_id"] = message_id
+    if turn_id:
+        payload["turn_id"] = turn_id
+    if episode_id:
+        payload["episode_id"] = episode_id
+    return ConversationMessage.model_validate(payload).model_dump(mode="json")
+
+
 def _config(state: ResearchLoopState) -> StudyConfig | None:
     value = state.get("study_config")
     return StudyConfig.model_validate(value) if value is not None else None
@@ -140,6 +150,26 @@ def _config(state: ResearchLoopState) -> StudyConfig | None:
 def _plan(state: ResearchLoopState) -> EDAPlan | None:
     value = state.get("current_plan")
     return EDAPlan.model_validate(value) if value is not None else None
+
+
+def _current_data_fingerprint(state: ResearchLoopState) -> str | None:
+    plan = state.get("current_plan") or {}
+    value = plan.get("data_fingerprint")
+    return str(value) if value else None
+
+
+def _scoped_episode_summaries(state: ResearchLoopState) -> list[dict[str, Any]]:
+    """Return only evidence proven against the currently active data snapshot."""
+
+    fingerprint = _current_data_fingerprint(state)
+    if not fingerprint:
+        return []
+    return [
+        item
+        for item in state.get("episode_summaries", [])
+        if item.get("memory_status", "active") == "active"
+        and item.get("data_fingerprint") == fingerprint
+    ]
 
 
 def _feedback(state: ResearchLoopState) -> list[FeedbackPacket]:
@@ -207,6 +237,71 @@ def _cursor(state: ResearchLoopState) -> LoopCursor:
     return LoopCursor.model_validate(state.get("loop_cursor", {}))
 
 
+def _episode_summary(
+    state: ResearchLoopState,
+    *,
+    cursor: LoopCursor | None = None,
+    latest_run: dict[str, Any] | None = None,
+    evaluation: dict[str, Any] | None = None,
+    status: str | None = None,
+) -> EpisodeSummary | None:
+    current = cursor or _cursor(state)
+    if not current.episode_id:
+        return None
+    latest = latest_run if latest_run is not None else state.get("latest_run") or {}
+    assessment = evaluation if evaluation is not None else state.get("evaluation") or {}
+    plan = state.get("current_plan") or {}
+    config = _config(state)
+    decision = assessment.get("decision")
+    resolved_status = status or current.episode_status
+    if status is None:
+        resolved_status = {
+            "accept": "accepted",
+            "need_user": "limited",
+            "reject": "rejected",
+        }.get(decision, resolved_status)
+    return EpisodeSummary(
+        episode_id=current.episode_id,
+        episode_number=max(1, current.episode_number),
+        goal=current.episode_goal or str(state.get("user_request") or ""),
+        status=resolved_status,
+        run_id=latest.get("run_id"),
+        plan_id=latest.get("plan_id") or (state.get("current_plan") or {}).get("plan_id"),
+        evaluation_decision=decision,
+        summary=str(assessment.get("summary") or ""),
+        findings=[str(item) for item in assessment.get("findings", [])[:8]],
+        warnings=[str(item) for item in assessment.get("warnings", [])[:8]],
+        report_path=latest.get("report_path"),
+        figure_count=len(latest.get("figure_paths") or {}),
+        figure_keys=[str(key) for key in (latest.get("figure_paths") or {})],
+        data_fingerprint=plan.get("data_fingerprint"),
+        study_name=config.study.name if config is not None else None,
+        target_name=config.target.name if config is not None else None,
+        study_start_time=(
+            config.study.start_time.isoformat()
+            if config is not None and config.study.start_time is not None
+            else None
+        ),
+        study_end_time=(
+            config.study.end_time.isoformat()
+            if config is not None and config.study.end_time is not None
+            else None
+        ),
+        skill_name=plan.get("skill_name"),
+        skill_version=plan.get("skill_version"),
+    )
+
+
+def _upsert_episode_summary(
+    existing: list[dict[str, Any]],
+    summary: EpisodeSummary | None,
+) -> list[dict[str, Any]]:
+    if summary is None:
+        return existing[-MAX_EPISODE_SUMMARIES:]
+    retained = [item for item in existing if item.get("episode_id") != summary.episode_id]
+    return [*retained, summary.model_dump(mode="json")][-MAX_EPISODE_SUMMARIES:]
+
+
 def _planning_interrupt_kind(state: ResearchLoopState) -> str:
     if state.get("plan_origin") == "automatic_evaluation" and state.get("latest_run"):
         return "result_limitations"
@@ -245,6 +340,63 @@ def _invalid_resume_feedback(state: ResearchLoopState, response: ResumePayload, 
     return _append_feedback(state, packet)
 
 
+def _interrupt_payload(
+    state: ResearchLoopState,
+    *,
+    kind: InterruptKind,
+    **values: Any,
+) -> InterruptPayload:
+    events = state.get("events", [])
+    revision = max(
+        (int(item["sequence"]) for item in events if isinstance(item.get("sequence"), int)),
+        default=0,
+    )
+    cursor = _cursor(state)
+    interrupt_id = canonical_hash(
+        {
+            "thread_id": state.get("thread_id"),
+            "kind": kind,
+            "episode_id": cursor.episode_id,
+            "iteration_id": cursor.iteration_id,
+            "stage": cursor.stage,
+            "plan_id": (state.get("current_plan") or {}).get("plan_id"),
+            "run_id": (state.get("latest_run") or {}).get("run_id"),
+            "revision": revision,
+        }
+    )
+    return InterruptPayload(
+        kind=kind,
+        interrupt_id=interrupt_id,
+        state_revision=revision,
+        **values,
+    )
+
+
+def _resume_identity_matches(response: ResumePayload, payload: InterruptPayload) -> bool:
+    return bool(
+        (response.interrupt_id is None or response.interrupt_id == payload.interrupt_id)
+        and (response.state_revision is None or response.state_revision == payload.state_revision)
+    )
+
+
+def _stale_resume_feedback(
+    state: ResearchLoopState,
+    response: ResumePayload,
+    payload: InterruptPayload,
+) -> list[dict[str, Any]]:
+    packet = FeedbackPacket(
+        source="user",
+        code="stale_interrupt_action",
+        severity="error",
+        message="当前操作来自已经失效的交互状态。",
+        observed={"interrupt_id": response.interrupt_id, "state_revision": response.state_revision},
+        expected={"interrupt_id": payload.interrupt_id, "state_revision": payload.state_revision},
+        recommendation="请使用当前界面中的最新方案或操作。",
+        requires_user=True,
+    )
+    return _append_feedback(state, packet)
+
+
 def build_research_workflow(
     *,
     main_agent: MainResearchAgent,
@@ -253,20 +405,92 @@ def build_research_workflow(
     skills: SkillRegistry,
     tools: ToolRegistry,
     checkpointer: Any,
+    result_store: ToolResultStore,
 ):
     """Compile the only workflow used by desktop research sessions."""
+
+    def skill_version_feedback(state: ResearchLoopState) -> FeedbackPacket | None:
+        plan = _plan(state)
+        skill_value = state.get("active_skill") or {}
+        skill_name = plan.skill_name if plan is not None else str(skill_value.get("name") or "")
+        locked_version = plan.skill_version if plan is not None else str(skill_value.get("version") or "")
+        if not skill_name or not locked_version:
+            return None
+        try:
+            installed_version = skills.get(skill_name).version
+        except Exception:  # noqa: BLE001 - missing Skills use the existing validator path
+            return None
+        if installed_version == locked_version:
+            return None
+        return FeedbackPacket(
+            source="skill_validator",
+            code="session_skill_version_mismatch",
+            severity="error",
+            message=(
+                f"当前对话使用研究协议 {skill_name}@{locked_version}，"
+                f"应用当前版本为 {installed_version}。请新建对话重新分析；此前报告仍可查看。"
+            ),
+            observed={"skill": skill_name, "session_version": locked_version},
+            expected={"installed_version": installed_version},
+            recommendation="新建对话并重新提交研究问题；不要在旧 checkpoint 上迁移或继续执行方案。",
+            requires_user=True,
+        )
+
+    def _blocking_feedback(packets: list[dict[str, Any]]) -> FeedbackPacket | None:
+        for item in reversed(packets):
+            packet = FeedbackPacket.model_validate(item)
+            if packet.severity in {"error", "fatal"}:
+                return packet
+        return None
+
+    def progress_stall_code(state: ResearchLoopState) -> str | None:
+        if (
+            state.get("plan_origin") != "automatic_evaluation"
+            or (state.get("evaluation") or {}).get("decision") != "revise"
+        ):
+            return None
+        cycle_id = state.get("revision_cycle_id")
+        records = [
+            item
+            for item in state.get("progress_records", [])
+            if item.get("revision_cycle_id") == cycle_id and item.get("evaluation_completed")
+        ]
+        if len(records) < 2:
+            return None
+        current = records[-1]
+        previous = records[:-1]
+        current_agenda = current.get("agenda_fingerprint")
+        if current_agenda and current_agenda in {
+            item.get("agenda_fingerprint") for item in previous
+        }:
+            return "no_agenda_progress"
+        current_evidence = current.get("evidence_fingerprint")
+        if current_evidence in {item.get("evidence_fingerprint") for item in previous}:
+            return "no_new_evidence"
+        return None
 
     def ingest_user(state: ResearchLoopState) -> dict[str, Any]:
         message = state.get("pending_user_message", "").strip()
         messages = list(state.get("messages", []))
+        turn_id = state.get("pending_turn_id")
         if message:
-            messages.append(ConversationMessage(role="user", content=message).model_dump(mode="json"))
+            messages.append(
+                _conversation_message(
+                    role="user",
+                    content=message,
+                    message_id=state.get("pending_message_id"),
+                    turn_id=turn_id,
+                )
+            )
         return {
             "phase": "understanding",
             "control": "understand",
             "user_interrupt_kind": None,
             "latest_turn": message or _latest_turn(state),
+            "active_turn_id": turn_id or state.get("active_turn_id"),
             "pending_user_message": "",
+            "pending_message_id": None,
+            "pending_turn_id": None,
             "messages": messages[-MAX_GRAPH_MESSAGES:],
             "events": _event(
                 state,
@@ -278,6 +502,20 @@ def build_research_workflow(
         }
 
     def understand(state: ResearchLoopState) -> dict[str, Any]:
+        if packet := skill_version_feedback(state):
+            return {
+                "phase": "awaiting_user",
+                "control": "need_user",
+                "feedback_packets": _append_feedback(state, packet),
+                "stop_reason": packet.message,
+                "user_interrupt_kind": "plan_error",
+                "events": _event(
+                    state,
+                    f"旧会话版本不兼容：{_short(packet.message, 44)}",
+                    "failed",
+                    trace_category="error",
+                ),
+            }
         try:
             decision, _ = main_agent.decide(
                 question=_latest_turn(state),
@@ -290,11 +528,31 @@ def build_research_workflow(
                 evaluation=state.get("evaluation"),
                 history=_messages(state),
                 available_skills=skills.metadata(),
+                episode_summaries=_scoped_episode_summaries(state),
+                active_gate=state.get("user_interrupt_kind") or state.get("return_to_gate"),
+                episode_goal=_episode_goal(state),
+                latest_run=state.get("latest_run"),
             )
+            active_gate = state.get("user_interrupt_kind") or state.get("return_to_gate")
+            if (
+                decision.intent == "execute_plan"
+                and active_gate in {"result_limitations", "result_rejected"}
+                and state.get("latest_run")
+            ):
+                decision = DialogueDecision(
+                    intent="discussion",
+                    response=(
+                        "当前方案已经执行并完成评估；原样重跑不会处理现有限制。"
+                        "请修改方案以补充所需证据，或明确接受当前结果及限制。"
+                    ),
+                )
         except Exception as exc:  # noqa: BLE001 - converted into structured loop feedback
             packet = exception_feedback(exc, source="plan_validator", requires_user=True)
             return {
                 "phase": "awaiting_user",
+                # Route straight to the pause: without a decision the reply node
+                # would only add a second, misleading schema error.
+                "control": "need_user",
                 "feedback_packets": _append_feedback(state, packet),
                 "stop_reason": packet.message,
                 "user_interrupt_kind": _planning_interrupt_kind(state),
@@ -306,7 +564,7 @@ def build_research_workflow(
                     error=packet.message,
                 ),
             }
-        return {
+        update = {
             "phase": "planning" if decision.intent in {"new_plan", "revise_plan"} else "understanding",
             "control": decision.intent if decision.intent != "discussion" else "reply",
             "decision": decision.model_dump(mode="json"),
@@ -317,6 +575,9 @@ def build_research_workflow(
                 response=_short(decision.response),
             ),
         }
+        if decision.intent == "revise_plan":
+            update["revision_cycle_id"] = state.get("active_turn_id") or state.get("revision_cycle_id")
+        return update
 
     def route_main(state: ResearchLoopState) -> Literal["new_plan", "revise_plan", "execute_plan", "reply", "need_user"]:
         control = state.get("control", "reply")
@@ -371,7 +632,10 @@ def build_research_workflow(
                 f"{protocol.protocol_id}@{protocol.version}"
             )
         return {
-            "active_skill": skill.model_dump(mode="json"),
+            # The registry is the authority for Skill content.  Persisting the
+            # whole prompt/protocol in every checkpoint needlessly duplicated
+            # a large immutable object.
+            "active_skill": {"name": skill.name, "version": skill.version},
             "phase": "planning",
             "control": "plan",
             "plan_origin": "initial",
@@ -416,6 +680,12 @@ def build_research_workflow(
                 plan=plan,
                 config=config,
                 decision=decision,
+                previous_evaluation=state.get("evaluation"),
+                quality_report=(
+                    DataQualityReport.model_validate(state["quality_report"])
+                    if state.get("quality_report")
+                    else None
+                ),
             )
         except Exception as exc:  # noqa: BLE001 - converted into structured loop feedback
             packet = exception_feedback(exc, source="plan_validator", retryable=True)
@@ -424,18 +694,30 @@ def build_research_workflow(
                 "control": "retry",
                 "feedback_packets": _append_feedback(state, packet),
                 "plan_origin": "user_revision",
+                "stop_reason": packet.message,
                 "user_interrupt_kind": None,
             }
         return {
             "current_plan": revised.model_dump(mode="json"),
             "plan_history": [*state.get("plan_history", []), revised.model_dump(mode="json")],
             "plan_fingerprints": [*state.get("plan_fingerprints", []), plan_fingerprint(revised)],
+            "feedback_history": _archive_feedback(state),
+            "feedback_packets": [],
+            "evaluation": None,
             "plan_origin": "user_revision",
+            "return_to_gate": None,
             "phase": "validating_plan",
             "control": "validate",
+            "stop_reason": None,
+            "user_interrupt_kind": None,
             "messages": [
                 *state.get("messages", []),
-                ConversationMessage(role="assistant", content=assistant_message).model_dump(mode="json"),
+                _conversation_message(
+                    role="assistant",
+                    content=assistant_message,
+                    turn_id=state.get("active_turn_id"),
+                    episode_id=_cursor(state).episode_id,
+                ),
             ][-MAX_GRAPH_MESSAGES:],
             "events": _event(
                 state,
@@ -480,7 +762,30 @@ def build_research_workflow(
                 "loop_cursor": cursor.model_dump(mode="json"),
                 "budget": budget.model_dump(mode="json"),
             }
-        skill = SkillDefinition.model_validate(skill_value)
+        if packet := skill_version_feedback(state):
+            return {
+                "phase": "awaiting_user",
+                "control": "need_user",
+                "feedback_packets": _append_feedback(state, packet),
+                "stop_reason": packet.message,
+                "user_interrupt_kind": "plan_error",
+                "loop_cursor": cursor.model_dump(mode="json"),
+                "budget": budget.model_dump(mode="json"),
+            }
+        try:
+            skill = skills.get(str(skill_value.get("name") or ""))
+            if skill.version != skill_value.get("version"):
+                raise SkillLoadError("当前 Skill 版本与 checkpoint 中锁定的版本不一致，请重新生成方案。")
+        except Exception as exc:  # noqa: BLE001 - converted into structured feedback
+            packet = exception_feedback(exc, source="skill_validator", requires_user=True)
+            return {
+                "phase": "awaiting_user",
+                "control": "need_user",
+                "feedback_packets": _append_feedback(state, packet),
+                "user_interrupt_kind": "plan_error",
+                "loop_cursor": cursor.model_dump(mode="json"),
+                "budget": budget.model_dump(mode="json"),
+            }
         feedback = _feedback(state)
         origin = state.get("plan_origin", "initial")
         try:
@@ -492,6 +797,7 @@ def build_research_workflow(
                     feedback=feedback,
                     authorization_envelope=state.get("authorization_envelope"),
                     conversation=_messages(state),
+                    episode_summaries=_scoped_episode_summaries(state),
                     source="automatic_evaluation",
                     progress=noop_progress,
                 )
@@ -500,6 +806,10 @@ def build_research_workflow(
                     question=_episode_goal(state),
                     study_config=config,
                     conversation=_messages(state),
+                    # The planning service computes the new study fingerprint
+                    # before retrieval, so it can safely select matching memory
+                    # even though begin_episode has cleared current_plan.
+                    episode_summaries=state.get("episode_summaries", []),
                     progress=noop_progress,
                     skill=skill,
                     feedback=feedback,
@@ -569,6 +879,7 @@ def build_research_workflow(
             "plan_history": [*state.get("plan_history", []), proposal.plan.model_dump(mode="json")],
             "plan_fingerprints": [*state.get("plan_fingerprints", []), fingerprint],
             "budget": budget.model_dump(mode="json"),
+            "stop_reason": None,
             "events": _event(
                 state,
                 f"生成候选方案：{proposal.plan.plan_id} · {_short(proposal.plan.objective, 42)}",
@@ -599,6 +910,14 @@ def build_research_workflow(
                 "feedback_packets": _append_feedback(state, packet),
                 "user_interrupt_kind": _planning_interrupt_kind(state),
             }
+        if packet := skill_version_feedback(state):
+            return {
+                "phase": "awaiting_user",
+                "control": "need_user",
+                "feedback_packets": _append_feedback(state, packet),
+                "stop_reason": packet.message,
+                "user_interrupt_kind": "plan_error",
+            }
         try:
             execution.prepare(plan=plan, study_config=config)
         except Exception as exc:  # noqa: BLE001 - validator boundary
@@ -612,12 +931,19 @@ def build_research_workflow(
                     ResearchDataError,
                 ),
             )
-            packet = exception_feedback(
-                exc,
-                source="plan_validator",
-                retryable=retryable,
-                requires_user=requires_user,
-            )
+            if isinstance(exc, SkillVersionMismatchError):
+                packet = skill_version_feedback(state) or exception_feedback(
+                    exc,
+                    source="skill_validator",
+                    requires_user=True,
+                )
+            else:
+                packet = exception_feedback(
+                    exc,
+                    source="plan_validator",
+                    retryable=retryable,
+                    requires_user=requires_user,
+                )
             budget = _budget(state)
             if (
                 retryable
@@ -670,6 +996,10 @@ def build_research_workflow(
     def begin_episode(state: ResearchLoopState) -> dict[str, Any]:
         previous = _cursor(state)
         history = list(state.get("episode_history", []))
+        episode_summaries = _upsert_episode_summary(
+            list(state.get("episode_summaries", [])),
+            _episode_summary(state, cursor=previous),
+        )
         if previous.episode_id and not any(item.get("episode_id") == previous.episode_id for item in history):
             history.append(
                 {
@@ -690,13 +1020,16 @@ def build_research_workflow(
             "user_request": cursor.episode_goal,
             "explanation_request": "",
             "loop_cursor": cursor.model_dump(mode="json"),
+            "revision_cycle_id": cursor.episode_id,
             "episode_history": history,
+            "episode_summaries": episode_summaries,
             "active_skill": None,
             "current_plan": None,
             "plan_history": [],
             "plan_fingerprints": [],
             "planning_failure_fingerprints": [],
             "plan_origin": "initial",
+            "return_to_gate": None,
             "authorization_envelope": None,
             "approval_state": ApprovalState().model_dump(mode="json"),
             "tool_queue": [],
@@ -733,17 +1066,21 @@ def build_research_workflow(
     def prepare_approval(state: ResearchLoopState) -> dict[str, Any]:
         plan = _plan(state)
         timeout = int(state.get("approval_timeout_seconds", 30))
+        automatic_approval_enabled = bool(state.get("automatic_approval_enabled", False))
         approval = ApprovalState(
             status="waiting",
             plan_id=plan.plan_id if plan else None,
             plan_fingerprint=plan_fingerprint(plan) if plan else None,
-            deadline=(datetime.now(UTC) + timedelta(seconds=timeout)).isoformat(),
-            remaining_seconds=timeout,
+            deadline=(datetime.now(UTC) + timedelta(seconds=timeout)).isoformat()
+            if automatic_approval_enabled
+            else None,
+            remaining_seconds=timeout if automatic_approval_enabled else None,
             origin="user_revision" if state.get("plan_origin") == "user_revision" else "initial",
         )
         return {
             "phase": "awaiting_approval",
             "control": "interrupt",
+            "return_to_gate": None,
             "loop_cursor": _cursor(state).model_copy(
                 update={"episode_status": "awaiting_approval", "stage": "approval_gate"}
             ).model_dump(mode="json"),
@@ -753,22 +1090,34 @@ def build_research_workflow(
                 f"等待审批：{approval.plan_id or 'unknown'}",
                 trace_category="plan",
                 deadline=approval.deadline,
+                automatic=automatic_approval_enabled,
             ),
         }
 
     def approval_interrupt(state: ResearchLoopState) -> dict[str, Any]:
         approval = ApprovalState.model_validate(state["approval_state"])
-        payload = InterruptPayload(
+        payload = _interrupt_payload(
+            state,
             kind="plan_approval",
             phase="awaiting_approval",
-            message="请确认、修改或拒绝当前研究方案。",
-            choices=["approve", "modify", "reject"],
+            message="请确认、拒绝，或继续询问和修改当前研究方案。",
+            choices=["approve", "modify", "reject", "followup"],
             plan=state.get("current_plan"),
             deadline=approval.deadline,
             remaining_seconds=approval.remaining_seconds,
         )
         response = ResumePayload.model_validate(interrupt(payload.model_dump(mode="json")))
-        automatic_timeout = response.action == "timeout_accept" and response.automatic_timeout
+        if not _resume_identity_matches(response, payload):
+            return {
+                "phase": "awaiting_approval",
+                "control": "reinterrupt",
+                "feedback_packets": _stale_resume_feedback(state, response, payload),
+            }
+        automatic_timeout = (
+            response.action == "timeout_accept"
+            and response.automatic_timeout
+            and bool(state.get("automatic_approval_enabled", False))
+        )
         if response.action not in payload.choices and not automatic_timeout:
             return {
                 "phase": "awaiting_approval",
@@ -810,7 +1159,40 @@ def build_research_workflow(
             approval.status = "approved"
             approval.decision = response.action
             approval.approved_at = _now()
-            update = {"phase": "validating_plan", "control": "lock"}
+            update = {"phase": "validating_plan", "control": "lock", "return_to_gate": None}
+        elif response.action == "followup":
+            message = response.message.strip()
+            if not message:
+                packet = FeedbackPacket(
+                    source="user",
+                    code="empty_plan_followup",
+                    severity="error",
+                    message="方案讨论消息不能为空。",
+                    recommendation="请输入问题或修改意见，或使用方案卡上的明确操作。",
+                    requires_user=True,
+                )
+                return {
+                    "phase": "awaiting_approval",
+                    "control": "reinterrupt",
+                    "feedback_packets": _append_feedback(state, packet),
+                }
+            update = {
+                "phase": "understanding",
+                "control": "discuss",
+                "latest_turn": message,
+                "active_turn_id": response.turn_id or state.get("active_turn_id"),
+                "return_to_gate": "plan_approval",
+                "messages": [
+                    *state.get("messages", []),
+                    _conversation_message(
+                        role="user",
+                        content=message,
+                        message_id=response.message_id,
+                        turn_id=response.turn_id,
+                        episode_id=_cursor(state).episode_id,
+                    ),
+                ][-MAX_GRAPH_MESSAGES:],
+            }
         elif response.action == "modify":
             approval.status = "none"
             approval.decision = "modify"
@@ -822,16 +1204,29 @@ def build_research_workflow(
                 "phase": "understanding",
                 "control": "modify",
                 "latest_turn": message,
+                "active_turn_id": response.turn_id or state.get("active_turn_id"),
                 "plan_origin": "user_revision",
+                "return_to_gate": None,
                 "messages": [
                     *state.get("messages", []),
-                    ConversationMessage(role="user", content=message).model_dump(mode="json"),
+                    _conversation_message(
+                        role="user",
+                        content=message,
+                        message_id=response.message_id,
+                        turn_id=response.turn_id,
+                        episode_id=_cursor(state).episode_id,
+                    ),
                 ][-MAX_GRAPH_MESSAGES:],
             }
         else:
             approval.status = "rejected"
             approval.decision = "reject"
-            update = {"phase": "stopped", "control": "stop", "stop_reason": "用户拒绝执行当前方案。"}
+            update = {
+                "phase": "stopped",
+                "control": "stop",
+                "return_to_gate": None,
+                "stop_reason": "用户拒绝执行当前方案。",
+            }
         update["approval_state"] = approval.model_dump(mode="json")
         update["events"] = _event(
             state,
@@ -841,9 +1236,9 @@ def build_research_workflow(
         )
         return update
 
-    def route_approval(state: ResearchLoopState) -> Literal["lock", "modify", "stop", "reinterrupt"]:
+    def route_approval(state: ResearchLoopState) -> Literal["lock", "modify", "discuss", "stop", "reinterrupt"]:
         control = state.get("control", "reinterrupt")
-        return control if control in {"lock", "modify", "stop"} else "reinterrupt"  # type: ignore[return-value]
+        return control if control in {"lock", "modify", "discuss", "stop"} else "reinterrupt"  # type: ignore[return-value]
 
     def lock_plan(state: ResearchLoopState) -> dict[str, Any]:
         try:
@@ -894,11 +1289,10 @@ def build_research_workflow(
                 record = ToolCallRecord(call=call_payload)
                 cached_payload = result_cache.get(call.work_id)
                 if cached_payload is not None:
-                    cached = ToolResult.model_validate(cached_payload)
-                    rebound = cached.model_copy(update={"call": call})
+                    rebound = result_store.get(state["thread_id"], cached_payload, call=call)
                     execution.validate_tool_result(plan=plan, call=call, result=rebound)
                     record.status = "reused"
-                    record.result = _tool_result_reference(rebound)
+                    record.result = result_store.bind(state["thread_id"], cached_payload, call)
                     record.finished_at = _now()
                 records[call.call_id] = record.model_dump(mode="json")
         except Exception as exc:  # noqa: BLE001 - authorization/queue boundary
@@ -953,7 +1347,7 @@ def build_research_workflow(
         records = dict(state.get("tool_records", {}))
         record = ToolCallRecord.model_validate(records[call.call_id])
         if record.status in {"completed", "reused"} and record.result is not None:
-            result_payload = next(
+            result_reference = next(
                 (
                     item
                     for item in state.get("tool_results", [])
@@ -961,17 +1355,17 @@ def build_research_workflow(
                 ),
                 None,
             )
-            if result_payload is None:
-                cached_payload = state.get("tool_result_cache", {}).get(call.work_id)
-                if cached_payload is None:
+            if result_reference is None:
+                result_reference = state.get("tool_result_cache", {}).get(call.work_id)
+                if result_reference is None:
                     raise ResearchPlanValidationError(f"复用函数 {call.name} 缺少缓存结果")
-                cached = ToolResult.model_validate(cached_payload)
-                result_payload = cached.model_copy(update={"call": call}).model_dump(mode="json")
+            rebound_reference = result_store.bind(state["thread_id"], result_reference, call)
             record.status = "reused"
+            record.result = rebound_reference
             records[call.call_id] = record.model_dump(mode="json")
             results = list(state.get("tool_results", []))
             if not any(item["call"]["call_id"] == call.call_id for item in results):
-                results.append(result_payload)
+                results.append(rebound_reference)
             return {
                 "tool_records": records,
                 "tool_results": results,
@@ -1188,12 +1582,13 @@ def build_research_workflow(
         records = dict(state.get("tool_records", {}))
         record = ToolCallRecord.model_validate(records[call.call_id])
         record.status = "completed"
-        record.result = _tool_result_reference(result)
+        result_reference = result_store.put(state["thread_id"], result)
+        record.result = result_reference
         record.finished_at = _now()
         records[call.call_id] = record.model_dump(mode="json")
         result_cache = dict(state.get("tool_result_cache", {}))
         result_cache.pop(call.work_id, None)
-        result_cache[call.work_id] = result.model_dump(mode="json")
+        result_cache[call.work_id] = result_reference
         while len(result_cache) > MAX_TOOL_RESULT_CACHE:
             result_cache.pop(next(iter(result_cache)))
         return {
@@ -1201,7 +1596,7 @@ def build_research_workflow(
             "control": "advance",
             "tool_records": records,
             "tool_result_cache": result_cache,
-            "tool_results": [*state.get("tool_results", []), result.model_dump(mode="json")],
+            "tool_results": [*state.get("tool_results", []), result_reference],
             "pending_tool_result": None,
             "events": _event(
                 state,
@@ -1268,15 +1663,31 @@ def build_research_workflow(
         config = _config(state)
         if plan is None or config is None:
             raise ResearchPlanValidationError("评估前缺少计划或配置")
+        evaluating_cursor = _cursor(state).model_copy(
+            update={"episode_status": "evaluating", "stage": "evaluation", "terminal_reason": None}
+        )
+        run_identity = canonical_hash(
+            {
+                "thread_id": state["thread_id"],
+                "episode_id": evaluating_cursor.episode_id,
+                "iteration_id": evaluating_cursor.iteration_id,
+                "plan": plan_fingerprint(plan),
+            }
+        )
+        resolved_tool_results = [
+            result_store.get(state["thread_id"], item)
+            for item in state.get("tool_results", [])
+        ]
         run = execution.finalize(
             plan=plan,
             study_config=config,
-            tool_results=[ToolResult.model_validate(item) for item in state.get("tool_results", [])],
+            tool_results=resolved_tool_results,
             conversation=_messages(state),
+            run_id=f"agent-loop-{run_identity[:32]}",
             progress=noop_progress,
             loop_context={
                 "thread_id": state["thread_id"],
-                "episode": _cursor(state).model_dump(mode="json"),
+                "episode": evaluating_cursor.model_dump(mode="json"),
                 "research_iteration": _budget(state).evaluated_iterations + 1,
                 "plan_history": [item.get("plan_id") for item in state.get("plan_history", [])],
                 "feedback_packets": state.get("feedback_packets", []),
@@ -1298,8 +1709,6 @@ def build_research_workflow(
             "report_path": str(run.report_path),
             "figure_paths": {key: str(value) for key, value in run.figure_paths.items()},
             "evaluation": evaluation_payload,
-            "eda_summary": run.eda_summary,
-            "quality_report": run.quality_report.model_dump(mode="json"),
         }
         history_entry = {
             "run_id": run.run_id,
@@ -1307,6 +1716,27 @@ def build_research_workflow(
             "artifact_directory": str(run.artifact_directory),
             "report_path": str(run.report_path),
             "evaluation_decision": run.evaluation.decision,
+        }
+        episode_summaries = _upsert_episode_summary(
+            list(state.get("episode_summaries", [])),
+            _episode_summary(
+                state,
+                cursor=evaluating_cursor,
+                latest_run=latest,
+                evaluation=evaluation_payload,
+            ),
+        )
+        progress_record = {
+            "episode_id": evaluating_cursor.episode_id,
+            "revision_cycle_id": state.get("revision_cycle_id") or evaluating_cursor.episode_id,
+            "iteration_id": evaluating_cursor.iteration_id,
+            "plan_id": plan.plan_id,
+            "plan_revision": plan.revision,
+            "plan_fingerprint": plan_fingerprint(plan),
+            "agenda_fingerprint": agenda_fingerprint,
+            "evidence_fingerprint": evidence_hash,
+            "evaluation_decision": run.evaluation.decision,
+            "evaluation_completed": True,
         }
         return {
             "phase": "evaluating",
@@ -1318,12 +1748,14 @@ def build_research_workflow(
             "eda_summary": run.eda_summary,
             "latest_run": latest,
             "run_history": [*state.get("run_history", []), history_entry][-MAX_RUN_HISTORY:],
+            "episode_summaries": episode_summaries,
             "evidence_fingerprints": [*state.get("evidence_fingerprints", []), evidence_hash],
             "agenda_fingerprints": (
                 [*state.get("agenda_fingerprints", []), agenda_fingerprint]
                 if agenda_fingerprint
                 else list(state.get("agenda_fingerprints", []))
             ),
+            "progress_records": [*state.get("progress_records", []), progress_record][-64:],
             "budget": budget.model_dump(mode="json"),
             "events": _event(
                 state,
@@ -1373,12 +1805,10 @@ def build_research_workflow(
             return decision  # type: ignore[return-value]
         if decision != "revise":
             return "invalid"
-        evidence = state.get("evidence_fingerprints", [])
-        agenda_fingerprints = state.get("agenda_fingerprints", [])
-        agenda_fingerprint = (state.get("evaluation") or {}).get("agenda_fingerprint")
-        if agenda_fingerprint and agenda_fingerprint in agenda_fingerprints[:-1]:
+        if progress_stall_code(state) is not None:
             return "need_user"
-        if not agenda_fingerprint and evidence and evidence[-1] in evidence[:-1]:
+        budget = _budget(state)
+        if budget.evaluated_iterations >= budget.max_evaluated_iterations:
             return "need_user"
         return "revise"
 
@@ -1469,11 +1899,10 @@ def build_research_workflow(
 
     def prepare_need_user(state: ResearchLoopState) -> dict[str, Any]:
         packets = list(state.get("feedback_packets", []))
-        evidence = state.get("evidence_fingerprints", [])
-        agenda_fingerprints = state.get("agenda_fingerprints", [])
-        agenda_fingerprint = (state.get("evaluation") or {}).get("agenda_fingerprint")
-        stop_reason = state.get("stop_reason")
-        if agenda_fingerprint and agenda_fingerprint in agenda_fingerprints[:-1]:
+        blocking = _blocking_feedback(packets)
+        stop_reason = blocking.message if blocking is not None else state.get("stop_reason")
+        stall_code = progress_stall_code(state) if blocking is None and not stop_reason else None
+        if stall_code == "no_agenda_progress":
             packet = budget_feedback(
                 _budget(state),
                 code="no_agenda_progress",
@@ -1481,7 +1910,7 @@ def build_research_workflow(
             )
             packets = _append_feedback({**state, "feedback_packets": packets}, packet)
             stop_reason = packet.message
-        elif evidence and evidence[-1] in evidence[:-1]:
+        elif stall_code == "no_new_evidence":
             packet = budget_feedback(
                 _budget(state),
                 code="no_new_evidence",
@@ -1489,7 +1918,18 @@ def build_research_workflow(
             )
             packets = _append_feedback({**state, "feedback_packets": packets}, packet)
             stop_reason = packet.message
-        elif state.get("evaluation"):
+        elif not stop_reason and (
+            (state.get("evaluation") or {}).get("decision") == "revise"
+            and _budget(state).evaluated_iterations >= _budget(state).max_evaluated_iterations
+        ):
+            packet = budget_feedback(
+                _budget(state),
+                code="safety_iteration_limit",
+                message="自动研究触发安全熔断；议程尚未在安全范围内收敛，请用户处理当前限制。",
+            )
+            packets = _append_feedback({**state, "feedback_packets": packets}, packet)
+            stop_reason = packet.message
+        elif state.get("evaluation") and not stop_reason:
             evaluation_summary = str((state.get("evaluation") or {}).get("summary") or "议程仍有需要用户处理的项目。")
             packet = budget_feedback(
                 _budget(state),
@@ -1498,7 +1938,7 @@ def build_research_workflow(
             )
             packets = _append_feedback({**state, "feedback_packets": packets}, packet)
             stop_reason = evaluation_summary
-        interrupt_kind = state.get("user_interrupt_kind")
+        interrupt_kind = state.get("user_interrupt_kind") or state.get("return_to_gate")
         if interrupt_kind not in {"plan_error", "result_limitations"}:
             interrupt_kind = "result_limitations" if state.get("latest_run") else "plan_error"
         cursor = _cursor(state).model_copy(
@@ -1516,11 +1956,26 @@ def build_research_workflow(
             "user_interrupt_kind": interrupt_kind,
             "loop_cursor": cursor.model_dump(mode="json"),
         }
-        record = write_loop_record(
-            thread_id=state["thread_id"],
-            state=projected,
-            outcome="need_user",
-        )
+        record: str | None = None
+        audit_error: str | None = None
+        try:
+            record = str(
+                write_loop_record(
+                    thread_id=state["thread_id"],
+                    state=projected,
+                    outcome="need_user",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - audit must not suppress the human gate
+            audit_error = f"{type(exc).__name__}: {exc}"
+            packet = FeedbackPacket(
+                source="evaluator",
+                code="loop_audit_write_failed",
+                severity="warning",
+                message=f"研究循环审计记录写入失败：{audit_error}",
+                recommendation="用户交互状态仍然有效；请检查应用数据目录的写入权限。",
+            )
+            packets = _append_feedback({**state, "feedback_packets": packets}, packet)
         return {
             "phase": "awaiting_user",
             "control": "interrupt",
@@ -1528,12 +1983,17 @@ def build_research_workflow(
             "stop_reason": stop_reason,
             "user_interrupt_kind": interrupt_kind,
             "loop_cursor": cursor.model_dump(mode="json"),
-            "loop_records": [*state.get("loop_records", []), str(record)],
+            "loop_records": (
+                [*state.get("loop_records", []), record]
+                if record is not None
+                else list(state.get("loop_records", []))
+            ),
             "events": _event(
                 state,
                 f"等待用户处理：{interrupt_kind} · {_short(stop_reason or '需要用户决策', 42)}",
                 trace_category="evaluation" if interrupt_kind == "result_limitations" else "error",
                 feedback_count=len(packets),
+                audit_error=audit_error,
             ),
         }
 
@@ -1566,12 +2026,17 @@ def build_research_workflow(
             execution.evict_prepared(_plan(state))
         except Exception:  # noqa: BLE001 - terminal cleanup is best effort
             execution.evict_prepared()
+        episode_summaries = _upsert_episode_summary(
+            list(state.get("episode_summaries", [])),
+            _episode_summary(state, cursor=cursor, status="stopped"),
+        )
         return {
             "phase": "stopped",
             "control": "stop",
             "stop_reason": stop_reason,
             "loop_cursor": cursor.model_dump(mode="json"),
             "loop_records": records,
+            "episode_summaries": episode_summaries,
             "events": _event(
                 state,
                 f"保存停止结果：{_short(stop_reason, 44)}",
@@ -1606,12 +2071,17 @@ def build_research_workflow(
             execution.evict_prepared(_plan(state))
         except Exception:  # noqa: BLE001 - terminal cleanup is best effort
             execution.evict_prepared()
+        episode_summaries = _upsert_episode_summary(
+            list(state.get("episode_summaries", [])),
+            _episode_summary(state, cursor=cursor, status="failed"),
+        )
         return {
             "phase": "failed",
             "control": "failed",
             "stop_reason": reason,
             "loop_cursor": cursor.model_dump(mode="json"),
             "loop_records": records,
+            "episode_summaries": episode_summaries,
             "events": _event(
                 state,
                 f"保存失败状态：{_short(reason, 44)}",
@@ -1639,6 +2109,10 @@ def build_research_workflow(
                 evaluation=state.get("evaluation"),
                 history=_messages(state),
                 available_skills=skills.metadata(),
+                episode_summaries=_scoped_episode_summaries(state),
+                active_gate=state.get("user_interrupt_kind") or state.get("return_to_gate"),
+                episode_goal=_episode_goal(state),
+                latest_run=state.get("latest_run"),
             )
             answer = decision.response.strip()
             if not answer:
@@ -1659,8 +2133,9 @@ def build_research_workflow(
                     trace_category="error",
                 ),
             }
+        return_to_approval = state.get("return_to_gate") == "plan_approval"
         return {
-            "phase": "awaiting_user",
+            "phase": "awaiting_approval" if return_to_approval else "awaiting_user",
             "control": "result",
             "loop_cursor": _cursor(state).model_copy(
                 update={
@@ -1673,7 +2148,12 @@ def build_research_workflow(
             "assistant_message": answer,
             "messages": [
                 *state.get("messages", []),
-                ConversationMessage(role="assistant", content=answer).model_dump(mode="json"),
+                _conversation_message(
+                    role="assistant",
+                    content=answer,
+                    turn_id=state.get("active_turn_id"),
+                    episode_id=_cursor(state).episode_id,
+                ),
             ][-MAX_GRAPH_MESSAGES:],
             "events": _event(
                 state,
@@ -1703,13 +2183,19 @@ def build_research_workflow(
                     trace_category="error",
                 ),
             }
+        return_to_approval = state.get("return_to_gate") == "plan_approval"
         return {
-            "phase": "awaiting_user",
+            "phase": "awaiting_approval" if return_to_approval else "awaiting_user",
             "control": "result",
             "assistant_message": answer,
             "messages": [
                 *state.get("messages", []),
-                ConversationMessage(role="assistant", content=answer).model_dump(mode="json"),
+                _conversation_message(
+                    role="assistant",
+                    content=answer,
+                    turn_id=state.get("active_turn_id"),
+                    episode_id=_cursor(state).episode_id,
+                ),
             ][-MAX_GRAPH_MESSAGES:],
             "events": _event(
                 state,
@@ -1718,11 +2204,23 @@ def build_research_workflow(
             ),
         }
 
-    def route_response(state: ResearchLoopState) -> Literal["result", "error"]:
-        return "error" if state.get("control") == "error" else "result"
+    def route_response(state: ResearchLoopState) -> Literal["result", "approval", "error"]:
+        if state.get("control") == "error":
+            return "error"
+        if state.get("return_to_gate") == "plan_approval":
+            return "approval"
+        if state.get("return_to_gate") in {
+            "plan_error",
+            "result_limitations",
+            "result_rejected",
+            "response_error",
+            "finalization_error",
+        }:
+            return "error"
+        return "result"
 
     def user_interrupt(state: ResearchLoopState) -> dict[str, Any]:
-        interrupt_kind = state.get("user_interrupt_kind")
+        interrupt_kind = state.get("user_interrupt_kind") or state.get("return_to_gate")
         if interrupt_kind not in {
             "plan_error",
             "result_limitations",
@@ -1735,7 +2233,14 @@ def build_research_workflow(
         is_response_error = interrupt_kind == "response_error"
         is_finalization_error = interrupt_kind == "finalization_error"
         is_rejected = interrupt_kind == "result_rejected"
-        if is_finalization_error:
+        is_version_mismatch = any(
+            item.get("code") == "session_skill_version_mismatch"
+            for item in state.get("feedback_packets", [])
+        )
+        if is_version_mismatch:
+            message = state.get("stop_reason") or "当前对话与已安装研究协议版本不兼容，请新建对话。"
+            choices = ["stop"]
+        elif is_finalization_error:
             message = state.get("stop_reason") or "最终证据合并或报告生成失败；工具结果仍保留。"
             choices = ["retry", "stop"]
         elif is_response_error:
@@ -1749,11 +2254,12 @@ def build_research_workflow(
                 "当前最佳结果需要用户决策。" if has_result else "尚未生成可执行研究方案。"
             )
             choices = (
-                ["accept_limitations", "modify", "stop"]
+                ["modify", "followup", "stop"]
                 if has_result
                 else ["retry", "modify", "clarify", "stop"]
             )
-        payload = InterruptPayload(
+        payload = _interrupt_payload(
+            state,
             kind=interrupt_kind,
             phase="awaiting_user",
             message=message,
@@ -1763,6 +2269,12 @@ def build_research_workflow(
             result=state.get("latest_run") if has_result else None,
         )
         response = ResumePayload.model_validate(interrupt(payload.model_dump(mode="json")))
+        if not _resume_identity_matches(response, payload):
+            return {
+                "phase": "awaiting_user",
+                "control": "reinterrupt",
+                "feedback_packets": _stale_resume_feedback(state, response, payload),
+            }
         if response.action not in payload.choices:
             return {
                 "phase": "awaiting_user",
@@ -1786,14 +2298,6 @@ def build_research_workflow(
             return {
                 "phase": "evaluating" if state.get("latest_run") else "understanding",
                 "control": "explain" if state.get("latest_run") else "continue",
-                "stop_reason": None,
-                "user_interrupt_kind": None,
-            }
-        if has_result and response.action == "accept_limitations":
-            return {
-                "phase": "evaluating",
-                "control": "explain",
-                "explanation_request": "请总结当前最佳结果和限制。",
                 "stop_reason": None,
                 "user_interrupt_kind": None,
             }
@@ -1821,13 +2325,23 @@ def build_research_workflow(
             return {
                 "phase": "understanding",
                 "control": "continue",
+                "return_to_gate": interrupt_kind,
                 "latest_turn": message,
+                "active_turn_id": response.turn_id or state.get("active_turn_id"),
                 "explanation_request": "",
-                "stop_reason": None,
+                # A conversational follow-up does not resolve the pending
+                # evaluation. Keep its reason for the gate shown after reply.
+                "stop_reason": state.get("stop_reason"),
                 "user_interrupt_kind": None,
                 "messages": [
                     *state.get("messages", []),
-                    ConversationMessage(role="user", content=message).model_dump(mode="json"),
+                    _conversation_message(
+                        role="user",
+                        content=message,
+                        message_id=response.message_id,
+                        turn_id=response.turn_id,
+                        episode_id=_cursor(state).episode_id,
+                    ),
                 ][-MAX_GRAPH_MESSAGES:],
             }
         # Stopping out of an error interrupt must keep the cause in the terminal record.
@@ -1836,7 +2350,8 @@ def build_research_workflow(
         return {"phase": "stopped", "control": "stop", "stop_reason": reason}
 
     def result_interrupt(state: ResearchLoopState) -> dict[str, Any]:
-        payload = InterruptPayload(
+        payload = _interrupt_payload(
+            state,
             kind="result",
             phase="awaiting_user",
             message=state.get("assistant_message") or "研究结果已就绪。",
@@ -1846,6 +2361,12 @@ def build_research_workflow(
             result=state.get("latest_run"),
         )
         response = ResumePayload.model_validate(interrupt(payload.model_dump(mode="json")))
+        if not _resume_identity_matches(response, payload):
+            return {
+                "phase": "awaiting_user",
+                "control": "reinterrupt",
+                "feedback_packets": _stale_resume_feedback(state, response, payload),
+            }
         if response.action not in payload.choices:
             return {
                 "phase": "awaiting_user",
@@ -1864,10 +2385,17 @@ def build_research_workflow(
                 "phase": "understanding",
                 "control": "continue",
                 "latest_turn": message,
+                "active_turn_id": response.turn_id or state.get("active_turn_id"),
                 "explanation_request": "",
                 "messages": [
                     *state.get("messages", []),
-                    ConversationMessage(role="user", content=message).model_dump(mode="json"),
+                    _conversation_message(
+                        role="user",
+                        content=message,
+                        message_id=response.message_id,
+                        turn_id=response.turn_id,
+                        episode_id=_cursor(state).episode_id,
+                    ),
                 ][-MAX_GRAPH_MESSAGES:],
                 "plan_origin": "initial" if response.action == "next_round" else state.get("plan_origin", "initial"),
             }
@@ -1952,6 +2480,7 @@ def build_research_workflow(
         {
             "lock": "lock_plan",
             "modify": "main_agent",
+            "discuss": "main_agent",
             "stop": "persist_stop",
             "reinterrupt": "approval_interrupt",
         },
@@ -2028,12 +2557,12 @@ def build_research_workflow(
     graph.add_conditional_edges(
         "reply",
         route_response,
-        {"result": "result_interrupt", "error": "user_interrupt"},
+        {"result": "result_interrupt", "approval": "approval_interrupt", "error": "user_interrupt"},
     )
     graph.add_conditional_edges(
         "explain_result",
         route_response,
-        {"result": "result_interrupt", "error": "user_interrupt"},
+        {"result": "result_interrupt", "approval": "approval_interrupt", "error": "user_interrupt"},
     )
     graph.add_conditional_edges(
         "result_interrupt",

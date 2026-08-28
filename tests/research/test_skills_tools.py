@@ -27,12 +27,12 @@ def test_builtin_eda_skill_is_discoverable_and_versioned():
     skill = registry.get("price-exogenous-eda")
 
     assert skill.source == "builtin"
-    assert skill.version == "3.2.0"
+    assert skill.version == "3.2.1"
     assert skill.domain == "eda"
     assert set(skill.allowed_functions) == set(FUNCTION_CATALOG)
     assert skill.research_protocol is not None
     assert skill.research_protocol.protocol_id == "electricity-price-evidence-ladder"
-    assert skill.research_protocol.version == "2.2.0"
+    assert skill.research_protocol.version == "2.2.1"
     assert set(skill.research_protocol.function_order) == set(FUNCTION_CATALOG)
 
 
@@ -83,7 +83,7 @@ def test_builtin_domain_protocol_orders_model_calls_locally(synthetic_study: Pat
         "relationship_pearson_positive_lead_scan",
     ]
     assert plan.research_protocol_id == "electricity-price-evidence-ladder"
-    assert plan.research_protocol_version == "2.2.0"
+    assert plan.research_protocol_version == "2.2.1"
     assert plan.research_protocol_function_order == list(skill.research_protocol.function_order)
     assert any("请求参数禁用 thinking" in note for note in plan.planning_notes)
 

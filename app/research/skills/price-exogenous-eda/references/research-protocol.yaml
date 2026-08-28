@@ -1,8 +1,8 @@
 protocol_id: electricity-price-evidence-ladder
-version: "2.2.0"
+version: "2.2.1"
 kind: domain-evidence-ladder
 objective: >-
-  判定候选驱动变量能否进入电价预测特征集：按市场时钟、数据门禁、目标结构、驱动质量、
+  判定候选驱动变量能否进入电价预测特征集：按市场时钟、数据可用性、目标结构、驱动质量、
   关系稳定性、可预测性六层推进，每个变量最终归入可进入算法实验、仅可描述、
   存在泄漏风险或证据不足之一。
 invariants:
@@ -32,7 +32,7 @@ stages:
     exit_gate: 关键字段已知或被明确记录为限制；不得用默认常识替代具体市场规则。
 
   - stage_id: data_readiness
-    title: 数据质量与可获得性门禁
+    title: 数据质量与可获得性核验
     objective: 确认目标样本量足以支撑时序结论，并为每个变量定出可获得性资格。
     functions:
       - data_quality

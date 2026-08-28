@@ -49,7 +49,7 @@ ResearchStage = Literal[
 FUNCTION_CATALOG_VERSION = "eda-functions-v5"
 
 STAGE_TITLES: dict[str, str] = {
-    "data_readiness": "数据体检",
+    "data_readiness": "数据可用性核验",
     "target_structure": "电价自身规律",
     "driver_readiness": "影响因素质量",
     "relationship_evidence": "电价与因素的关系",
@@ -509,21 +509,6 @@ def function_metadata() -> dict[str, tuple[str, str]]:
 
 def optional_function_names() -> tuple[str, ...]:
     return tuple(name for name in FUNCTION_CATALOG if name != "data_quality")
-
-
-def functions_using_variables() -> frozenset[str]:
-    return frozenset(name for name, spec in FUNCTION_CATALOG.items() if spec.uses_variables)
-
-
-def functions_using_max_lag() -> frozenset[str]:
-    return frozenset(name for name, spec in FUNCTION_CATALOG.items() if spec.uses_max_lag)
-
-
-def stage_of(function_name: str) -> ResearchStage:
-    """Return the research stage a function belongs to, for grouping in UI and reports."""
-
-    spec = FUNCTION_CATALOG.get(function_name)
-    return spec.stage if spec is not None else "target_structure"
 
 
 def expand_legacy_function_permissions(names: list[str]) -> list[str]:

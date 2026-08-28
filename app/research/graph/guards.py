@@ -12,6 +12,7 @@ from app.research.agent.errors import (
     InsufficientDataError,
     PlanCompatibilityError,
     RepairablePlanError,
+    SkillVersionMismatchError,
 )
 from app.research.agent.schemas import EDAPlan
 from app.research.data.loader import ResearchDataError
@@ -174,7 +175,7 @@ def budget_feedback(budget: LoopBudget, *, code: str, message: str) -> FeedbackP
         severity="warning",
         message=message,
         observed=budget.model_dump(mode="json"),
-        recommendation="请用户接受当前限制、修改输入或停止。",
+        recommendation="请用户说明下一步研究要求，或结束本轮研究。",
         retryable=False,
         requires_user=True,
     )
@@ -195,6 +196,8 @@ def exception_feedback(
         recommendation = "输入内容已变化，请基于新数据重新生成并审批方案。"
     elif isinstance(exc, InsufficientDataError):
         recommendation = "请补充目标数据、扩大有效研究窗口或降低配置中的最低覆盖门槛后重新开始。"
+    elif isinstance(exc, SkillVersionMismatchError):
+        recommendation = "当前对话基于旧版研究协议；请新建对话重新分析，旧报告仍可查看。"
     elif isinstance(exc, PlanCompatibilityError):
         recommendation = "请使用当前 Skill 与函数版本重新生成并审批方案。"
     elif isinstance(exc, RepairablePlanError):

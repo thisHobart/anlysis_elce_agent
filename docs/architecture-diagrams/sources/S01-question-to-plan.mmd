@@ -1,0 +1,27 @@
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant UI as M01 桌面交互
+    participant APP as M02 应用协调
+    participant G as M03 ResearchLoopGraph
+    participant DP as M04 决策、Skill 与计划
+    participant DT as M05 数据与执行
+    participant LLM as 外部模型端点
+
+    U->>UI: 提交研究问题和数据文件
+    UI->>APP: submit_user_message(session_id, message, StudyConfig)
+    APP->>G: invoke(initial state)
+    G->>DP: 判断对话意图
+    DP->>LLM: 有界上下文 + DialogueDecision schema
+    LLM-->>DP: new_plan + skill_name
+    DP-->>G: DialogueDecision
+    G->>DT: 准备数据画像、质量报告和指纹
+    DT-->>G: profile + quality + fingerprint
+    G->>DP: 基于 Skill 生成并编译计划
+    DP->>LLM: 允许的函数 schema + 研究协议
+    LLM-->>DP: EDAPlanDraft
+    DP-->>G: 经本地校验的 EDAPlan
+    G-->>APP: plan_approval interrupt
+    APP-->>UI: ResearchLoopSnapshot
+    UI-->>U: 展示待审批方案卡
+

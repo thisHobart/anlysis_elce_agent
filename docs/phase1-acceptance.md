@@ -8,12 +8,13 @@
 |---|---|
 | 研究函数从 18 个扩展到 30 个（新增平稳性、趋势季节分解、偏自相关、尖峰状态、持续曲线、方差稳定、朴素基线、VIF、驱动平稳性、互信息、Granger 前置性、滚动稳定性） | 计划、执行、评估和报告全部涉及；新增 statsmodels 运行依赖 |
 | 内置 Skill 从 1 个变为 2 个；`price-exogenous-eda` 升到 `3.2.0`，协议升到 `electricity-price-evidence-ladder@2.2.0`；新增 `price-forecastability-audit@1.2.0` | 旧方案的 Skill/协议版本不再匹配，必须重新规划 |
-| Agent 主报告从 `report.md` 改为自包含 `report.html`，图表从 matplotlib PNG 改为内联 SVG | 产物清单、`report_path` 与"查看完整报告"入口变化 |
+| 主报告统一为 `report.md`，桌面端新增内置 Markdown/SVG 阅读器 | 产物清单、`report_path` 与“查看完整报告”入口变化 |
+| 研究包按复核动作分为 `evidence/`、`provenance/`、`data/`，新增自动生成的 `methods.md`；删除旧 CLI 聚合报告链 | 产物路径、方法说明、manifest 和桌面报告验收变化 |
 | 对话中新增可展开的研究过程卡；循环事件统一经 `narration.py` 翻译为用户语言 | 桌面时间线、会话投影与运行记录展示变化 |
 | 桌面文案整体改写为面向非开发用户的表述 | 界面文本断言与用户验收话术变化 |
 | PyInstaller 现在打包 `app/research/skills/` 下全部内置 Skill，并显式收集 statsmodels 数据 | EXE 体积与内置资源清单变化 |
 
-自动化回归当前为 **`173 passed`**，覆盖持久化恢复、审批真实性、非法 action、异常终态、单次执行快照、跨修订结果复用、A→B→A 收敛、分段比较、Iteration 上限、Episode 隔离、旧 schema 隔离、事件有界化、用户目录、真实函数时间场景，以及 30 函数全量执行、结构诊断逐项断言、叙述层翻译、双 Skill 发现、HTML 报告章节与 SVG 产物、研究过程可见性、三类数据文件直入和重启恢复。
+自动化回归当前为 **`184 passed`**，覆盖持久化恢复、审批真实性、非法 action、异常终态、单次执行快照、跨修订结果复用、A→B→A 收敛、修订议程重建、混合维度分段比较、Iteration 上限、Episode 隔离、旧 schema 隔离、事件有界化、用户目录、真实函数时间场景，以及 30 函数全量执行、结构诊断逐项断言、叙述层翻译、双 Skill 发现、Markdown/SVG 报告、研究过程可见性、分层研究包、方法与证据映射、三类数据文件直入和重启恢复。
 
 自动测试替身只用于边界回归，不作为真实 Agent 完成证明。
 
@@ -32,7 +33,7 @@ $env:QT_QPA_PLATFORM="offscreen"
 
 1. 两个内置 Skill 都能被模型选中，并各自跑通一次真实数据研究。
 2. 研究过程卡在执行期间实时增长，结束后折叠，重启后可展开回看。
-3. `report.html` 在浏览器中排版正常、图表清晰、可打印为 PDF。
+3. `report.md` 在桌面内置阅读器中排版正常，SVG 图表随窗口缩放且可打开外部文件。
 4. 单文件 EXE 启动后能加载两个内置 Skill，并完成一次含平稳性与朴素基线的分析。
 
 ## 完成条件证据
@@ -45,18 +46,18 @@ $env:QT_QPA_PLATFORM="offscreen"
 | 领域研究协议 | 本地 `electricity-price-evidence-ladder@2.2.0` 与 `price-forecastability-ladder@1.2.0`；计划和 manifest 记录协议版本，编译器按协议排序 |
 | 研究函数覆盖度 | 30 个原子函数按五个阶段分组，全量执行回归通过 |
 | 统计实现可信 | ADF/KPSS/MSTL/PACF/Ljung-Box 直接调用 statsmodels，不自行重写 |
-| 分段比较 | 峰谷、季节和时间范围通过单次 `segments` 调用进入同一 summary 与确定性评估 |
+| 分段比较 | 峰谷、季节和时间范围通过单次 `segments` 调用进入同一 summary；小时、月份、时间范围只在各自维度内生成差值 |
 | 审批真实性 | 方案 ID、方案指纹和审批时间共同生成 authorization envelope；模型意图不可绕过审批 |
 | 自动修订边界 | 研究问题、步骤数、全部函数参数、变量、滞后和分段定义均 fail-closed |
 | 结果复用 | `call_id` 保留执行溯源，`work_id` 支持同数据同函数同参数的跨修订复用 |
-| 路由状态 | `control` 是唯一下一跳信号；`phase` 只服务桌面展示；Graph schema 为 8，旧 SQLite 状态先备份再重建 |
+| 路由状态 | `control` 是唯一下一跳信号；`phase` 只服务桌面展示；Graph schema 为 11，旧 SQLite 状态保持只读并提示新建对话 |
 | 外部 Skill | `skills/`、`VPP_SKILL_PATHS`、外部 Skill 集成测试；外部脚本不执行 |
 | Skill 工具权限 | Function Schema 取 Skill 许可交集；编译器和 `ToolPolicy` 双重拒绝越权 |
-| 完整计划契约 | `research_plan.json` 保存 Skill、原子函数、变量、参数和版本 |
-| 30 秒反馈 | 前台 deadline 到达后才允许内部超时 resume；SQLite 重启发现过期时必须明确确认 |
+| 完整计划契约 | `provenance/research_plan.json` 保存 Skill、原子函数、变量、参数和版本 |
+| 显式审批 | 默认无操作不执行；宿主显式启用自动模式时，deadline 到达后才允许内部超时 resume |
 | 受控函数执行 | `ToolRegistry → ToolPolicy → ToolExecutor`；执行轨迹记录 provider、版本和真实起止时间 |
-| 可见的研究过程 | `narration.py` 只翻译已发生事件；模型 thinking 全程禁用且不落库 |
-| 报告可读性 | 自包含 `report.html` + 内联 SVG + 折叠技术细节；`report.md` 与 `figures/*.svg` 同时保留 |
+| 可见的研究过程 | `narration.py` 只翻译已发生事件；请求参数禁用模型 thinking，残留思考内容被网关丢弃且不落库 |
+| 报告可读性 | 桌面内置 `report.md` 阅读器 + SVG；报告按“图 → 读图 → 关键数字”组织证据，方法、阈值、假设验收与有效性核验集中在 `methods.md` |
 | LangGraph 编排 | 单一持久化 Graph 包含 Skill、规划、interrupt 审批、逐函数执行、校验、评估回流和结果 interrupt |
 | Loop 分层 | Session → Episode → Iteration → stage attempt；预算按 Episode 隔离，失败重试不消耗已评估迭代 |
 | 可复现性 | 同一数据和锁定计划重复执行的 summary、quality、evaluation 完全一致 |

@@ -38,7 +38,7 @@
 
 ```text
 app/
-  llm/                    # 唯一模型网关、OpenAI 兼容实现和错误边界
+  llm/                    # 唯一研究模型协议、Chat/Responses 适配和错误边界
   research/
     application/          # 桌面可调用的协调、规划和确定性执行服务
     agent/
@@ -64,11 +64,11 @@ app/
 - Agent 根据研究问题、数据画像和 `electricity-price-evidence-ladder` 生成结构化 `EDAPlan`，通过 Function Calling 从 30 个原子研究函数中选择最小集合；本地编译器负责领域排序、权限和参数门禁。
 - 内置两个核心 Skill：`price-exogenous-eda`（电价 + 外生变量）与 `price-forecastability-audit`（仅目标序列的可预测性审计）。
 - 统计实现基于 numpy / pandas / scipy / statsmodels；ADF、KPSS、MSTL、PACF 与 Ljung-Box 直接调用成熟实现，不自行重写。
-- 模型方案只读展示 30 秒；用户通过自然语言反馈要求修改，模型生成新版本后重新进入反馈窗口。
+- 模型方案只读展示并等待明确确认；用户可以继续询问、自然语言修改或拒绝，模型生成新版本后重新进入审批门。
 - 计划、函数结果和评估均生成结构化反馈；规划失败转 `plan_error`，评估修订在当前 Episode 的独立 Iteration 中进行，并受无进展检测与已评估 Iteration 上限约束。
 - 确定性工具负责计算，评估器检查证据和风险。
 - 界面上的“研究过程”由 `app/research/graph/narration.py` 把已发生的循环事件翻译成用户语言，不展示也不保存任何模型私有思考链。
-- 保存对话、计划版本、数据指纹、多轮运行血缘、执行轨迹、结构化结果、自包含 HTML 报告、SVG 图表及哈希。
+- 保存对话、计划版本、数据指纹、多轮运行血缘、执行轨迹、结构化结果、Markdown 报告、SVG 图表及哈希。
 
 详细设计与运行方法见 [phase1-price-exogenous-eda.md](phase1-price-exogenous-eda.md)。
 

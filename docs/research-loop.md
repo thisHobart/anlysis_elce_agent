@@ -53,20 +53,20 @@ Session：长期对话与研究历史，不设置“总研究轮次”
 ## 人机交互
 
 - 方案审批通过 `interrupt()` 暂停，通过 `Command(resume=...)` 恢复。
-- 应用保持打开时，30 秒无反馈由桌面发送 `timeout_accept`。
+- 默认必须明确确认方案；只有宿主显式启用自动执行时，前台反馈窗口到期才发送 `timeout_accept`。
 - `timeout_accept` 只能由前台倒计时在 deadline 到达后携带内部标记触发；提前调用或普通用户恢复请求会被 Graph 拒绝。
 - 应用关闭期间不执行任务；重启发现审批过期时必须用户明确确认。
 - 评估自动修订只允许收缩原审批函数、变量和参数范围；扩大范围转 `result_limitations`。
 - 审批事实由 `approval_state` 中的方案 ID、方案指纹和审批时间共同确定；`plan_origin` 或模型 `execute_plan` 意图不能直接授权执行。
 - 每个 interrupt 只接受 payload `choices` 中列出的 action；越界 action 保持原 checkpoint，不会默认结束或拒绝。
 - `plan_error` 只提供重试、修改要求或停止，不允许接受/执行不存在的方案。
-- `result_limitations` 只在已有研究结果时出现，用户可以接受限制、修改或停止。
+- `result_limitations` 只在已有研究结果时出现，用户可以说明下一步研究要求或结束本轮研究。
 
 ## 自校验与恢复
 
 - 所有错误转换为结构化 `FeedbackPacket`。
 - `call_id` 标识当前计划中的执行实例；`work_id` 只由数据指纹、函数版本和规范化参数生成，用于跨修订复用。
-- 工具结果复用缓存最多64项；复用时结果重新绑定当前 `call_id/step_id`，保证证据溯源不串线。
+- 工具结果复用缓存最多64项；完整结果原子写入 checkpoint 同级的结果存储，Graph 只保存 `work_id/output_hash/storage_key` 引用；复用时重新加载、验哈希并绑定当前 `call_id/step_id`，保证证据溯源不串线。
 - `ToolResult` 保存真实 `started_at/finished_at`；研究包执行轨迹不再用 finalize 时间伪造函数时间。
 - 节点和外部副作用保持幂等；checkpoint 恢复只重跑未提交的函数 attempt，已完成结果直接复用。
 - 方案校验时加载并固定一次执行快照，工具队列和 finalize 复用该快照；缓存最多保留两份并在终态释放。
@@ -76,7 +76,8 @@ Session：长期对话与研究历史，不设置“总研究轮次”
 - 计划、函数结果和最终评估分别验证；生成者不负责单独批准自己的结果。
 - Episode 游标、Iteration 游标、规划/函数 attempt、反馈、循环计数、正负结果和终止原因均持久化。
 - `feedback_packets` 只保存当前 Iteration 尚未解决的反馈；已被新候选计划消费的反馈进入有界 `feedback_history`，不再重复喂给 planner。
-- Graph 内事件最多保留160条并使用单调 sequence；完整桌面轨迹由会话投影保存。Graph 消息最多80条，运行历史只保存产物引用，不复制完整 summary。
+- Graph 内事件最多保留160条并使用单调 sequence；完整桌面轨迹由会话投影保存。Graph 消息最多120条且模型上下文执行硬字符上限，历史 Episode 按数据指纹过滤后作为独立上下文传入，运行历史只保存产物引用，不复制完整 summary。
+- 每次 Graph 到达审批、结果或其他用户交互点后，SQLite 只保留每个 namespace 的最新完整 checkpoint 及其 pending writes；当前 Graph 不使用 `DeltaChannel`，桌面也不提供 time-travel。完整审计由会话投影、循环记录和研究包承担。
 
 循环事件是界面“研究过程”的唯一来源：`app/research/graph/narration.py` 把事件名、状态和 details 翻译成分阶段的中文说明，供对话卡片和运行记录复用；同一函数的准备/完成/校验三条事件在对话卡中合并成一行，完整三条保留在运行记录里。叙述层不引入任何新的事实，也不接触模型私有推理。
 
@@ -92,4 +93,4 @@ Session：长期对话与研究历史，不设置“总研究轮次”
 
 该上限只防止异常状态导致无限循环；正常收敛不依赖它，也不把它作为用户可见的研究完成条件。当前不设置 Episode 函数调用总量或活动处理时间预算。
 
-SQLite checkpoint 是运行状态权威来源；`research_sessions.json` 是界面和跨 Episode 历史投影。Graph schema 为8；旧 schema 在解析嵌套契约前进入安全投影，SQLite 原始状态备份到 checkpoint 同级的 `checkpoint_backups/` 后再重建，避免升级时因 `extra="forbid"` 直接崩溃。
+SQLite checkpoint 是运行状态权威来源；`research_sessions.json` 是界面和跨 Episode 历史投影。Graph schema 为 11；旧 schema 在解析嵌套契约前进入只读安全投影，原始 checkpoint 和此前报告保持不变，界面提示用户新建对话，不在旧会话中迁移或重建。

@@ -192,12 +192,22 @@ class ConversationPane(QFrame):
     send_requested = Signal(str)
     cancel_requested = Signal()
     plan_run_requested = Signal(object)
+    plan_reject_requested = Signal()
+    end_research_requested = Signal()
     draft_changed = Signal(bool)
+
+    DEFAULT_INPUT_PLACEHOLDER = (
+        "说说你想研究什么，例如“负荷对实时电价的影响有多大”“峰谷价差在夏天有什么不同”…"
+    )
+    CONTINUE_RESEARCH_PLACEHOLDER = (
+        "输入下一步研究要求，例如：按推荐变量继续；删除 fcst_water；加入 actual_load 后继续…"
+    )
 
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("conversationPane")
         self._running = False
+        self._interaction_kind: str | None = None
         self._message_widgets: dict[str, QWidget] = {}
         self.current_plan_widget: PlanMessageWidget | None = None
         layout = QVBoxLayout(self)
@@ -220,6 +230,10 @@ class ConversationPane(QFrame):
         self.scroll.setObjectName("conversationScroll")
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._bottom_scroll_timer = QTimer(self)
+        self._bottom_scroll_timer.setSingleShot(True)
+        self._bottom_scroll_timer.setInterval(40)
+        self._bottom_scroll_timer.timeout.connect(self._scroll_to_bottom_now)
         self.timeline = QWidget()
         self.timeline_layout = QVBoxLayout(self.timeline)
         self.timeline_layout.setContentsMargins(24, 20, 24, 20)
@@ -235,12 +249,18 @@ class ConversationPane(QFrame):
         composer_outer.setSpacing(6)
         self.input = QPlainTextEdit()
         self.input.setObjectName("composerInput")
-        self.input.setPlaceholderText("说说你想研究什么，例如“负荷对实时电价的影响有多大”“峰谷价差在夏天有什么不同”…")
+        self.input.setPlaceholderText(self.DEFAULT_INPUT_PLACEHOLDER)
         self.input.setMaximumHeight(92)
         self.input.textChanged.connect(lambda: self.draft_changed.emit(bool(self.input.toPlainText().strip())))
         composer_outer.addWidget(self.input)
         actions = QHBoxLayout()
         actions.addStretch(1)
+        self.end_research_button = QPushButton("结束本轮研究")
+        self.end_research_button.setObjectName("endResearchButton")
+        self.end_research_button.setToolTip("保留当前结果并停止继续分析")
+        self.end_research_button.clicked.connect(self.end_research_requested)
+        self.end_research_button.hide()
+        actions.addWidget(self.end_research_button)
         self.send_button = QPushButton("发送")
         self.send_button.setObjectName("primaryButton")
         self.send_button.clicked.connect(self._submit_or_cancel)
@@ -250,6 +270,7 @@ class ConversationPane(QFrame):
         QShortcut(QKeySequence("Ctrl+Return"), self.input, activated=self._submit_or_cancel)
 
     def set_session(self, session: ResearchSession) -> None:
+        self.set_interaction_context(None)
         self.title_label.setText(session.title)
         self.status_label.setText(STATUS_LABELS.get(session.status, session.status))
         self.clear_messages()
@@ -265,6 +286,20 @@ class ConversationPane(QFrame):
         self.send_button.setText("停止" if running else "发送")
         self.send_button.setToolTip("停止当前分析" if running else "发送消息（Ctrl+Enter）")
         self.input.setEnabled(not running)
+        self._refresh_interaction_controls()
+
+    def set_interaction_context(self, kind: str | None) -> None:
+        """Adapt the composer to the current Graph interaction gate."""
+
+        self._interaction_kind = kind
+        self._refresh_interaction_controls()
+
+    def _refresh_interaction_controls(self) -> None:
+        continue_research = self._interaction_kind == "result_limitations"
+        self.input.setPlaceholderText(
+            self.CONTINUE_RESEARCH_PLACEHOLDER if continue_research else self.DEFAULT_INPUT_PLACEHOLDER
+        )
+        self.end_research_button.setVisible(continue_research and not self._running)
 
     def clear_messages(self) -> None:
         while self.timeline_layout.count() > 1:
@@ -292,6 +327,7 @@ class ConversationPane(QFrame):
                 EDAPlan.model_validate(message.payload["plan"]),
             )
             widget.run_requested.connect(self.plan_run_requested)
+            widget.reject_requested.connect(self.plan_reject_requested)
             plan_state = message.payload.get("state", "awaiting")
             if plan_state == "running":
                 widget.set_running()
@@ -325,13 +361,18 @@ class ConversationPane(QFrame):
         self.timeline_layout.insertWidget(self.timeline_layout.count() - 1, row)
 
     def scroll_to_bottom(self) -> None:
-        QTimer.singleShot(
-            0, lambda: self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum())
-        )
+        # A message can add nested, word-wrapped widgets whose final height is
+        # only known after another layout pass. Apply immediately, after the
+        # current event, and once more after delayed size hints settle. The
+        # single timer is restarted by bursts of progress updates, so they do
+        # not queue an unbounded number of callbacks.
+        self.timeline_layout.activate()
+        self._scroll_to_bottom_now()
+        self._bottom_scroll_timer.start()
 
-    def scroll_to_plan(self) -> None:
-        if self.current_plan_widget is not None:
-            self.scroll.ensureWidgetVisible(self.current_plan_widget, 20, 40)
+    def _scroll_to_bottom_now(self) -> None:
+        scrollbar = self.scroll.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def _submit_or_cancel(self) -> None:
         if self._running:
@@ -342,6 +383,7 @@ class ConversationPane(QFrame):
             return
         self.input.clear()
         self.send_requested.emit(text)
+        self.scroll_to_bottom()
 
 
 class FileSlotRow(QFrame):
@@ -471,7 +513,6 @@ class TracePanel(QFrame):
         self.setObjectName("tracePanel")
         self._events: list[TraceEvent] = []
         self._auto_follow = True
-        self._maximized = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(5)
@@ -521,6 +562,7 @@ class TracePanel(QFrame):
         category = self.filter.currentData() or "all"
         self.tree.clear()
         previous_title = ""
+        previous_function: str | None = None
         for event in self._events:
             if category != "all" and event.category != category:
                 continue
@@ -538,11 +580,20 @@ class TracePanel(QFrame):
             )
             detail = step.detail or event.summary
             headline = step.title if not detail else f"{step.title} — {detail}"
-            # Several loop events narrate to one title (finish plus verify, local plus graph copy);
-            # the first row carries the richest detail, so later repeats are dropped.
-            if step.title == previous_title:
+            # Execution completion and result validation intentionally narrate
+            # to the same completed-function title. Collapse only that lifecycle
+            # pair. Other repeated titles (for example three independently
+            # loaded input files) are separate audit events and must stay visible.
+            duplicate_function_completion = bool(
+                step.function_name
+                and step.function_name == previous_function
+                and step.title == previous_title
+                and step.title.startswith("已完成 · ")
+            )
+            if duplicate_function_completion:
                 continue
             previous_title = step.title
+            previous_function = step.function_name
             item = QTreeWidgetItem([time_text, step.stage_label, headline])
             item.setToolTip(2, f"{event.name}\n{event.summary}" if event.summary else event.name)
             self.tree.addTopLevelItem(item)
@@ -559,13 +610,8 @@ class TracePanel(QFrame):
         self.tree.scrollToBottom()
 
     def _toggle_maximized(self, maximized: bool) -> None:
-        self._maximized = maximized
         self.maximize_button.setText("还原" if maximized else "放大")
         self.maximize_requested.emit(maximized)
-
-    def set_maximized(self, maximized: bool) -> None:
-        if self.maximize_button.isChecked() != maximized:
-            self.maximize_button.setChecked(maximized)
 
 
 class ContextPane(QSplitter):

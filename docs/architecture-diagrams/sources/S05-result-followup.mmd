@@ -1,0 +1,21 @@
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant UI as M01 桌面交互
+    participant APP as M02 应用协调
+    participant G as M03 ResearchLoopGraph
+    participant DP as M04 决策与解释
+    participant LLM as 外部模型端点
+
+    U->>UI: 追问某项结果或限制
+    UI->>APP: submit_user_message(session_id, follow-up)
+    APP->>G: resume result_interrupt / continue thread
+    G->>DP: 问题 + 压缩后的结构化证据 + 评估
+    DP->>LLM: explain_result 上下文
+    LLM-->>DP: 基于证据的解释
+    DP-->>G: assistant_message
+    G-->>APP: result interrupt + 新消息
+    APP-->>UI: 快照与解释文本
+    UI-->>U: 展示回答并保留继续追问入口
+    Note over G,LLM: 原始文件和完整 Graph 状态不会交给模型；无证据内容必须明确缺失
+

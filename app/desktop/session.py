@@ -86,6 +86,8 @@ class SessionMessage(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     message_id: str = Field(default_factory=lambda: uuid4().hex)
+    turn_id: str | None = None
+    episode_id: str | None = None
     role: Literal["user", "assistant", "system"]
     kind: MessageKind = "text"
     content: str = ""
@@ -114,6 +116,7 @@ class SessionRunRecord(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     run_id: str
+    episode_id: str | None = None
     plan_id: str
     parent_run_id: str | None = None
     question: str
@@ -121,9 +124,17 @@ class SessionRunRecord(BaseModel):
     report_path: str
     created_at: str = Field(default_factory=utc_now)
     evaluation: dict[str, Any] = Field(default_factory=dict)
+    data_fingerprint: str | None = Field(default=None, pattern=r"^[a-f0-9]{12}$")
+    study_name: str | None = None
+    target_name: str | None = None
+    study_start_time: str | None = None
+    study_end_time: str | None = None
+    skill_name: str | None = None
+    skill_version: str | None = None
+    memory_status: Literal["active", "stale"] = "active"
 
 
-SESSION_SCHEMA_VERSION = 9
+SESSION_SCHEMA_VERSION = 11
 """Projection schema written by this build; bump it whenever stored sessions change shape."""
 
 
@@ -217,10 +228,20 @@ def _migrate_8_to_9(session: ResearchSession) -> None:
     """Version the removal of the user-facing research-configuration file slot."""
 
 
+def _migrate_9_to_10(session: ResearchSession) -> None:
+    """Version durable turn IDs and Episode linkage added to the UI projection."""
+
+
+def _migrate_10_to_11(session: ResearchSession) -> None:
+    """Version data-scoped run memory and explicit stale-state tracking."""
+
+
 SESSION_MIGRATIONS: dict[int, Callable[[ResearchSession], None]] = {
     **{version: _carry_forward for version in range(1, 7)},
     7: _migrate_7_to_8,
     8: _migrate_8_to_9,
+    9: _migrate_9_to_10,
+    10: _migrate_10_to_11,
 }
 
 

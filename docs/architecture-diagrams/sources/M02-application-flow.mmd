@@ -1,0 +1,26 @@
+flowchart TB
+    IN(["入口：session_id、消息或恢复动作、StudyConfig"])
+
+    subgraph M02["M02 应用协调 · app/research/application"]
+        direction TB
+        A["ResearchCoordinator<br/>接收统一命令"]
+        B["组装 Gateway、Agent、Skill、Tool 与服务"]
+        C{"新会话或恢复？"}
+        D["构建初始 ResearchLoopState"]
+        E["graph.invoke / Command(resume)"]
+        F["解析 snapshot 与 interrupt"]
+        G["narration<br/>转换进度与事件"]
+
+        A --> B --> C
+        C -->|新会话| D --> E
+        C -->|已有 thread| E
+        E --> F --> G
+    end
+
+    GRAPH(["调用端口：M03 ResearchLoopGraph"])
+    OUT(["出口：ResearchLoopSnapshot、InterruptPayload、进度"])
+
+    IN --> A
+    E --> GRAPH
+    GRAPH -.-> F
+    G --> OUT

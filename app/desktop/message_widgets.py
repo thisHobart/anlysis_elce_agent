@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.desktop.report_view import open_report
 from app.research.agent.schemas import AgentRunResult, EDAPlan
 from app.research.tools.catalog import FUNCTION_CATALOG, STAGE_TITLES
 
@@ -310,6 +311,7 @@ class PlanMessageWidget(QFrame):
     """Read-only analysis plan; changes are requested in plain language."""
 
     run_requested = Signal(object)
+    reject_requested = Signal()
 
     def __init__(self, plan: EDAPlan) -> None:
         super().__init__()
@@ -364,13 +366,16 @@ class PlanMessageWidget(QFrame):
             hypotheses.setObjectName("planObjective")
             layout.addWidget(hypotheses)
 
-        feedback_hint = QLabel("想改就直接在下面说，比如“只看夏季”“加上负价分析”；不回复会自动按这个方案开始。")
-        feedback_hint.setWordWrap(True)
-        feedback_hint.setObjectName("planHint")
-        layout.addWidget(feedback_hint)
+        self.feedback_hint = QLabel("想改或想先了解方案，可以直接在下面说；只有明确确认后才会开始执行。")
+        self.feedback_hint.setWordWrap(True)
+        self.feedback_hint.setObjectName("planHint")
+        layout.addWidget(self.feedback_hint)
 
         actions = QHBoxLayout()
         actions.addStretch(1)
+        self.reject_button = QPushButton("拒绝方案")
+        self.reject_button.clicked.connect(self.reject_requested)
+        actions.addWidget(self.reject_button)
         self.run_button = QPushButton("立即开始")
         self.run_button.setObjectName("primaryButton")
         self.run_button.clicked.connect(self._emit_plan)
@@ -385,7 +390,15 @@ class PlanMessageWidget(QFrame):
 
     def set_feedback_countdown(self, seconds: int) -> None:
         self.status_label.setText(f"{seconds} 秒后自动执行")
+        self.feedback_hint.setText("想改就直接在下面说；输入期间倒计时会暂停。")
         self.run_button.show()
+        self.reject_button.show()
+
+    def set_explicit_approval(self) -> None:
+        self.status_label.setText("等待明确确认")
+        self.feedback_hint.setText("想改或想先了解方案，可以直接在下面说；只有明确确认后才会开始执行。")
+        self.run_button.show()
+        self.reject_button.show()
 
     def set_feedback_paused(self, text: str = "正在接收修改意见") -> None:
         self.status_label.setText(text)
@@ -393,81 +406,80 @@ class PlanMessageWidget(QFrame):
     def set_running(self) -> None:
         self.status_label.setText("执行中")
         self.run_button.hide()
+        self.reject_button.hide()
 
     def set_finished(self, status: str = "已完成") -> None:
         self.status_label.setText(status)
         self.run_button.hide()
+        self.reject_button.hide()
 
 
 class ResultMessageWidget(QFrame):
-    """Final conclusions, limitations, and where to find the full report."""
+    """One screen of conclusions, plus the way into the full report.
+
+    Limitations, hypothesis verdicts and validity checks are deliberately absent:
+    they are written in full to ``report.md`` and ``methods.md``, and repeating
+    them here turns the conversation into a second, worse report.
+    """
+
+    MAXIMUM_FINDINGS = 3
 
     def __init__(self, result: AgentRunResult | None = None, *, payload: dict | None = None) -> None:
         super().__init__()
         if result is None and payload is None:
             raise ValueError("result or payload is required")
         if result is not None:
-            evaluation_summary = result.evaluation.summary
-            findings = result.evaluation.findings
-            warnings = result.evaluation.warnings
-            hypothesis_assessments = result.evaluation.hypothesis_assessments
+            evaluation = result.evaluation.model_dump(mode="json")
             figure_count = len(result.figure_paths)
             report_path = str(result.report_path)
             artifact_directory = str(result.artifact_directory)
         else:
             data = payload or {}
-            evaluation = data.get("evaluation", {})
-            evaluation_summary = str(evaluation.get("summary", "研究已完成"))
-            findings = list(evaluation.get("findings", []))
-            warnings = list(evaluation.get("warnings", []))
-            hypothesis_assessments = list(evaluation.get("hypothesis_assessments", []))
+            evaluation = dict(data.get("evaluation", {}))
             figure_count = int(data.get("figure_count", 0))
             report_path = str(data.get("report_path", ""))
             artifact_directory = str(data.get("artifact_directory", ""))
+        evaluation_summary = str(evaluation.get("summary", "研究已完成"))
+        findings = [str(item) for item in evaluation.get("findings", [])]
+        warnings = [str(item) for item in evaluation.get("warnings", [])]
+        followups = [str(item) for item in evaluation.get("suggested_followups", [])]
+        variable_recommendations = evaluation.get("variable_recommendations") or {}
+        decision = str(evaluation.get("decision", "accept"))
+
         self.setObjectName("resultMessage")
         self.setMinimumWidth(560)
         self.setMaximumWidth(720)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(8)
-        title = QLabel("分析完成")
+        title = QLabel("变量筛查完成" if variable_recommendations else "分析完成")
         title.setObjectName("resultTitle")
         layout.addWidget(title)
         summary = QLabel(evaluation_summary)
         summary.setObjectName("resultSummary")
         summary.setWordWrap(True)
         layout.addWidget(summary)
-        if findings:
-            heading = QLabel("主要发现")
-            heading.setObjectName("resultHeading")
-            layout.addWidget(heading)
-        for finding in findings[:6]:
+        for finding in findings[: self.MAXIMUM_FINDINGS]:
             label = QLabel(f"· {finding}")
             label.setWordWrap(True)
             layout.addWidget(label)
-        if hypothesis_assessments:
-            status_labels = {
-                "candidate_support": "有证据支持",
-                "not_supported": "证据不支持",
-                "inconclusive": "证据不足",
-                "not_tested": "本轮未检验",
-            }
-            heading = QLabel("判断验收")
-            heading.setObjectName("resultHeading")
-            layout.addWidget(heading)
-            for assessment in hypothesis_assessments[:4]:
-                if hasattr(assessment, "model_dump"):
-                    assessment = assessment.model_dump(mode="json")
-                status = status_labels.get(str(assessment.get("status", "")), str(assessment.get("status", "")))
-                label = QLabel(f"· [{status}] {assessment.get('hypothesis', '')} — {assessment.get('evidence', '')}")
-                label.setWordWrap(True)
-                layout.addWidget(label)
-        if warnings:
-            warning = QLabel("需要留意：" + "；".join(warnings[:3]))
-            warning.setObjectName("resultWarning")
-            warning.setWordWrap(True)
-            layout.addWidget(warning)
-        meta = QLabel(f"完整报告含 {figure_count} 张图表，可随时打开查看或分享。")
+        recommended_variables = [
+            str(item) for item in variable_recommendations.get("recommended_variables", [])
+        ]
+        if variable_recommendations:
+            recommendation_label = QLabel(
+                "推荐深入分析：" + ("、".join(recommended_variables) if recommended_variables else "暂无优先变量")
+            )
+            recommendation_label.setObjectName("resultWarning")
+            recommendation_label.setWordWrap(True)
+            layout.addWidget(recommendation_label)
+        pending = self._pending_items(evaluation) if decision in {"need_user", "reject"} else []
+        if pending:
+            decision_label = QLabel("需要你决定：" + "；".join(pending[:3]))
+            decision_label.setObjectName("resultWarning")
+            decision_label.setWordWrap(True)
+            layout.addWidget(decision_label)
+        meta = QLabel(self._meta_text(figure_count, len(warnings), len(followups)))
         meta.setObjectName("resultMeta")
         meta.setWordWrap(True)
         layout.addWidget(meta)
@@ -475,7 +487,7 @@ class ResultMessageWidget(QFrame):
         report_button = QPushButton("查看完整报告")
         report_button.setObjectName("primaryButton")
         report_button.setEnabled(bool(report_path))
-        report_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(report_path)))
+        report_button.clicked.connect(lambda: open_report(report_path, self))
         package_button = QPushButton("打开结果文件夹")
         package_button.setEnabled(bool(artifact_directory))
         package_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(artifact_directory)))
@@ -483,6 +495,32 @@ class ResultMessageWidget(QFrame):
         actions.addWidget(package_button)
         actions.addStretch(1)
         layout.addLayout(actions)
+
+    @staticmethod
+    def _pending_items(evaluation: dict[str, Any]) -> list[str]:
+        """Name the open items a decision depends on, without restating their evidence."""
+
+        names = [
+            str(check.get("name", ""))
+            for check in evaluation.get("checks", [])
+            if check.get("status") != "pass" and check.get("scope") not in {"inherent", "within_envelope"}
+        ]
+        names.extend(
+            str(item.get("hypothesis", ""))
+            for item in evaluation.get("hypothesis_assessments", [])
+            if item.get("status") in {"not_tested", "inconclusive"}
+            and item.get("scope") not in {"inherent", "within_envelope"}
+        )
+        return [name for name in dict.fromkeys(names) if name]
+
+    @staticmethod
+    def _meta_text(figure_count: int, warning_count: int, followup_count: int) -> str:
+        parts = [f"报告含 {figure_count} 张图表"]
+        if warning_count:
+            parts.append(f"{warning_count} 条适用边界")
+        if followup_count:
+            parts.append(f"{followup_count} 条下一步建议")
+        return "，".join(parts) + "，可随时打开查看或分享。"
 
     @classmethod
     def from_payload(cls, payload: dict) -> ResultMessageWidget:

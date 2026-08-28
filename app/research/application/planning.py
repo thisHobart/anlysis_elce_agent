@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.research.agent.context import compact_episode_context
 from app.research.agent.schemas import ConversationMessage, EDAPlan, ResearchDataProfile, ResearchProposal
 from app.research.agent.subagents.eda import EDASubagent
 from app.research.data.alignment import AlignmentResult, align_loaded_series
@@ -88,7 +89,7 @@ def _proposal_message(plan: EDAPlan, profile: ResearchDataProfile) -> str:
     return (
         f"我已检查 {profile.aligned_rows:,} 个对齐时间点，目标 {profile.target_name} 的覆盖率为 "
         f"{profile.target_coverage_rate:.2%}。大模型建议执行：{enabled}。"
-        "方案展示后会等待 30 秒；如需调整，请直接在对话中提出修改意见，由大模型生成修订版。"
+        "方案展示后会等待明确确认；如需调整，请直接在对话中提出修改意见，由大模型生成修订版。"
         f"{metadata_note}"
     )
 
@@ -110,12 +111,15 @@ class EDAPlanningService:
         skill: SkillDefinition | None = None,
         feedback: list[FeedbackPacket] | None = None,
         revision_context: dict[str, Any] | None = None,
+        episode_summaries: list[dict[str, Any]] | None = None,
     ) -> ResearchProposal:
         callback = progress or noop_progress
         callback(5, "解析数据字段与时间轴")
         config = resolve_config(config_path=config_path, study_config=study_config)
         callback(20, "加载并对齐数据")
         prepared = prepare_research_data(config)
+        inputs = input_file_manifest(config)
+        current_data_fingerprint = study_fingerprint(config, inputs)
         callback(65, "EDA Subagent 分析问题与数据画像")
         history = [
             {
@@ -124,6 +128,10 @@ class EDAPlanningService:
             }
             for item in (conversation or [])
         ]
+        episode_memory = compact_episode_context(
+            episode_summaries or [],
+            data_fingerprint=current_data_fingerprint,
+        )
         plan = self.subagent.propose(
             question,
             config,
@@ -132,9 +140,9 @@ class EDAPlanningService:
             skill=skill,
             feedback=feedback,
             revision_context=revision_context,
+            episode_memory=episode_memory,
         )
-        inputs = input_file_manifest(config)
-        plan = plan.model_copy(update={"data_fingerprint": study_fingerprint(config, inputs)})
+        plan = plan.model_copy(update={"data_fingerprint": current_data_fingerprint})
         profile = _data_profile(prepared)
         callback(100, "分析方案已生成，等待用户反馈")
         return ResearchProposal(
@@ -155,6 +163,7 @@ class EDAPlanningService:
         source: str = "automatic_evaluation",
         progress: ProgressCallback | None = None,
         authorization_envelope: dict[str, Any] | None = None,
+        episode_summaries: list[dict[str, Any]] | None = None,
     ) -> ResearchProposal:
         proposal = self.propose(
             question=current_plan.question,
@@ -163,6 +172,7 @@ class EDAPlanningService:
             progress=progress,
             skill=skill,
             feedback=feedback,
+            episode_summaries=episode_summaries,
             revision_context={
                 "current_plan": current_plan.model_dump(mode="json"),
                 "authorization_envelope": authorization_envelope,

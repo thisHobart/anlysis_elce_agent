@@ -17,6 +17,7 @@ from app.research.agent.errors import (
     PlanCompatibilityError,
     RepairablePlanError,
     ResearchPlanValidationError,
+    SkillVersionMismatchError,
 )
 from app.research.agent.schemas import AgentRunResult, ConversationMessage, EDAPlan
 from app.research.application.planning import noop_progress, prepare_research_data, resolve_config
@@ -130,7 +131,7 @@ class EDAExecutionService:
             raise PlanCompatibilityError("旧版本地规划方案不能继续执行，请由大模型重新生成方案。")
         skill = self.skills.get(plan.skill_name)
         if skill.version != plan.skill_version:
-            raise PlanCompatibilityError(
+            raise SkillVersionMismatchError(
                 f"Skill 版本不匹配 {plan.skill_name}: plan={plan.skill_version}, installed={skill.version}"
             )
         policy = ToolPolicy(allowed_functions=frozenset(skill.allowed_functions))
@@ -370,9 +371,10 @@ class EDAExecutionService:
                 {
                     "step_id": step.step_id,
                     "call_id": result.call.call_id,
+                    "work_id": result.call.work_id,
                     "function": result.call.name,
                     "title": step.title,
-                    "parameters": step.parameters,
+                    "parameters": result.call.arguments,
                     "status": "completed",
                     "result_key": result_key,
                     "started_at": result.started_at or record.get("started_at"),
@@ -386,6 +388,9 @@ class EDAExecutionService:
             )
         callback(78, "评估器检查结果与风险")
         evaluation = evaluate_agent_run(plan=plan, quality=prepared.quality, summary=summary)
+        resolved_loop_context = dict(loop_context or {})
+        if loop_context is not None:
+            resolved_loop_context["evaluation"] = evaluation.model_dump(mode="json")
         plan_payload = json.dumps(plan.model_dump(mode="json"), ensure_ascii=False, sort_keys=True).encode("utf-8")
         fingerprint = hashlib.sha256(
             prepared_execution.data_fingerprint.encode("ascii") + plan_payload
@@ -397,6 +402,7 @@ class EDAExecutionService:
         if not messages:
             messages = [ConversationMessage(role="user", content=plan.question)]
         callback(88, "生成可复现研究包")
+        research_protocol = self.skills.get(plan.skill_name).research_protocol
         bundle = write_agent_research_package(
             config=config,
             quality=prepared.quality,
@@ -409,7 +415,8 @@ class EDAExecutionService:
             evaluation=evaluation,
             conversation=messages,
             execution_trace=trace,
-            loop_context=loop_context,
+            research_protocol=research_protocol,
+            loop_context=resolved_loop_context if loop_context is not None else None,
             run_id=run_id,
         )
         callback(100, "研究完成")

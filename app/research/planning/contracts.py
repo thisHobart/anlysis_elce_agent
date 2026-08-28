@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.research.agent.schemas import rename_legacy_step_keys
+from app.research.planning.variables import VariableSelectionMode, VariableSelectionStage
 from app.research.tools.catalog import FUNCTION_CATALOG, LEGACY_METHOD_TO_FUNCTION, ResearchFunctionName
 
 
@@ -34,6 +35,10 @@ class EDAPlanDraft(BaseModel):
             "Never include the target price name. Use an empty list for price-only analysis."
         ),
     )
+    variable_selection_mode: VariableSelectionMode = "explicit"
+    variable_selection_stage: VariableSelectionStage = "direct"
+    deferred_functions: list[ResearchFunctionName] = Field(default_factory=list)
+    variable_recommendation_limit: int = Field(default=8, ge=1, le=32)
     steps: list[DraftStep] = Field(
         default_factory=list,
         description="Atomic EDA function calls only; data_quality is mandatory and added by the compiler.",

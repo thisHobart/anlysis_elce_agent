@@ -11,7 +11,7 @@ from app.desktop.input_config import build_runtime_study
 from app.desktop.session import ResearchSession, SessionInputFile
 from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
 from app.research.agent.subagents.eda import EDASubagent
-from app.research.application.coordinator import GRAPH_SCHEMA_VERSION, ResearchCoordinator
+from app.research.application.coordinator import ResearchCoordinator
 from app.research.application.execution import EDAExecutionService
 from app.research.graph.contracts import LoopCursor
 from app.research.graph.guards import canonical_hash
@@ -151,6 +151,7 @@ def test_foreground_timeout_cannot_approve_before_deadline(synthetic_study: Path
         message="分析电价",
         study_config=config,
         approval_timeout_seconds=30,
+        automatic_approval_enabled=True,
     )
     assert approval.interrupt and approval.interrupt.kind == "plan_approval"
 
@@ -167,7 +168,7 @@ def test_foreground_timeout_cannot_approve_before_deadline(synthetic_study: Path
     )
 
 
-def test_old_sqlite_schema_is_safe_to_open_and_backed_up_before_restart(
+def test_old_sqlite_schema_is_safe_to_open_and_preserved_without_restart(
     synthetic_study: Path,
     tmp_path: Path,
 ):
@@ -185,11 +186,16 @@ def test_old_sqlite_schema_is_safe_to_open_and_backed_up_before_restart(
     assert safe.phase == "stopped"
     assert safe.values["schema_upgrade_required"] is True
 
-    restarted = coordinator.submit_user_message(
+    blocked = coordinator.submit_user_message(
         session_id="p2-old-schema",
-        message="接受",
+        message="继续分析",
         study_config=config,
     )
-    assert restarted.values["graph_schema_version"] == GRAPH_SCHEMA_VERSION
-    assert list((tmp_path / "checkpoint_backups").rglob("*.json"))
+    assert blocked.phase == "stopped"
+    assert blocked.values["graph_schema_version"] == 1
+    assert "请新建对话并重新提交研究问题" in blocked.values["stop_reason"]
+    assert not (tmp_path / "checkpoint_backups").exists()
+    raw = coordinator.graph.get_state(coordinator._config("p2-old-schema"))
+    assert raw.values["graph_schema_version"] == 1
+    assert raw.values["approval_state"] == legacy_approval
     coordinator.close()

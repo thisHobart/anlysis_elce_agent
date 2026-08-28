@@ -1,0 +1,29 @@
+flowchart TB
+    IN(["入口：计划、质量报告、已校验证据与运行引用"])
+
+    subgraph M06["M06 评估与交付"]
+        direction TB
+        A["evaluate_agent_run<br/>检查议程、证据身份和方法限制"]
+        B["形成 hypothesis assessments<br/>与 evaluation checks"]
+        C{"确定性四态决策"}
+        D["FeedbackPacket<br/>修订或补充要求"]
+        E["write_agent_research_package"]
+        F["报告、方法与 SVG 图表"]
+        G["证据、provenance、对齐数据与 manifest"]
+
+        A --> B --> C
+        C -->|revise / need_user / reject| D
+        C -->|accept| E
+        E --> F
+        E --> G
+    end
+
+    OUT1(["出口：AgentEvaluation / FeedbackPacket"])
+    OUT2(["出口：ArtifactBundle / report_path / manifest"])
+
+    IN --> A
+    C --> OUT1
+    D --> OUT1
+    F --> OUT2
+    G --> OUT2
+

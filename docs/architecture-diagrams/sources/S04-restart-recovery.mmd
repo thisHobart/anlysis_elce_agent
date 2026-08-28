@@ -1,0 +1,22 @@
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant UI as M01 桌面交互
+    participant APP as M02 应用协调
+    participant ST as M07 状态与契约
+    participant G as M03 ResearchLoopGraph
+
+    U->>UI: 重新启动应用并选择历史会话
+    UI->>ST: SessionStore.load()
+    ST-->>UI: 会话、消息和 trace 展示投影
+    UI->>APP: get_snapshot(session_id)
+    APP->>ST: 读取 SQLite checkpoint
+    ST->>ST: 检查 graph_schema_version 与安全迁移
+    ST-->>APP: 权威 ResearchLoopState
+    APP->>G: 恢复当前 thread 快照
+    G-->>APP: phase、interrupt、工具队列与事件
+    APP-->>UI: ResearchLoopSnapshot
+    UI->>UI: 从快照和事件重建方案卡、进度和结果状态
+    UI-->>U: 显示可继续的审批、修复或结果交互
+    Note over UI,ST: 会话文件只恢复展示；Graph checkpoint 决定运行语义
+

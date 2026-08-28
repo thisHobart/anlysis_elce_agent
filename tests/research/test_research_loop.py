@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
+import sqlite3
 import time
 from pathlib import Path
 
 import pytest
 
-from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
+from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent, compact_evidence
 from app.research.agent.schemas import AgentEvaluation, EvaluationCheck
 from app.research.agent.subagents.eda import EDASubagent
 from app.research.application.coordinator import GRAPH_SCHEMA_VERSION, ResearchCoordinator
@@ -156,8 +158,14 @@ def test_one_graph_runs_approval_tools_evaluation_and_followup(
     assert result.interrupt.kind == "result"
     assert len(result.values["run_history"]) == 1
     assert len(result.values["tool_results"]) == 3
+    assert all(item["kind"] == "tool_result_ref_v1" and "output" not in item for item in result.values["tool_results"])
+    assert "eda_summary" not in result.values["latest_run"]
+    assert "quality_report" not in result.values["latest_run"]
     assert result.values["budget"]["evaluated_iterations"] == 1
     assert result.values["loop_cursor"]["episode_number"] == 1
+    assert result.values["episode_summaries"][0]["run_id"] == result.values["latest_run"]["run_id"]
+    assert result.values["episode_summaries"][0]["status"] == "accepted"
+    assert result.values["episode_summaries"][0]["data_fingerprint"] == result.values["current_plan"]["data_fingerprint"]
     event_names = [event["name"] for event in result.events]
     assert any(
         name.startswith("函数执行完成：") and "price_descriptive_distribution" in name
@@ -165,7 +173,7 @@ def test_one_graph_runs_approval_tools_evaluation_and_followup(
     )
     assert any(name.startswith("评估运行：") and "accept" in name for name in event_names)
     artifact_directory = Path(result.values["latest_run"]["artifact_directory"])
-    assert (artifact_directory / "research_loop.json").is_file()
+    assert (artifact_directory / "provenance" / "research_loop.json").is_file()
 
     followup = coordinator.submit_user_message(
         session_id=thread_id,
@@ -175,6 +183,193 @@ def test_one_graph_runs_approval_tools_evaluation_and_followup(
     assert followup.interrupt is not None
     assert followup.interrupt.kind == "result"
     assert "已校验证据" in followup.values["assistant_message"]
+
+
+def test_plan_question_returns_to_the_same_approval_gate_and_typed_rejection_stops(
+    synthetic_study: Path,
+):
+    class PlanDiscussionDialogue(LoopDialogue):
+        def decide(self, **kwargs):
+            if "为什么" in kwargs.get("question", ""):
+                return DialogueDecision(intent="discussion", response="该函数用于回答当前方案中的分布问题。")
+            return super().decide(**kwargs)
+
+    coordinator = ResearchCoordinator(
+        main_agent=MainResearchAgent(model_dialogue=PlanDiscussionDialogue()),
+        eda_subagent=EDASubagent(model_planner=LoopPlanner()),
+    )
+    session_id = "loop-plan-discussion"
+    config = load_study_config(synthetic_study)
+    approval = coordinator.submit_user_message(
+        session_id=session_id,
+        message="分析电价结构",
+        study_config=config,
+    )
+    assert approval.interrupt and approval.interrupt.kind == "plan_approval"
+
+    discussed = coordinator.submit_user_message(
+        session_id=session_id,
+        message="为什么选择这个函数？",
+        study_config=config,
+    )
+    assert discussed.interrupt and discussed.interrupt.kind == "plan_approval"
+    assert discussed.values["assistant_message"] == "该函数用于回答当前方案中的分布问题。"
+    assert ApprovalState.model_validate(discussed.values["approval_state"]).status == "waiting"
+
+    rejected = coordinator.submit_user_message(
+        session_id=session_id,
+        message="拒绝",
+        study_config=config,
+    )
+    assert rejected.phase == "stopped"
+    assert rejected.interrupt is None
+
+
+def test_stale_interrupt_identity_cannot_approve_a_newer_gate(synthetic_study: Path):
+    coordinator = loop_coordinator()
+    approval = coordinator.submit_user_message(
+        session_id="loop-stale-interrupt",
+        message="分析电价结构",
+        study_config=load_study_config(synthetic_study),
+    )
+    assert approval.interrupt and approval.interrupt.interrupt_id
+
+    with pytest.raises(ValueError, match="交互状态已经失效"):
+        coordinator.resume(
+            session_id="loop-stale-interrupt",
+            action="approve",
+            interrupt_id="obsolete-interrupt",
+            state_revision=approval.interrupt.state_revision,
+        )
+
+    current = coordinator.get_snapshot("loop-stale-interrupt")
+    assert current.interrupt and current.interrupt.interrupt_id == approval.interrupt.interrupt_id
+    assert current.values["tool_results"] == []
+
+
+def test_approval_still_completes_after_discussing_the_plan(
+    synthetic_study: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class PlanDiscussionDialogue(LoopDialogue):
+        def decide(self, **kwargs):
+            if "为什么" in kwargs.get("question", ""):
+                return DialogueDecision(intent="discussion", response="先解释方案，再继续等待确认。")
+            return super().decide(**kwargs)
+
+    monkeypatch.setattr("app.research.application.execution.evaluate_agent_run", accepting_evaluation)
+    coordinator = ResearchCoordinator(
+        main_agent=MainResearchAgent(model_dialogue=PlanDiscussionDialogue()),
+        eda_subagent=EDASubagent(model_planner=LoopPlanner()),
+    )
+    config = load_study_config(synthetic_study)
+    coordinator.submit_user_message(
+        session_id="loop-discuss-then-approve",
+        message="分析电价结构",
+        study_config=config,
+    )
+    discussed = coordinator.submit_user_message(
+        session_id="loop-discuss-then-approve",
+        message="为什么选择这个方案？",
+        study_config=config,
+    )
+    assert discussed.interrupt and discussed.interrupt.kind == "plan_approval"
+
+    result = coordinator.resume(session_id="loop-discuss-then-approve", action="approve")
+    assert result.interrupt and result.interrupt.kind == "result"
+    assert result.values["loop_cursor"]["episode_status"] == "accepted"
+
+
+def test_completed_run_replacement_rebuilds_agenda_and_returns_segment_evidence(
+    synthetic_study: Path,
+):
+    class StaleAgendaPlanner:
+        enabled = True
+        model_name = "loop-test-model"
+
+        def propose(self, _question, _config, _quality, history=None, skill=None, feedback=None):
+            del history, feedback
+            assert skill is not None
+            return {
+                "objective": "先检查电价分布",
+                "hypotheses": ["这条旧议程无法由确定性规则识别。"],
+                "selected_variables": [],
+                "steps": [
+                    {
+                        "function": "price_descriptive_distribution",
+                        "enabled": True,
+                        "rationale": "建立第一轮分布证据。",
+                        "parameters": {},
+                    }
+                ],
+                "assumptions": [],
+            }
+
+    class SegmentRevisionDialogue(LoopDialogue):
+        def decide(self, **kwargs):
+            if kwargs.get("question") == "改为峰谷和月份分段":
+                return DialogueDecision(
+                    intent="revise_plan",
+                    response="已改为分段对比。",
+                    enabled_functions=["price_segment_distribution_comparison"],
+                    selected_variables=[],
+                    comparison_id="peak_valley",
+                    segments=[
+                        {"segment_id": "valley", "label": "谷段", "kind": "hours", "hours": [0, 1, 2, 3, 4, 5]},
+                        {"segment_id": "peak", "label": "峰段", "kind": "hours", "hours": [18, 19, 20, 21, 22, 23]},
+                    ],
+                )
+            if kwargs.get("summary"):
+                return DialogueDecision(intent="explain_result", response="已返回新的分段均值与波动证据。")
+            return super().decide(**kwargs)
+
+    coordinator = ResearchCoordinator(
+        main_agent=MainResearchAgent(model_dialogue=SegmentRevisionDialogue()),
+        eda_subagent=EDASubagent(model_planner=StaleAgendaPlanner()),
+    )
+    config = load_study_config(synthetic_study)
+    thread_id = "loop-replace-stale-agenda"
+
+    approval = coordinator.submit_user_message(
+        session_id=thread_id,
+        message="先研究电价",
+        study_config=config,
+    )
+    assert approval.interrupt and approval.interrupt.kind == "plan_approval"
+    limited = coordinator.resume(session_id=thread_id, action="approve")
+    assert limited.interrupt and limited.interrupt.kind == "result_limitations"
+
+    revised = coordinator.submit_user_message(
+        session_id=thread_id,
+        message="改为峰谷和月份分段",
+        study_config=config,
+    )
+    assert revised.interrupt and revised.interrupt.kind == "plan_approval"
+    assert revised.values["current_plan"]["hypotheses"] == [
+        "峰段、谷段或其他明确分段可能存在电价差异。"
+    ]
+
+    result = coordinator.resume(session_id=thread_id, action="approve")
+    assert result.interrupt and result.interrupt.kind == "result"
+    assert result.values["evaluation"]["decision"] == "accept"
+    assert result.values["assistant_message"] == "已返回新的分段均值与波动证据。"
+    assert "comparisons" in result.values["eda_summary"]
+    dialogue_evidence = compact_evidence(result.values["eda_summary"], result.values["evaluation"])
+    assert dialogue_evidence["comparisons"]["price"]["peak_valley"]["segments"]["peak"]["std"] is not None
+
+    artifact_directory = Path(result.values["latest_run"]["artifact_directory"])
+    markdown = (artifact_directory / "report.md").read_text(encoding="utf-8")
+    assert "本轮分析：电价分段对比" in markdown
+    assert re.search(r"^## \d+ 分段对比$", markdown, flags=re.MULTILINE) and "标准差" in markdown
+    assert "谷段" in markdown and "峰段" in markdown
+    loop_context = json.loads(
+        (artifact_directory / "provenance" / "research_loop.json").read_text(encoding="utf-8")
+    )
+    assert loop_context["evaluation"]["decision"] == "accept"
+    assert loop_context["episode"]["episode_status"] == "evaluating"
+    assert loop_context["episode"]["terminal_reason"] is None
+    assert loop_context["feedback_packets"] == []
+    assert any(item["code"] == "agenda_requires_user" for item in loop_context["feedback_history"])
 
 
 def test_evaluator_revision_auto_executes_once_without_second_approval(
@@ -286,8 +481,14 @@ def test_sqlite_restores_approval_and_expired_timeout_requires_confirmation(
         message="分析电价结构",
         study_config=config,
         approval_timeout_seconds=1,
+        automatic_approval_enabled=True,
     )
     assert approval.interrupt and approval.interrupt.kind == "plan_approval"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?",
+            ("sqlite-approval",),
+        ).fetchone()[0] == 1
     first.close()
 
     time.sleep(1.05)
@@ -300,10 +501,24 @@ def test_sqlite_restores_approval_and_expired_timeout_requires_confirmation(
 
     result = restored.resume(session_id="sqlite-approval", action="approve")
     assert result.interrupt and result.interrupt.kind == "result"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?",
+            ("sqlite-approval",),
+        ).fetchone()[0] == 1
+    result_store_files = list(database.with_name(f"{database.stem}_tool_results").rglob("*.json"))
+    assert len(result_store_files) == len(result.values["tool_result_cache"])
+    restored.delete_thread("sqlite-approval")
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?",
+            ("sqlite-approval",),
+        ).fetchone()[0] == 0
+    assert not list(database.with_name(f"{database.stem}_tool_results").rglob("*.json"))
     restored.close()
 
 
-def test_old_graph_schema_restarts_on_the_next_user_message(synthetic_study: Path):
+def test_old_graph_schema_is_preserved_and_requests_a_new_conversation(synthetic_study: Path):
     coordinator = loop_coordinator()
     session_id = "loop-old-schema"
     config = load_study_config(synthetic_study)
@@ -312,18 +527,26 @@ def test_old_graph_schema_restarts_on_the_next_user_message(synthetic_study: Pat
         message="分析电价结构",
         study_config=config,
     )
-    coordinator.graph.update_state(coordinator._config(session_id), {"graph_schema_version": 1})
+    previous_version = GRAPH_SCHEMA_VERSION - 1
+    coordinator.graph.update_state(
+        coordinator._config(session_id),
+        {"graph_schema_version": previous_version},
+    )
 
-    restarted = coordinator.submit_user_message(
+    blocked = coordinator.submit_user_message(
         session_id=session_id,
-        message="接受",
+        message="继续分析",
         study_config=config,
     )
 
-    assert restarted.values["graph_schema_version"] == GRAPH_SCHEMA_VERSION
-    assert restarted.values["user_request"] == "分析电价结构"
-    assert restarted.interrupt and restarted.interrupt.kind == "plan_approval"
-    assert restarted.values["budget"]["plan_attempts_in_iteration"] == 1
+    assert blocked.phase == "stopped"
+    assert blocked.interrupt is None
+    assert blocked.values["graph_schema_version"] == previous_version
+    assert blocked.values["schema_upgrade_required"] is True
+    assert "请新建对话并重新提交研究问题" in blocked.values["stop_reason"]
+    raw = coordinator.graph.get_state(coordinator._config(session_id))
+    assert raw.values["graph_schema_version"] == previous_version
+    assert raw.values["user_request"] == "分析电价结构"
 
 
 def test_transient_tool_failure_retries_once(
@@ -633,8 +856,13 @@ def test_crash_inside_tool_node_recovers_current_call_once_from_sqlite(
     monkeypatch.setattr("app.research.application.execution.evaluate_agent_run", accepting_evaluation)
 
     class CrashingExecution(EDAExecutionService):
-        def execute_call(self, **_kwargs):
-            raise KeyboardInterrupt("simulated process crash")
+        calls = 0
+
+        def execute_call(self, **kwargs):
+            self.calls += 1
+            if self.calls == 2:
+                raise KeyboardInterrupt("simulated process crash")
+            return super().execute_call(**kwargs)
 
     config = load_study_config(synthetic_study)
     database = tmp_path / "crash.sqlite3"
@@ -647,16 +875,54 @@ def test_crash_inside_tool_node_recovers_current_call_once_from_sqlite(
     with pytest.raises(KeyboardInterrupt, match="simulated process crash"):
         first.resume(session_id="loop-crash-recovery", action="approve")
     crashed = first.get_snapshot("loop-crash-recovery")
-    running = next(iter(crashed.values["tool_records"].values()))
+    running = next(item for item in crashed.values["tool_records"].values() if item["status"] == "running")
+    completed = next(item for item in crashed.values["tool_records"].values() if item["status"] == "completed")
     assert running["status"] == "running"
+    assert completed["result"]["kind"] == "tool_result_ref_v1"
     first.close()
 
     restored = loop_coordinator(checkpoint_path=database)
     result = restored.continue_thread("loop-crash-recovery")
 
     assert result.interrupt and result.interrupt.kind == "result"
-    recovered = next(iter(result.values["tool_records"].values()))
+    recovered = next(item for item in result.values["tool_records"].values() if item["attempts"] == 2)
     assert recovered["attempts"] == 2
+    restored.close()
+
+
+def test_exhausted_crash_recovery_routes_to_a_durable_user_interrupt(
+    synthetic_study: Path,
+    tmp_path: Path,
+):
+    class AlwaysCrashingExecution(EDAExecutionService):
+        def execute_call(self, **_kwargs):
+            raise KeyboardInterrupt("simulated repeated process crash")
+
+    config = load_study_config(synthetic_study)
+    database = tmp_path / "repeated-crash.sqlite3"
+    first = loop_coordinator(execution=AlwaysCrashingExecution(), checkpoint_path=database)
+    first.submit_user_message(
+        session_id="loop-repeated-crash",
+        message="分析电价结构",
+        study_config=config,
+    )
+    with pytest.raises(KeyboardInterrupt, match="simulated repeated process crash"):
+        first.resume(session_id="loop-repeated-crash", action="approve")
+    first.close()
+
+    second = loop_coordinator(execution=AlwaysCrashingExecution(), checkpoint_path=database)
+    with pytest.raises(KeyboardInterrupt, match="simulated repeated process crash"):
+        second.continue_thread("loop-repeated-crash")
+    second.close()
+
+    restored = loop_coordinator(checkpoint_path=database)
+    exhausted = restored.continue_thread("loop-repeated-crash")
+
+    assert exhausted.interrupt and exhausted.interrupt.kind == "plan_error"
+    assert any(item["code"] == "tool_retry_budget" for item in exhausted.values["feedback_packets"])
+    failed = next(iter(exhausted.values["tool_records"].values()))
+    assert failed["status"] == "failed"
+    assert failed["attempts"] == 2
     restored.close()
 
 
@@ -769,7 +1035,7 @@ def test_evaluator_reject_persists_negative_result_and_stops(
     assert record["evaluation"]["decision"] == "reject"
 
 
-def test_evaluator_need_user_accept_limitations_reaches_result(
+def test_evaluator_need_user_can_end_the_round_with_stop(
     synthetic_study: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -785,7 +1051,7 @@ def test_evaluator_need_user_accept_limitations_reaches_result(
         main_agent=MainResearchAgent(model_dialogue=NeedUserDialogue()),
         eda_subagent=EDASubagent(model_planner=LoopPlanner()),
     )
-    session_id = "loop-need-user-accept"
+    session_id = "loop-need-user-stop"
     coordinator.submit_user_message(
         session_id=session_id,
         message="分析电价结构",
@@ -793,9 +1059,11 @@ def test_evaluator_need_user_accept_limitations_reaches_result(
     )
     waiting = coordinator.resume(session_id=session_id, action="approve")
     assert waiting.interrupt and waiting.interrupt.kind == "result_limitations"
-    result = coordinator.resume(session_id=session_id, action="accept_limitations")
-    assert result.interrupt and result.interrupt.kind == "result"
-    assert "只根据已校验证据" in result.values["assistant_message"]
+    assert waiting.interrupt.choices == ["modify", "followup", "stop"]
+    result = coordinator.resume(session_id=session_id, action="stop")
+    assert result.phase == "stopped"
+    assert result.interrupt is None
+    assert result.values["latest_run"] is not None
 
 
 def test_evaluator_need_user_modify_returns_to_plan_approval(
@@ -828,6 +1096,182 @@ def test_evaluator_need_user_modify_returns_to_plan_approval(
         "data_quality",
         "price_descriptive_distribution",
     ]
+
+
+def test_result_limitation_followups_keep_the_gate_and_never_rerun_an_unchanged_plan(
+    synthetic_study: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class LimitationDialogue(LoopDialogue):
+        def __init__(self) -> None:
+            self.turns: list[dict] = []
+
+        def decide(self, **kwargs):
+            self.turns.append(kwargs)
+            question = kwargs.get("question", "")
+            if "可视化" in question:
+                return DialogueDecision(intent="discussion", response="当前运行没有图表，因为只执行了已批准的步骤。")
+            if "继续按当前方案" in question:
+                # This reproduces the model route shown in the reported trace.
+                # The graph must fail closed instead of rerunning the already
+                # evaluated plan and tripping its no-progress guard.
+                return DialogueDecision(intent="execute_plan", response="继续执行当前方案。")
+            return super().decide(**kwargs)
+
+    monkeypatch.setattr(
+        "app.research.application.execution.evaluate_agent_run",
+        lambda **_kwargs: AgentEvaluation(
+            decision="need_user",
+            summary="需要批准加入周期性函数后才能继续。",
+            checks=[
+                EvaluationCheck(
+                    name="周期性范围",
+                    status="warning",
+                    message="尚未批准周期性函数。",
+                    scope="needs_approval",
+                )
+            ],
+            agenda_fingerprint="pending-periodicity-scope",
+        ),
+    )
+    dialogue = LimitationDialogue()
+    coordinator = ResearchCoordinator(
+        main_agent=MainResearchAgent(model_dialogue=dialogue),
+        eda_subagent=EDASubagent(model_planner=LoopPlanner()),
+    )
+    config = load_study_config(synthetic_study)
+    session_id = "loop-limitation-followup-context"
+
+    coordinator.submit_user_message(
+        session_id=session_id,
+        message="分析电价与外生变量周期性",
+        study_config=config,
+    )
+    limited = coordinator.resume(session_id=session_id, action="approve")
+    assert limited.interrupt and limited.interrupt.kind == "result_limitations"
+    assert len(limited.values["run_history"]) == 1
+
+    discussed = coordinator.submit_user_message(
+        session_id=session_id,
+        message="周期性分析没有可显示的可视化图片吗？",
+        study_config=config,
+    )
+    assert discussed.interrupt and discussed.interrupt.kind == "result_limitations"
+    assert discussed.values["assistant_message"] == "当前运行没有图表，因为只执行了已批准的步骤。"
+    discussion_turn = next(item for item in dialogue.turns if "可视化" in item.get("question", ""))
+    assert discussion_turn["active_gate"] == "result_limitations"
+    assert discussion_turn["episode_goal"] == "分析电价与外生变量周期性"
+
+    blocked = coordinator.submit_user_message(
+        session_id=session_id,
+        message="继续按当前方案执行并返回结构化结果",
+        study_config=config,
+    )
+    assert blocked.interrupt and blocked.interrupt.kind == "result_limitations"
+    assert len(blocked.values["run_history"]) == 1
+    assert "原样重跑不会处理" in blocked.values["assistant_message"]
+    assert not any(
+        item["code"] in {"no_agenda_progress", "no_new_evidence"}
+        for item in blocked.values["feedback_packets"]
+    )
+
+
+def test_old_skill_version_blocks_the_session_and_requests_a_new_conversation(
+    synthetic_study: Path,
+):
+    coordinator = loop_coordinator()
+    session_id = "loop-old-skill-version"
+    approval = coordinator.submit_user_message(
+        session_id=session_id,
+        message="分析电价结构",
+        study_config=load_study_config(synthetic_study),
+    )
+    assert approval.interrupt and approval.interrupt.kind == "plan_approval"
+    plan = approval.values["current_plan"]
+    skill = coordinator.skills.get(plan["skill_name"])
+    coordinator.skills._skills[skill.name] = skill.model_copy(update={"version": "99.0.0"})
+
+    blocked = coordinator.submit_user_message(
+        session_id=session_id,
+        message="继续分析",
+        study_config=load_study_config(synthetic_study),
+    )
+
+    assert blocked.interrupt and blocked.interrupt.kind == "plan_error"
+    assert blocked.interrupt.choices == ["stop"]
+    assert "请新建对话重新分析" in blocked.interrupt.message
+    assert blocked.values["run_history"] == []
+    assert any(
+        item["code"] == "session_skill_version_mismatch"
+        for item in blocked.values["feedback_packets"]
+    )
+
+
+def test_user_revision_validation_error_is_not_masked_by_stale_progress(
+    synthetic_study: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class RevisionFailurePlanner(LoopPlanner):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def propose(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return super().propose(*args, **kwargs)
+            return {
+                "objective": "无效修订",
+                "hypotheses": [],
+                "selected_variables": ["not_a_variable"],
+                "steps": [],
+                "assumptions": [],
+            }
+
+    class InvalidRevisionDialogue(LoopDialogue):
+        def decide(self, **kwargs):
+            if kwargs.get("question") == "扩大到外生变量分析":
+                return DialogueDecision(
+                    intent="revise_plan",
+                    enabled_functions=["relationship_scipy_pearson_pairwise"],
+                    selected_variables=["not_a_variable"],
+                )
+            return super().decide(**kwargs)
+
+    monkeypatch.setattr(
+        "app.research.application.execution.evaluate_agent_run",
+        lambda **_kwargs: AgentEvaluation(
+            decision="need_user",
+            summary="等待用户扩大范围。",
+            checks=[],
+            agenda_fingerprint="old-agenda",
+        ),
+    )
+    coordinator = ResearchCoordinator(
+        main_agent=MainResearchAgent(model_dialogue=InvalidRevisionDialogue()),
+        eda_subagent=EDASubagent(model_planner=RevisionFailurePlanner()),
+    )
+    config = load_study_config(synthetic_study)
+    session_id = "loop-revision-error-priority"
+    coordinator.submit_user_message(
+        session_id=session_id,
+        message="分析电价结构",
+        study_config=config,
+    )
+    waiting = coordinator.resume(session_id=session_id, action="approve")
+    assert waiting.interrupt and waiting.interrupt.kind == "result_limitations"
+
+    failed = coordinator.submit_user_message(
+        session_id=session_id,
+        message="扩大到外生变量分析",
+        study_config=config,
+    )
+
+    assert failed.interrupt and failed.interrupt.kind == "plan_error"
+    assert "未知变量" in failed.interrupt.message
+    assert not any(
+        item["code"] in {"no_agenda_progress", "no_new_evidence"}
+        for item in failed.values["feedback_packets"]
+    )
 
 
 def test_evaluator_need_user_stop_persists_stop_record(
@@ -938,11 +1382,40 @@ def test_function_queue_size_does_not_reduce_iteration_limit(
     assert result.interrupt and result.interrupt.kind == "result_limitations"
     assert result.values["budget"]["evaluated_iterations"] == 4
     assert evaluations == 4
+    assert planner.calls == 4
     assert len(result.values["run_history"]) == 4
+    assert any(item["code"] == "safety_iteration_limit" for item in result.values["feedback_packets"])
     assert not any(
         item["code"] in {"tool_call_budget", "active_time_budget"}
         for item in result.values["feedback_packets"]
     )
+
+
+def test_need_user_audit_failure_does_not_swallow_the_interrupt(
+    synthetic_study: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class MissingSkillDialogue(LoopDialogue):
+        def decide(self, **_kwargs):
+            return DialogueDecision(intent="new_plan", skill_name="not-installed")
+
+    def fail_audit(**_kwargs):
+        raise PermissionError("simulated audit write failure")
+
+    monkeypatch.setattr("app.research.graph.workflow.write_loop_record", fail_audit)
+    coordinator = ResearchCoordinator(
+        main_agent=MainResearchAgent(model_dialogue=MissingSkillDialogue()),
+        eda_subagent=EDASubagent(model_planner=LoopPlanner()),
+    )
+
+    waiting = coordinator.submit_user_message(
+        session_id="loop-audit-failure",
+        message="分析电价",
+        study_config=load_study_config(synthetic_study),
+    )
+
+    assert waiting.interrupt and waiting.interrupt.kind == "plan_error"
+    assert any(item["code"] == "loop_audit_write_failed" for item in waiting.values["feedback_packets"])
 
 
 def test_no_new_evidence_stops_automatic_loop(synthetic_study: Path, monkeypatch: pytest.MonkeyPatch):

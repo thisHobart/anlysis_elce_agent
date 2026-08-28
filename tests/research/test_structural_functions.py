@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -357,8 +358,12 @@ def test_every_registered_function_executes_and_reports_evidence(synthetic_study
             continue
         assert spec.evidence_field in summary[spec.result_key], spec.key
     assert set(summary["comparisons"]) == {"methods", "price", "relationships"}
-    assert result.report_path.name == "report.html"
+    assert result.report_path.name == "report.md"
     report = result.report_path.read_text(encoding="utf-8")
     assert "电价自身规律" in report
     assert "朴素基线" in report
-    assert json.loads((result.artifact_directory / "eda_summary.json").read_text(encoding="utf-8"))
+    # Every chart this run can draw has to reach the reader, or the function ran for nothing.
+    assert set(re.findall(r"!\[[^\]]*\]\(figures/([^)]+)\.svg\)", report)) == set(result.figure_paths)
+    assert json.loads(
+        (result.artifact_directory / "evidence" / "eda_summary.json").read_text(encoding="utf-8")
+    )

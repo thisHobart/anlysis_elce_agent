@@ -1,0 +1,146 @@
+classDiagram
+    direction TB
+
+    class ResearchLoopState {
+        <<TypedDict>>
+        +int graph_schema_version
+        +bool schema_upgrade_required
+        +str thread_id
+        +str session_id
+        +LoopPhase phase
+        +str control
+        +str return_to_gate
+        +dict loop_cursor
+        +list episode_history
+        +list episode_summaries
+        +list messages
+        +dict study_config
+        +dict data_profile
+        +dict quality_report
+        +dict active_skill
+        +dict decision
+        +dict current_plan
+        +dict authorization_envelope
+        +dict approval_state
+        +list tool_queue
+        +dict tool_records
+        +list tool_results
+        +dict evaluation
+        +list feedback_packets
+        +dict budget
+        +list run_history
+        +str assistant_message
+        +str stop_reason
+        +list events
+    }
+
+    class LoopCursor {
+        +str episode_id
+        +int episode_number
+        +EpisodeStatus episode_status
+        +str iteration_id
+        +int iteration_number
+        +int plan_attempt_number
+        +int call_attempt_number
+        +str current_call_id
+        +str stage
+        +str terminal_reason
+    }
+
+    class EpisodeBudget {
+        +int max_plan_attempts_per_iteration
+        +int max_function_attempts_per_call
+        +int max_evaluated_iterations
+        +int plan_attempts_in_iteration
+        +int evaluated_iterations
+    }
+
+    class ApprovalState {
+        +ApprovalStatus status
+        +str plan_id
+        +str plan_fingerprint
+        +datetime approved_at
+        +datetime deadline
+        +int remaining_seconds
+        +str decision
+        +str origin
+    }
+
+    class AuthorizationEnvelope {
+        +str approved_plan_id
+        +str approved_plan_fingerprint
+        +str question_hash
+        +int max_steps
+        +str skill_name
+        +str skill_version
+        +str data_fingerprint
+        +list functions
+        +list variables
+        +dict max_lag_by_function
+        +dict approved_parameters
+    }
+
+    class ToolCallRecord {
+        +ToolCall call
+        +ToolStatus status
+        +int attempts
+        +datetime started_at
+        +datetime completed_at
+        +ToolResult result
+        +FeedbackPacket error
+    }
+
+    class InterruptPayload {
+        +InterruptKind kind
+        +str interrupt_id
+        +int state_revision
+        +LoopPhase phase
+        +str message
+        +list choices
+        +EDAPlan plan
+        +AgentEvaluation evaluation
+        +ToolResult result
+    }
+
+    class ResumePayload {
+        +ResumeAction action
+        +str message
+        +str interrupt_id
+        +int state_revision
+        +bool automatic_timeout
+        +datetime created_at
+    }
+
+    class ResearchLoopSnapshot {
+        +str thread_id
+        +LoopPhase phase
+        +dict values
+        +InterruptPayload interrupt
+        +list events
+    }
+
+    class ExternalContracts {
+        <<PydanticModels>>
+        StudyConfig
+        DataQualityReport
+        SkillDefinition
+        DialogueDecision
+        EDAPlan
+        ToolCall
+        ToolResult
+        AgentEvaluation
+        FeedbackPacket
+        RunRecord
+    }
+
+    note for ResearchLoopState "Python 声明：TypedDict(total=False)，所有键均可选"
+
+    ResearchLoopState *-- LoopCursor : loop_cursor
+    ResearchLoopState *-- EpisodeBudget : budget
+    ResearchLoopState *-- ApprovalState : approval_state
+    ResearchLoopState o-- AuthorizationEnvelope : authorization_envelope
+    ResearchLoopState o-- ToolCallRecord : tool_records
+    ResearchLoopState ..> ExternalContracts : 引用业务契约
+    ResearchLoopState ..> ResearchLoopSnapshot : 投影
+    ResearchLoopSnapshot o-- InterruptPayload : 可选中断
+    InterruptPayload ..> ResumePayload : 由用户恢复

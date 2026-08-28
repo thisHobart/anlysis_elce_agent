@@ -40,7 +40,6 @@ ResumeAction = Literal[
     "reject",
     "followup",
     "next_round",
-    "accept_limitations",
     "retry",
     "clarify",
     "stop",
@@ -123,6 +122,7 @@ EpisodeStatus = Literal[
     "stopped",
     "failed",
 ]
+MemoryStatus = Literal["active", "stale"]
 
 
 class LoopCursor(BaseModel):
@@ -185,6 +185,35 @@ class LoopCursor(BaseModel):
         )
 
 
+class EpisodeSummary(BaseModel):
+    """Compact, evidence-backed memory for one research goal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    episode_id: str
+    episode_number: int = Field(ge=1)
+    goal: str
+    status: EpisodeStatus
+    run_id: str | None = None
+    plan_id: str | None = None
+    evaluation_decision: Literal["accept", "revise", "need_user", "reject"] | None = None
+    summary: str = ""
+    findings: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    report_path: str | None = None
+    figure_count: int = Field(default=0, ge=0)
+    figure_keys: list[str] = Field(default_factory=list)
+    data_fingerprint: str | None = Field(default=None, pattern=r"^[a-f0-9]{12}$")
+    study_name: str | None = None
+    target_name: str | None = None
+    study_start_time: str | None = None
+    study_end_time: str | None = None
+    skill_name: str | None = None
+    skill_version: str | None = None
+    memory_status: MemoryStatus = "active"
+    updated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+
 class ApprovalState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -234,6 +263,8 @@ class InterruptPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kind: InterruptKind
+    interrupt_id: str = ""
+    state_revision: int = Field(default=0, ge=0)
     phase: LoopPhase
     message: str
     choices: list[ResumeAction]
@@ -249,6 +280,10 @@ class ResumePayload(BaseModel):
 
     action: ResumeAction
     message: str = ""
+    message_id: str | None = None
+    turn_id: str | None = None
+    interrupt_id: str | None = None
+    state_revision: int | None = Field(default=None, ge=0)
     automatic_timeout: bool = False
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 

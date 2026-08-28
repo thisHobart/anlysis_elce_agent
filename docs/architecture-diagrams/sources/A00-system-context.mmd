@@ -1,0 +1,15 @@
+flowchart LR
+    USER["用户<br/>提出问题、审批方案、查看结果"]
+    SYSTEM["电价研究 Agent<br/>本地 PySide6 研究工作站"]
+    LLM["OpenAI 兼容模型端点<br/>结构化决策与解释"]
+    FILES[("本地研究文件<br/>CSV / Excel / Parquet")]
+    STORE[("本地持久化<br/>SQLite checkpoint / 会话 / 研究包")]
+
+    USER -->|问题、文件与人工决策| SYSTEM
+    SYSTEM -->|方案、过程、报告与解释| USER
+    SYSTEM -->|有界上下文与函数 schema| LLM
+    LLM -->|DialogueDecision / PlanDraft / 解释| SYSTEM
+    FILES -->|只读研究输入| SYSTEM
+    SYSTEM -.->|状态、投影与证据资产| STORE
+    STORE -.->|恢复状态与历史结果| SYSTEM
+

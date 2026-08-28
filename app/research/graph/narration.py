@@ -59,7 +59,6 @@ APPROVAL_ACTION_LABELS: dict[str, str] = {
     "retry": "请求重试",
     "followup": "收到追问",
     "clarify": "收到补充说明",
-    "accept_limitations": "已接受当前结论限制",
 }
 
 FAILURE_TITLES: dict[str, str] = {
@@ -196,7 +195,8 @@ def narrate_event(event: dict[str, Any]) -> ThinkingStep:
         return ThinkingStep("design", "锁定执行计划", composition or tail, status)
 
     if head == "等待审批":
-        return ThinkingStep("confirm", "等待方案确认", "超时未收到修改意见将自动执行", "running")
+        detail = "超时未收到修改意见将自动执行" if details.get("automatic") else "需要明确确认后才会执行"
+        return ThinkingStep("confirm", "等待方案确认", detail, "running")
     if head == "方案操作":
         action = str(details.get("action", tail.split(" · ")[0]))
         return ThinkingStep("confirm", APPROVAL_ACTION_LABELS.get(action, action), "", status)
@@ -248,7 +248,7 @@ NODE_PROGRESS: dict[str, tuple[int, str, str, str]] = {
     "validate_plan": (34, "design", "校验分析方案", "核对步骤、变量、参数与数据指纹"),
     "prepare_plan_repair": (32, "design", "修复分析方案", "在已授权范围内调整"),
     "prepare_approval": (40, "confirm", "准备方案确认", ""),
-    "approval_interrupt": (40, "confirm", "等待方案确认", "超时未收到修改意见将自动执行"),
+    "approval_interrupt": (40, "confirm", "等待方案确认", "需要明确确认、询问或拒绝"),
     "lock_plan": (45, "design", "锁定执行计划", "执行期间不再变更"),
     "execute_tool": (62, "compute", "执行分析函数", ""),
     "validate_tool_result": (72, "compute", "校验分析结果", ""),
@@ -264,6 +264,19 @@ NODE_PROGRESS: dict[str, tuple[int, str, str, str]] = {
     "persist_stop": (100, "answer", "研究已终止", ""),
     "persist_failure": (100, "issue", "本轮研究未完成", ""),
 }
+
+# Human gates are durable workflow states, not Agent work.  They remain in the
+# audit event stream and are rendered by the plan/result/notice card after the
+# worker returns, but must never appear as a running step under “正在研究…”.
+HUMAN_GATE_NODES = frozenset(
+    {
+        "prepare_approval",
+        "approval_interrupt",
+        "prepare_need_user",
+        "user_interrupt",
+        "result_interrupt",
+    }
+)
 
 # Bookkeeping nodes that move the cursor without doing anything a user needs to see.
 SILENT_NODES = frozenset({"advance_tool", "mark_tool_running"})

@@ -45,6 +45,12 @@ def _selector_payload(segment: SegmentDefinition) -> dict[str, Any]:
     return segment.model_dump(mode="json", exclude_none=True)
 
 
+def _same_comparison_group(left: SegmentDefinition, right: SegmentDefinition) -> bool:
+    """Only compare selectors that partition the same time dimension."""
+
+    return left.kind == right.kind
+
+
 def _price_statistics(values: pd.Series, mask: np.ndarray, *, minimum: int) -> dict[str, Any]:
     selected = values.loc[mask]
     clean = selected.dropna().astype(float)
@@ -86,12 +92,16 @@ def compare_price_segments(
     }
     contrasts: list[dict[str, Any]] = []
     for left, right in combinations(segments, 2):
+        if not _same_comparison_group(left, right):
+            continue
         left_row = rows[left.segment_id]
         right_row = rows[right.segment_id]
         left_mean, right_mean = left_row["mean"], right_row["mean"]
         left_median, right_median = left_row["median"], right_row["median"]
+        left_std, right_std = left_row["std"], right_row["std"]
         contrasts.append(
             {
+                "comparison_group": left.kind,
                 "left_segment_id": left.segment_id,
                 "right_segment_id": right.segment_id,
                 "overlap_rows": int((masks[left.segment_id] & masks[right.segment_id]).sum()),
@@ -101,6 +111,11 @@ def compare_price_segments(
                 "median_difference_left_minus_right": (
                     _number(left_median - right_median)
                     if left_median is not None and right_median is not None
+                    else None
+                ),
+                "std_difference_left_minus_right": (
+                    _number(left_std - right_std)
+                    if left_std is not None and right_std is not None
                     else None
                 ),
             }
@@ -148,10 +163,13 @@ def compare_relationship_segments(
             }
         contrasts: list[dict[str, Any]] = []
         for left, right in combinations(segments, 2):
+            if not _same_comparison_group(left, right):
+                continue
             left_value = segment_rows[left.segment_id]["correlation"]
             right_value = segment_rows[right.segment_id]["correlation"]
             contrasts.append(
                 {
+                    "comparison_group": left.kind,
                     "left_segment_id": left.segment_id,
                     "right_segment_id": right.segment_id,
                     "overlap_rows": int((masks[left.segment_id] & masks[right.segment_id]).sum()),

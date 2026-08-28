@@ -23,10 +23,27 @@ POSITIVE = "#0F766E"
 NEGATIVE = "#BE123C"
 SERIES_COLORS = ("#3F51B5", "#0F766E", "#B45309", "#BE123C", "#7C3AED", "#475569")
 
-FONT = (
-    "'Segoe UI', 'Microsoft YaHei', -apple-system, BlinkMacSystemFont, "
-    "'Helvetica Neue', Arial, sans-serif"
-)
+# Widths for laying out value labels without measuring text: one 10.5px digit is
+# about 6px wide, and a label needs this much clearance from the bar end.
+LABEL_CHARACTER_WIDTH = 6.2
+LABEL_GAP = 6.0
+
+
+def elide(name: str, limit: int) -> str:
+    """Shorten a long series name from the middle, keeping the part that tells it apart.
+
+    Cutting the tail off ``fcst_new_energy_type_13`` and ``fcst_new_energy_type_1``
+    prints two different variables under one identical label.
+    """
+
+    if len(name) <= limit or limit < 5:
+        return name[:limit]
+    return f"{name[: limit - 4]}…{name[-3:]}"
+
+# QtSvg does not reliably resolve CSS font-family lists for CJK glyphs. A
+# single CJK-capable family keeps its glyph metrics and synthetic weight
+# aligned; platforms without this font still use Qt's normal font fallback.
+FONT = "'Microsoft YaHei'"
 
 
 def format_number(value: float | None, *, unit: str = "") -> str:
@@ -475,17 +492,29 @@ def ranked_bar_chart(
         color = NEGATIVE if value < 0 else POSITIVE
         parts.append(
             f'<text x="{left - 12}" y="{center + 4}" text-anchor="end" font-size="11" '
-            f'fill="{INK}">{escape(name[:22])}</text>'
+            f'fill="{INK}">{escape(elide(name, 22))}</text>'
         )
         parts.append(
             f'<rect x="{start:.1f}" y="{center - 8:.1f}" width="{bar_width:.1f}" height="16" rx="3" '
             f'fill="{color}" opacity="0.9"/>'
         )
-        anchor = "start" if value >= 0 else "end"
-        label_x = end + (6 if value >= 0 else -6)
+        label = format_number(value, unit=unit)
+        label_width = len(label) * LABEL_CHARACTER_WIDTH
+        outside_x = end + (LABEL_GAP if value >= 0 else -LABEL_GAP)
+        outside_fits = (
+            outside_x + label_width <= width - 6 if value >= 0 else outside_x - label_width >= left - 6
+        )
+        if outside_fits:
+            anchor, label_x, fill = ("start" if value >= 0 else "end"), outside_x, MUTED
+        else:
+            # The bar reaches the axis margin; keeping the label outside would print it
+            # on top of the category name. Put it inside the bar instead.
+            anchor = "end" if value >= 0 else "start"
+            label_x = end - LABEL_GAP if value >= 0 else end + LABEL_GAP
+            fill = PANEL
         parts.append(
             f'<text x="{label_x:.1f}" y="{center + 4:.1f}" text-anchor="{anchor}" font-size="10.5" '
-            f'fill="{MUTED}">{escape(format_number(value, unit=unit))}</text>'
+            f'fill="{fill}">{escape(label)}</text>'
         )
     if caption:
         parts.append(f'<text x="18" y="{height - 6}" font-size="10" fill="{AXIS}">{escape(caption)}</text>')
@@ -543,11 +572,11 @@ def heatmap_chart(
         column_x = left + cell * index + cell / 2
         parts.append(
             f'<text transform="translate({column_x:.1f} {top - 8:.1f}) rotate(-42)" text-anchor="start" '
-            f'font-size="10" fill="{MUTED}">{escape(name[:18])}</text>'
+            f'font-size="10" fill="{MUTED}">{escape(elide(name, 18))}</text>'
         )
         parts.append(
             f'<text x="{left - 10}" y="{top + cell * index + cell / 2 + 4:.1f}" text-anchor="end" '
-            f'font-size="10" fill="{INK}">{escape(name[:20])}</text>'
+            f'font-size="10" fill="{INK}">{escape(elide(name, 20))}</text>'
         )
     for row_index, row in enumerate(matrix):
         for column_index, value in enumerate(row):
@@ -677,7 +706,7 @@ def range_chart(
         color = NEGATIVE if crosses_zero else ACCENT
         parts.append(
             f'<text x="{left - 12}" y="{center + 4}" text-anchor="end" font-size="11" '
-            f'fill="{INK}">{escape(str(row.get("name", ""))[:22])}</text>'
+            f'fill="{INK}">{escape(elide(str(row.get("name", "")), 22))}</text>'
         )
         parts.append(
             f'<rect x="{min(low, high):.1f}" y="{center - 5:.1f}" width="{max(2.0, abs(high - low)):.1f}" '

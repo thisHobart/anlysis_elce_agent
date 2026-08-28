@@ -1,5 +1,5 @@
 protocol_id: price-forecastability-ladder
-version: "1.2.0"
+version: "1.2.1"
 kind: domain-evidence-ladder
 objective: >-
   只用目标电价序列，按形态、动态、建模就绪三层证据把该序列的可预测性归入结构清晰、
@@ -28,7 +28,7 @@ stages:
     exit_gate: 关键字段已知或被明确记录为限制；不得用默认常识替代具体市场规则。
 
   - stage_id: data_readiness
-    title: 数据质量门禁
+    title: 数据质量核验
     objective: 确认目标序列的时间轴、覆盖和有效样本足以支撑时序结论。
     functions:
       - data_quality

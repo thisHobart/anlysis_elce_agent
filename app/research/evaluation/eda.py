@@ -8,6 +8,20 @@ import json
 from typing import Any
 
 from app.research.agent.schemas import AgendaScope, AgentEvaluation, EDAPlan, EvaluationCheck, HypothesisAssessment
+from app.research.evaluation.agenda import resolve_agenda_item
+from app.research.evaluation.criteria import (
+    CALENDAR_EFFECT_THRESHOLD,
+    DISTRIBUTION_KURTOSIS_THRESHOLD,
+    DISTRIBUTION_SKEW_THRESHOLD,
+    DRIVER_DRIFT_STANDARD_DEVIATIONS,
+    MINIMUM_DRIVER_COVERAGE,
+    SEASONAL_STRENGTH_THRESHOLD,
+    VOLATILITY_REGIME_RATIO,
+    group_variance_share,
+)
+from app.research.evaluation.issues import issue_line
+from app.research.evaluation.wording import GROUP_LABELS, stationarity_text, transform_text
+from app.research.planning.variables import build_variable_recommendations
 from app.research.schemas.feedback import FeedbackPacket
 from app.research.schemas.results import DataQualityReport
 from app.research.tools.catalog import FUNCTION_CATALOG
@@ -21,54 +35,13 @@ def _share(value: float | None) -> str:
     return "—" if value is None else f"{value * 100:.2f}%"
 
 
-def _issue_message(code: str, fallback: str) -> str:
-    messages = {
-        "series_has_no_values": "统一时间轴上没有可用数值。",
-        "very_low_coverage": "可用数据不足统一时间轴的一半。",
-        "low_coverage": "缺失时间点可能影响时序和关系分析。",
-        "incomplete_coverage": "统一时间轴上存在数据缺口。",
-        "invalid_timestamps": "部分非法时间戳已在对齐前排除。",
-        "non_numeric_values": "部分非空值无法转换为数值。",
-        "duplicate_timestamps": "重复时间戳已按配置规则聚合。",
-        "availability_unknown": "预测时点的数据可获得性未知，当前关系只能用于描述。",
-        "forecast_vintage_unknown": "缺少预测发布或可获得时间，无法确认该变量在预测时点可用。",
-        "lookahead_risk": "实际观测值在未来预测时点可能不可用。",
-    }
-    return messages.get(code, fallback)
-
-
-def _contains_any(value: str, terms: tuple[str, ...]) -> bool:
-    normalized = value.casefold()
-    return any(term.casefold() in normalized for term in terms)
-
-
-SEASONAL_STRENGTH_THRESHOLD = 0.3
-"""Below this an MSTL/STL seasonal component is not a stable periodic structure."""
-
-CALENDAR_EFFECT_THRESHOLD = 0.06
-"""Conventional medium effect size for eta squared, used to read one calendar grouping."""
-
-
-def _group_variance_share(rows: Any) -> float | None:
-    """Return eta squared for one calendar grouping, from the group summary rows themselves."""
-
-    usable = [
-        row
-        for row in (rows or [])
-        if isinstance(row, dict) and row.get("mean") is not None and row.get("observations")
-    ]
-    if len(usable) < 2:
-        return None
-    total = sum(int(row["observations"]) for row in usable)
-    grand_mean = sum(float(row["mean"]) * int(row["observations"]) for row in usable) / total
-    between = sum(int(row["observations"]) * (float(row["mean"]) - grand_mean) ** 2 for row in usable)
-    within = sum(
-        max(int(row["observations"]) - 1, 0) * float(row["std"]) ** 2
-        for row in usable
-        if row.get("std") is not None
-    )
-    spread = between + within
-    return between / spread if spread > 0 else None
+def _segment_pair_label(comparison: dict[str, Any], contrast: dict[str, Any]) -> str:
+    segments = comparison.get("segments", {})
+    left_id = str(contrast.get("left_segment_id") or "")
+    right_id = str(contrast.get("right_segment_id") or "")
+    left = str((segments.get(left_id) or {}).get("label") or left_id)
+    right = str((segments.get(right_id) or {}).get("label") or right_id)
+    return f"{left}与{right}"
 
 
 def _truncated_lag_scans(relationships: dict[str, Any]) -> tuple[list[str], int | None]:
@@ -105,19 +78,6 @@ def _variables_without_relationship_evidence(relationships: dict[str, Any]) -> l
     return empty
 
 
-DISTRIBUTION_SKEW_THRESHOLD = 0.5
-"""Absolute skewness above which a price distribution is meaningfully asymmetric."""
-
-DISTRIBUTION_KURTOSIS_THRESHOLD = 1.0
-"""Excess kurtosis above which the tails are heavier than a normal reference."""
-
-VOLATILITY_REGIME_RATIO = 2.0
-"""Ratio between the widest and narrowest rolling window that marks a volatility regime."""
-
-MINIMUM_DRIVER_COVERAGE = 0.9
-"""Coverage below which a driver cannot carry its share of a relationship analysis."""
-
-
 def _drifting_variables(series: dict[str, Any]) -> list[str] | None:
     """Return drivers whose whole-sample drift exceeds one of their own standard deviations."""
 
@@ -130,7 +90,10 @@ def _drifting_variables(series: dict[str, Any]) -> list[str] | None:
         if slope is None or not observations or not dispersion:
             continue
         judged = True
-        if abs(float(slope)) * int(observations) >= float(dispersion):
+        if (
+            abs(float(slope)) * int(observations)
+            >= DRIVER_DRIFT_STANDARD_DEVIATIONS * float(dispersion)
+        ):
             drifting.append(name)
     return drifting if judged else None
 
@@ -221,16 +184,16 @@ def _driver_stationarity_assessment(
     )
 
 def _advanced_assessment(
-    hypothesis: str,
+    item_id: str,
     *,
     price: dict[str, Any],
     exogenous: dict[str, Any],
     relationships: dict[str, Any],
     enabled_functions: set[str],
 ) -> tuple[str, str, str, AgendaScope, str | None] | None:
-    """Assess hypotheses generated by the structural, driver, and dependence functions."""
+    """Assess one agenda item using the evidence its own function produced."""
 
-    if _contains_any(hypothesis, ("关系可能存在时段差异", "分小时关系")):
+    if item_id == "relationships.by_hour":
         return _grouped_relationship_assessment(
             relationships,
             enabled_functions,
@@ -239,7 +202,7 @@ def _advanced_assessment(
             function_name="relationship_pearson_by_hour",
             label="交割小时",
         )
-    if _contains_any(hypothesis, ("关系可能存在月份结构", "分月份关系")):
+    if item_id == "relationships.by_month":
         return _grouped_relationship_assessment(
             relationships,
             enabled_functions,
@@ -248,7 +211,7 @@ def _advanced_assessment(
             function_name="relationship_pearson_by_month",
             label="月份",
         )
-    if _contains_any(hypothesis, ("偏斜", "分布形态", "偏度", "峰度")):
+    if item_id == "price.distribution":
         distribution = price.get("distribution")
         if not distribution:
             scope, remediation = _missing_scope(
@@ -269,7 +232,7 @@ def _advanced_assessment(
             "inherent",
             None,
         )
-    if _contains_any(hypothesis, ("波动可能分阶段", "波动聚集", "方差随时间", "波动状态")):
+    if item_id == "price.volatility":
         volatility = price.get("volatility")
         rolling = price.get("rolling_statistics") or {}
         one_day = rolling.get("one_day") or {}
@@ -282,13 +245,23 @@ def _advanced_assessment(
             )
             return "price.volatility", "not_tested", "本轮未执行电价滚动波动分析。", scope, remediation
         lowest = one_day.get("minimum_std")
-        if not lowest:
+        if lowest is None:
             return (
                 "price.volatility",
                 "inconclusive",
-                "滚动窗口未给出可比较的最低波动水平。",
+                "滚动窗口没有给出可比较的最低波动水平。",
                 "needs_data",
                 "需要更长或缺口更少的目标序列才能比较波动状态。",
+            )
+        if float(lowest) == 0.0:
+            # A flat day (price held at a cap, floor, or a constant fill) makes the
+            # ratio undefined, and is itself evidence that the swings are not uniform.
+            return (
+                "price.volatility",
+                "candidate_support",
+                "存在整整一天价格几乎没有变化的时段，而另一些时段波动很大，说明波动不是全期稳定的。",
+                "inherent",
+                None,
             )
         ratio = float(one_day["maximum_std"]) / float(lowest)
         return (
@@ -298,7 +271,7 @@ def _advanced_assessment(
             "inherent",
             None,
         )
-    if _contains_any(hypothesis, ("覆盖率可能不足", "变量覆盖", "样本覆盖")):
+    if item_id == "exogenous.coverage":
         profiles = exogenous.get("series") or {}
         if not profiles:
             scope, remediation = _missing_scope(
@@ -325,7 +298,7 @@ def _advanced_assessment(
             "inherent",
             None,
         )
-    if _contains_any(hypothesis, ("长期漂移", "变量趋势", "驱动漂移")):
+    if item_id == "exogenous.trend":
         trends = exogenous.get("series") or {}
         drifting = _drifting_variables(trends)
         if drifting is None:
@@ -347,7 +320,7 @@ def _advanced_assessment(
             "inherent",
             None,
         )
-    if _contains_any(hypothesis, ("响应可能不是单调", "分位响应", "响应形状")):
+    if item_id == "relationships.quantile_response":
         responses = {
             name: result["feature_quantile_response"]
             for name, result in relationships.get("series", {}).items()
@@ -373,9 +346,9 @@ def _advanced_assessment(
             "inherent",
             None,
         )
-    if _contains_any(hypothesis, ("自身非平稳", "驱动非平稳", "共同趋势")):
+    if item_id == "exogenous.stationarity":
         return _driver_stationarity_assessment(exogenous, enabled_functions)
-    if _contains_any(hypothesis, ("平稳", "差分", "去趋势", "单位根", "稳定水平")):
+    if item_id == "price.stationarity":
         stationarity = price.get("stationarity")
         if not stationarity:
             scope, remediation = _missing_scope(
@@ -395,11 +368,14 @@ def _advanced_assessment(
         return (
             "price.stationarity",
             status,
-            f"ADF/KPSS 结论为 {verdict}，建议变换：{stationarity.get('recommended_transform')}。",
+            (
+                f"平稳性检验的结论是{stationarity_text(verdict)}；"
+                f"{transform_text(stationarity.get('recommended_transform'))}。"
+            ),
             scope,
             remediation,
         )
-    if _contains_any(hypothesis, ("季节成分", "趋势成分", "成分分解", "残差占比")):
+    if item_id == "price.decomposition":
         decomposition = price.get("decomposition")
         if not decomposition:
             scope, remediation = _missing_scope(
@@ -422,7 +398,7 @@ def _advanced_assessment(
             "inherent",
             None,
         )
-    if _contains_any(hypothesis, ("直接记忆", "偏自相关", "自回归阶", "随机游走")):
+    if item_id == "price.partial_autocorrelation":
         memory = price.get("partial_autocorrelation")
         if not memory:
             scope, remediation = _missing_scope(
@@ -441,7 +417,7 @@ def _advanced_assessment(
             "inherent",
             None,
         )
-    if _contains_any(hypothesis, ("聚集", "成片", "状态画像", "负价频率")):
+    if item_id == "price.spike_regime":
         regime = price.get("spike_regime")
         if not regime:
             scope, remediation = _missing_scope(
@@ -463,7 +439,7 @@ def _advanced_assessment(
             "inherent",
             None,
         )
-    if _contains_any(hypothesis, ("持续曲线", "高价时段", "价格集中度", "贡献主要价值")):
+    if item_id == "price.duration_curve":
         curve = price.get("duration_curve")
         if not curve:
             scope, remediation = _missing_scope(
@@ -485,7 +461,7 @@ def _advanced_assessment(
             "inherent",
             None,
         )
-    if _contains_any(hypothesis, ("厚尾", "方差稳定", "变换")):
+    if item_id == "price.variance_stabilization":
         stabilization = price.get("variance_stabilization")
         if not stabilization:
             scope, remediation = _missing_scope(
@@ -508,7 +484,7 @@ def _advanced_assessment(
             "inherent",
             None,
         )
-    if _contains_any(hypothesis, ("朴素基线", "误差底线", "达标线")):
+    if item_id == "price.naive_baselines":
         baselines = price.get("naive_baselines")
         if not baselines:
             scope, remediation = _missing_scope(
@@ -521,11 +497,14 @@ def _advanced_assessment(
         return (
             "price.naive_baselines",
             "candidate_support",
-            f"最优朴素基线为{baselines.get('best_baseline_label')}，MAE {_fmt(baselines.get('best_mae'))}。",
+            (
+                f"误差最低的朴素基线是{baselines.get('best_baseline_label')}，"
+                f"平均绝对误差 {_fmt(baselines.get('best_mae'))}。"
+            ),
             "inherent",
             None,
         )
-    if _contains_any(hypothesis, ("多重共线", "共线性冗余", "变量冗余结构")):
+    if item_id == "exogenous.multicollinearity":
         multicollinearity = exogenous.get("multicollinearity")
         if not multicollinearity:
             scope, remediation = _missing_scope(
@@ -545,7 +524,7 @@ def _advanced_assessment(
             "inherent",
             None,
         )
-    if _contains_any(hypothesis, ("非线性依赖", "互信息")):
+    if item_id == "relationships.mutual_information":
         information = relationships.get("mutual_information")
         if not information:
             scope, remediation = _missing_scope(
@@ -564,7 +543,7 @@ def _advanced_assessment(
             "inherent",
             None,
         )
-    if _contains_any(hypothesis, ("前置性", "granger", "自回归拟合")):
+    if item_id == "relationships.granger":
         precedence = relationships.get("granger_precedence")
         if not precedence:
             scope, remediation = _missing_scope(
@@ -583,7 +562,7 @@ def _advanced_assessment(
             "inherent",
             None,
         )
-    if _contains_any(hypothesis, ("随时间漂移", "反号", "关系稳定性")):
+    if item_id == "relationships.rolling_stability":
         stability = relationships.get("rolling_stability")
         if not stability:
             scope, remediation = _missing_scope(
@@ -606,18 +585,27 @@ def _advanced_assessment(
 
 
 def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[HypothesisAssessment]:
-    assessments: list[HypothesisAssessment] = []
+    """Assess every planned hypothesis, keeping one row per agenda item.
+
+    A plan carries both the model's own wording and the wording each selected
+    function registers, so two differently phrased hypotheses regularly resolve
+    to the same agenda item and the same evidence. Only the first wording is
+    kept; otherwise the report and the revision agenda would count one question
+    twice.
+    """
+
+    assessments: dict[str, HypothesisAssessment] = {}
     price = summary.get("price", {})
     exogenous = summary.get("exogenous", {})
     relationships = summary.get("relationships", {}).get("series", {})
     comparisons = summary.get("comparisons", {})
     enabled_functions = {step.function for step in plan.enabled_steps}
     for hypothesis in plan.hypotheses:
-        item_id = ""
+        item_id = resolve_agenda_item(hypothesis) or ""
         scope: AgendaScope = "inherent"
         remediation: str | None = None
         advanced = _advanced_assessment(
-            hypothesis,
+            item_id,
             price=price,
             exogenous=exogenous,
             relationships=summary.get("relationships", {}),
@@ -625,8 +613,7 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
         )
         if advanced is not None:
             item_id, status, evidence, scope, remediation = advanced
-        elif _contains_any(hypothesis, ("尖峰", "极端", "负价", "峰值", "高价尖峰", "异常价格", "尾部")):
-            item_id = "price.extremes"
+        elif item_id == "price.extremes":
             extremes = price.get("extremes")
             if not extremes:
                 status, evidence = "not_tested", "本轮未执行电价极端值方法。"
@@ -640,8 +627,7 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
                 count = int(extremes.get("high_spike_count", 0)) + int(extremes.get("extreme_low_count", 0))
                 status = "candidate_support" if count else "not_supported"
                 evidence = f"IQR 规则识别到 {count} 个极端高低价观测。"
-        elif _contains_any(hypothesis, ("自相关", "序列相关", "序列持续性", "价格持续性", "价格滞后结构")):
-            item_id = "price.autocorrelation"
+        elif item_id == "price.autocorrelation":
             rows = [row for row in price.get("autocorrelation", []) if row.get("correlation") is not None]
             strongest = max((abs(float(row["correlation"])) for row in rows), default=None)
             if strongest is None:
@@ -655,11 +641,7 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
             else:
                 status = "candidate_support" if strongest >= 0.2 else "not_supported"
                 evidence = f"扫描范围内最大绝对自相关为 {strongest:.3f}。"
-        elif _contains_any(
-            hypothesis,
-            ("日内", "周内", "月份结构", "月度结构", "季节性", "季节结构", "小时结构", "日历结构"),
-        ):
-            item_id = "price.seasonality"
+        elif item_id == "price.seasonality":
             seasonality = price.get("seasonality")
             if not seasonality:
                 status, evidence = "not_tested", "本轮未执行季节性方法。"
@@ -681,7 +663,7 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
                 shares = {
                     label: share
                     for label in ("hour_of_day", "day_of_week", "month")
-                    if (share := _group_variance_share(seasonality.get(label))) is not None
+                    if (share := group_variance_share(seasonality.get(label))) is not None
                 }
                 if strengths:
                     strongest = max(strengths)
@@ -692,7 +674,7 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
                     status = (
                         "candidate_support" if widest >= CALENDAR_EFFECT_THRESHOLD else "not_supported"
                     )
-                    evidence = f"{spread_text}{label} 分组解释了 {widest:.1%} 的电价方差。"
+                    evidence = f"{spread_text}按{GROUP_LABELS.get(label, label)}分组能解释 {widest:.1%} 的电价波动。"
                 else:
                     status, evidence = "not_tested", "季节分组样本不足。"
                     scope, remediation = _missing_scope(
@@ -701,8 +683,7 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
                         approval_message="需要批准加入日历分组函数后才能验证该假设。",
                         data_message="已启用日历分组函数，但当前分组样本不足。",
                     )
-        elif _contains_any(hypothesis, ("共线性", "变量冗余", "驱动冗余", "高度相关变量")):
-            item_id = "exogenous.collinearity"
+        elif item_id == "exogenous.collinearity":
             pairs = exogenous.get("strong_collinearity_pairs")
             if pairs is None:
                 status, evidence = "not_tested", "本轮未执行共线性方法。"
@@ -714,9 +695,8 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
                 )
             else:
                 status = "candidate_support" if pairs else "not_supported"
-                evidence = f"检测到 {len(pairs)} 对超过阈值的变量。"
-        elif _contains_any(hypothesis, ("异常观测", "异常值", "离群", "变量异常")):
-            item_id = "exogenous.outliers"
+                evidence = f"有 {len(pairs)} 对变量彼此高度相关。"
+        elif item_id == "exogenous.outliers":
             series = exogenous.get("series", {})
             counts = sum(int(item.get("outlier_count", 0)) for item in series.values())
             tested = any("outlier_count" in item for item in series.values())
@@ -729,9 +709,7 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
                     approval_message="需要批准加入外生变量异常值函数后才能验证该假设。",
                     data_message="已启用变量异常值函数，但当前没有可用异常值证据。",
                 )
-        elif _contains_any(hypothesis, ("同期线性", "同期关系", "同期相关", "线性关系", "单调关系")):
-            monotonic = _contains_any(hypothesis, ("单调关系",))
-            item_id = "relationships.monotonic" if monotonic else "relationships.contemporaneous"
+        elif item_id in {"relationships.contemporaneous", "relationships.monotonic"}:
             coefficients = [
                 abs(float(metric["correlation"]))
                 for result in relationships.values()
@@ -749,9 +727,8 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
                 )
             else:
                 status = "candidate_support" if strongest >= 0.1 else "not_supported"
-                evidence = f"最大绝对同期关系系数为 {strongest:.3f}，尚未控制时间序列混杂。"
-        elif _contains_any(hypothesis, ("领先间隔", "领先滞后", "领先关系", "滞后关系", "领先变化", "滞后变化")):
-            item_id = "relationships.lead_lag"
+                evidence = f"同一时刻的最大绝对相关系数为 {strongest:.3f}，尚未排除共同趋势和季节规律。"
+        elif item_id == "relationships.lead_lag":
             best_rows = [
                 result.get("best_absolute_lag") or {}
                 for result in relationships.values()
@@ -768,41 +745,56 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
                 )
             else:
                 status = "candidate_support" if positive else "not_supported"
-                evidence = f"{len(positive)}/{len(best_rows)} 个变量的绝对相关峰值出现在正领先位置。"
-        elif _contains_any(
-            hypothesis,
-            ("峰段", "谷段", "夏季", "冬季", "事件前", "事件后", "分段", "分段差异", "时段差异"),
-        ):
-            prefer_relationship = _contains_any(hypothesis, ("关系差异",))
-            item_id = "comparisons.relationship_segments" if prefer_relationship else "comparisons.price_segments"
+                evidence = f"{len(positive)}/{len(best_rows)} 个变量在正的提前量上相关最强。"
+        elif item_id in {"comparisons.price_segments", "comparisons.relationship_segments"}:
+            prefer_relationship = item_id == "comparisons.relationship_segments"
             price_contrasts = [
-                row
+                (comparison, row)
                 for comparison in comparisons.get("price", {}).values()
                 for row in comparison.get("contrasts", [])
                 if row.get("mean_difference_left_minus_right") is not None
             ]
             relationship_contrasts = [
-                row
+                (comparison, variable, row)
                 for comparison in comparisons.get("relationships", {}).values()
-                for result in comparison.get("series", {}).values()
+                for variable, result in comparison.get("series", {}).items()
                 for row in result.get("contrasts", [])
                 if row.get("correlation_difference_left_minus_right") is not None
             ]
             if price_contrasts and not (prefer_relationship and relationship_contrasts):
-                largest = max(price_contrasts, key=lambda row: abs(row["mean_difference_left_minus_right"]))
+                comparison, largest = max(
+                    price_contrasts,
+                    key=lambda item: abs(item[1]["mean_difference_left_minus_right"]),
+                )
+                volatility = [
+                    (item_comparison, row)
+                    for item_comparison, row in price_contrasts
+                    if row.get("std_difference_left_minus_right") is not None
+                ]
+                volatility_text = ""
+                if volatility:
+                    volatility_comparison, volatility_largest = max(
+                        volatility,
+                        key=lambda item: abs(item[1]["std_difference_left_minus_right"]),
+                    )
+                    volatility_text = (
+                        f"；{_segment_pair_label(volatility_comparison, volatility_largest)}的标准差相差 "
+                        f"{abs(float(volatility_largest['std_difference_left_minus_right'])):.3f}"
+                    )
                 status = "candidate_support"
                 evidence = (
-                    "分段均值最大绝对差为 "
-                    f"{abs(float(largest['mean_difference_left_minus_right'])):.3f}，仍属于描述性比较。"
+                    f"{_segment_pair_label(comparison, largest)}的均值相差 "
+                    f"{abs(float(largest['mean_difference_left_minus_right'])):.3f}"
+                    f"{volatility_text}，仍属于描述性比较。"
                 )
             elif relationship_contrasts:
-                largest = max(
+                comparison, variable, largest = max(
                     relationship_contrasts,
-                    key=lambda row: abs(row["correlation_difference_left_minus_right"]),
+                    key=lambda item: abs(item[2]["correlation_difference_left_minus_right"]),
                 )
                 status = "candidate_support"
                 evidence = (
-                    "分段相关系数最大绝对差为 "
+                    f"{variable} 在{_segment_pair_label(comparison, largest)}的相关系数相差 "
                     f"{abs(float(largest['correlation_difference_left_minus_right'])):.3f}。"
                 )
             else:
@@ -815,10 +807,11 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
                 )
         else:
             item_id = f"hypothesis:{hashlib.sha256(hypothesis.encode('utf-8')).hexdigest()[:12]}"
-            status, evidence = "not_tested", "假设措辞未匹配预定义的确定性验收规则，本轮未验证该假设。"
+            status, evidence = "not_tested", "本轮的分析方法里没有能判定这条说法的检验。"
             scope = "needs_restatement"
-            remediation = "请把该假设改写为可由已授权函数验证的表述，或明确确认不再追踪它。"
-        assessments.append(
+            remediation = "请把它改写成本轮方法能判定的说法，或者确认不再跟踪它。"
+        assessments.setdefault(
+            item_id,
             HypothesisAssessment(
                 item_id=item_id,
                 hypothesis=hypothesis,
@@ -826,9 +819,22 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
                 evidence=evidence,
                 scope=scope,
                 remediation=remediation,
-            )
+            ),
         )
-    return assessments
+    for hypothesis in plan.unverifiable_hypotheses:
+        item_id = f"hypothesis:{hashlib.sha256(hypothesis.encode('utf-8')).hexdigest()[:12]}"
+        assessments.setdefault(
+            item_id,
+            HypothesisAssessment(
+                item_id=item_id,
+                hypothesis=hypothesis,
+                status="not_tested",
+                evidence="这条说法没有对应的确定性研究函数，因此未进入本轮执行议程。",
+                scope="needs_restatement",
+                remediation="请把它改写为当前研究函数能判定的说法，或者确认不再跟踪它。",
+            ),
+        )
+    return list(assessments.values())
 
 
 def evaluate_agent_run(
@@ -913,9 +919,7 @@ def evaluate_agent_run(
                 ),
             )
         )
-        warnings.extend(
-            f"{issue.series or '研究'}：{_issue_message(issue.code, issue.message)}" for issue in severe_issues[:6]
-        )
+        warnings.extend(issue_line(issue) for issue in severe_issues[:6])
     else:
         checks.append(EvaluationCheck(name="数据风险", status="pass", message="未检测到高优先级数据风险。"))
 
@@ -948,33 +952,34 @@ def evaluate_agent_run(
         extremes = price.get("extremes")
         if distribution and extremes:
             findings.append(
-                "电价均值/中位数为 "
-                f"{_fmt(distribution.get('mean'))}/{_fmt(distribution.get('median'))}，"
-                f"高价尖峰 {extremes.get('high_spike_count', 0)} 个。"
+                f"多数时候电价在 {_fmt(distribution.get('median'))} 附近，"
+                f"平均值 {_fmt(distribution.get('mean'))}，"
+                f"另有 {extremes.get('high_spike_count', 0)} 个极端高价时点。"
             )
         elif distribution:
             findings.append(
-                f"电价均值/中位数为 {_fmt(distribution.get('mean'))}/{_fmt(distribution.get('median'))}。"
+                f"多数时候电价在 {_fmt(distribution.get('median'))} 附近，"
+                f"平均值 {_fmt(distribution.get('mean'))}。"
             )
         elif extremes:
-            findings.append(f"本轮识别到高价尖峰 {extremes.get('high_spike_count', 0)} 个。")
+            findings.append(f"本轮识别到 {extremes.get('high_spike_count', 0)} 个极端高价时点。")
 
         stationarity = price.get("stationarity")
         if stationarity:
             findings.append(
-                f"平稳性结论为 {stationarity.get('verdict')}；建模前建议的变换是 "
-                f"{stationarity.get('recommended_transform')}。"
+                f"电价{stationarity_text(stationarity.get('verdict'))}，"
+                f"{transform_text(stationarity.get('recommended_transform'))}。"
             )
             if stationarity.get("verdict") != "stationary":
                 checks.append(
                     EvaluationCheck(
                         name="平稳性",
                         status="warning",
-                        message="目标序列未通过水平平稳性判定，同期相关可能包含共同趋势成分。",
+                        message="电价本身不围绕固定水平波动，同期相关里可能混进了共同趋势。",
                         scope="inherent",
                     )
                 )
-                followups.append("建模前先对目标序列做差分或去季节处理，再重新评估关系强度。")
+                followups.append("建模前先对电价做差分或去掉季节成分，再重新评估这些关系的强度。")
 
         decomposition = price.get("decomposition")
         if decomposition:
@@ -983,22 +988,24 @@ def evaluate_agent_run(
                 str(decomposition.get("dominant_seasonality")), "未识别"
             )
             findings.append(
-                f"趋势与季节分解显示残差方差占比为 {_share(remainder)}，主导季节成分为{dominant}。"
+                f"价格里最明显的重复规律是{dominant}；拆掉趋势和周期之后，"
+                f"仍有 {_share(remainder)} 的波动无法解释。"
             )
 
         regime = price.get("spike_regime")
         if regime:
             findings.append(
-                f"尖峰时段占比 {_share(regime.get('high_spike_share'))}，负价时段占比 "
-                f"{_share(regime.get('negative_share'))}，最长尖峰持续 "
-                f"{regime.get('high_episodes', {}).get('max_duration_intervals', 0)} 个间隔。"
+                f"价格尖峰占 {_share(regime.get('high_spike_share'))} 的时段，"
+                f"负价占 {_share(regime.get('negative_share'))}，"
+                f"最长的一段尖峰连续了 "
+                f"{regime.get('high_episodes', {}).get('max_duration_intervals', 0)} 个时段。"
             )
 
         baselines = price.get("naive_baselines")
         if baselines:
             findings.append(
-                f"朴素基线误差底线：{baselines.get('best_baseline_label')} 的 MAE 为 "
-                f"{_fmt(baselines.get('best_mae'))}。"
+                f"直接照抄历史价格中效果最好的是「{baselines.get('best_baseline_label')}」，"
+                f"平均绝对误差 {_fmt(baselines.get('best_mae'))}；后续模型必须低于这个数字。"
             )
             checks.append(
                 EvaluationCheck(
@@ -1009,11 +1016,11 @@ def evaluate_agent_run(
                 )
             )
             if not baselines.get("percentage_errors_reliable", True):
-                warnings.append("目标序列存在接近零的取值，百分比类误差指标（MAPE）不可靠。")
+                warnings.append("电价里有接近零的取值，用百分比表示的误差指标（如 MAPE）在这条序列上会失真。")
 
         stabilization = price.get("variance_stabilization")
         if stabilization and stabilization.get("recommended_transform") != "none":
-            followups.append("建模阶段先做 median/MAD 稳健标准化与 asinh 方差稳定变换，再训练模型。")
+            followups.append("训练模型之前，先做一次稳健标准化和 asinh 变换来压缩极端值。")
 
     exogenous_evidence = summary.get("exogenous", {})
     multicollinearity = exogenous_evidence.get("multicollinearity")
@@ -1032,7 +1039,9 @@ def evaluate_agent_run(
             )
         )
         if severe:
-            warnings.append(f"高度冗余变量：{'、'.join(severe[:5])}；建模时应择一保留或做降维。")
+            warnings.append(
+                f"{'、'.join(severe[:5])} 提供的信息和其他变量大量重叠，建模时保留一个代表即可。"
+            )
 
     driver_stationarity = exogenous_evidence.get("driver_stationarity")
     if driver_stationarity:
@@ -1061,8 +1070,10 @@ def evaluate_agent_run(
     if stability:
         unstable = stability.get("unstable_variables") or []
         if unstable:
-            warnings.append(f"关系随时间不稳定的变量：{'、'.join(unstable[:5])}。")
-            followups.append("对关系不稳定的变量，按时间分段重新评估，或改用时变系数模型。")
+            warnings.append(
+                f"{'、'.join(unstable[:5])} 与电价的关系随时间明显变化，全时段的相关系数代表不了各个阶段。"
+            )
+            followups.append("对关系不稳定的变量，按时间分段重新评估，或者改用系数随时间变化的模型。")
 
     relationships = summary.get("relationships", {}).get("series", {})
     ranked: list[tuple[str, str, float, float | None, int | None]] = []
@@ -1081,14 +1092,19 @@ def evaluate_agent_run(
     ranked.sort(key=lambda row: abs(row[2]), reverse=True)
     if ranked:
         for name, method, correlation, p_value, lag in ranked[:3]:
-            lag_text = f"，出现在领先 {lag} 个间隔处" if lag is not None else ""
+            if lag:
+                position = f"提前 {lag} 个时段时"
+            elif method == "同期 Spearman":
+                position = "在同一时刻按大小排序比较"
+            else:
+                position = "在同一时刻"
             if p_value is None:
                 p_text = ""
             elif p_value == 0:
-                p_text = "，未校正 p<1e-12"
+                p_text = "（p 远小于 0.001，未做多重比较校正）"
             else:
-                p_text = f"，未校正 p={p_value:.3g}"
-            findings.append(f"{name} 的{method}相关系数为 {correlation:.3f}{lag_text}{p_text}。")
+                p_text = f"（p={p_value:.3g}，未做多重比较校正）"
+            findings.append(f"{name} 与电价{position}的相关系数为 {correlation:.3f}{p_text}。")
         meaningful = [row for row in ranked if abs(row[2]) >= 0.1]
         checks.append(
             EvaluationCheck(
@@ -1143,10 +1159,10 @@ def evaluate_agent_run(
                     scope="inherent",
                 )
             )
-            warnings.append("关系系数可能受到共同趋势、日内/周内季节性和序列自相关影响。")
+            warnings.append("这些相关系数还没有排除共同趋势、日内和周内规律，以及电价自身的延续性。")
         if "lag_scan" in relationship_methods:
-            warnings.append("最佳滞后来自多位置扫描，当前 p 值未进行多重检验校正。")
-            followups.append("对候选变量先去趋势、去季节性，再进行带多重检验控制的滞后稳定性分析。")
+            warnings.append("最合适的提前量是在多个位置里挑出来的，p 值没有做多重比较校正，显著性会被高估。")
+            followups.append("先给候选变量去掉趋势和季节成分，再重新检查提前量是否稳定，并对显著性做多重比较校正。")
     elif "relationships" in summary:
         checks.append(
             EvaluationCheck(
@@ -1157,7 +1173,7 @@ def evaluate_agent_run(
                 remediation="请检查变量覆盖率、研究窗口和最小样本门槛后重新开始关系分析。",
             )
         )
-        followups.append("检查变量覆盖率、研究窗口和最小样本门槛后重新规划关系分析。")
+        followups.append("先检查变量的数据完整度、研究时段和最小样本要求，再重新安排关系分析。")
 
     comparisons = summary.get("comparisons", {})
     comparison_count = 0
@@ -1181,10 +1197,25 @@ def evaluate_agent_run(
         ]
         if usable:
             largest = max(usable, key=lambda row: abs(row["mean_difference_left_minus_right"]))
-            findings.append(
-                f"分段对比 {comparison_id} 的最大绝对均值差为 "
-                f"{abs(float(largest['mean_difference_left_minus_right'])):.3f}。"
+            finding = (
+                f"分段对比 {comparison_id} 中，{_segment_pair_label(comparison, largest)}的均值相差 "
+                f"{abs(float(largest['mean_difference_left_minus_right'])):.3f}"
             )
+            volatility = [
+                row
+                for row in comparison.get("contrasts", [])
+                if row.get("std_difference_left_minus_right") is not None
+            ]
+            if volatility:
+                volatility_largest = max(
+                    volatility,
+                    key=lambda row: abs(row["std_difference_left_minus_right"]),
+                )
+                finding += (
+                    f"；{_segment_pair_label(comparison, volatility_largest)}的标准差相差 "
+                    f"{abs(float(volatility_largest['std_difference_left_minus_right'])):.3f}"
+                )
+            findings.append(f"{finding}。")
     for comparison_id, comparison in comparisons.get("relationships", {}).items():
         comparison_count += 1
         usable = [
@@ -1203,8 +1234,16 @@ def evaluate_agent_run(
             comparison_warnings.append(f"{comparison_id} 存在重叠子样本，相关差异需谨慎解释。")
         if usable:
             largest = max(usable, key=lambda row: abs(row["correlation_difference_left_minus_right"]))
+            variable = next(
+                (
+                    name
+                    for name, result in comparison.get("series", {}).items()
+                    if largest in result.get("contrasts", [])
+                ),
+                "变量",
+            )
             findings.append(
-                f"分段关系 {comparison_id} 的最大绝对相关系数差为 "
+                f"分段关系 {comparison_id} 中，{variable} 在不同分段的最大绝对相关系数差为 "
                 f"{abs(float(largest['correlation_difference_left_minus_right'])):.3f}。"
             )
     if comparison_count:
@@ -1226,14 +1265,43 @@ def evaluate_agent_run(
             )
         )
         warnings.extend(comparison_warnings)
-        warnings.append("分段差异是描述性证据；事件前后差异尚未控制趋势、季节性和并发事件。")
+        warnings.append("分段之间的差异只是直接比较的结果，还没有排除趋势、季节以及同时发生的其他因素。")
 
     if any(issue.code == "lookahead_risk" for issue in quality.issues):
-        followups.append("进入预测实验前，排除 observed_only 变量或补齐真实可获得时间。")
+        followups.append("进入预测实验前，去掉只有事后观测值的变量，或者补上它们真实的可获得时间。")
     if relationships:
-        followups.append("将最有证据的关系转化为候选特征，并在滚动时间切分中验证增量价值。")
+        followups.append("把证据最强的关系做成候选特征，并在按时间顺序切分的实验里验证它是否真的提升精度。")
     if not findings:
         findings.append("本轮主要完成数据可用性审查；尚未执行足以支持关系结论的分析步骤。")
+
+    variable_recommendations: dict[str, Any] | None = None
+    if plan.variable_selection_mode == "auto_recommend" and plan.variable_selection_stage == "screening":
+        variable_recommendations = build_variable_recommendations(
+            selected_variables=plan.selected_variables,
+            quality=quality,
+            summary=summary,
+            limit=plan.variable_recommendation_limit,
+        )
+        recommended_names = variable_recommendations["recommended_variables"]
+        recommendation_text = (
+            f"推荐优先深入分析：{'、'.join(recommended_names)}。"
+            if recommended_names
+            else "当前筛查没有形成达到关系门槛的优先变量。"
+        )
+        checks.append(
+            EvaluationCheck(
+                name="外生变量推荐确认",
+                status="warning",
+                message=recommendation_text,
+                scope="needs_approval",
+                remediation="请确认推荐变量、修改变量范围，或选择分析全部合格变量后再执行深入方法。",
+            )
+        )
+        findings.append(
+            f"已完成 {variable_recommendations['screened_variable_count']} 个外生变量的确定性筛查；"
+            f"{recommendation_text}"
+        )
+        followups.append("确认推荐的变量之后，再做分小时、分月份、提前量、非线性和稳定性这几项分析。")
 
     hypothesis_assessments = _assess_hypotheses(plan, summary)
 
@@ -1273,6 +1341,13 @@ def evaluate_agent_run(
         item.hypothesis for item in hypothesis_assessments
         if hypothesis_is_open(item) and item.scope == "needs_restatement"
     ]
+    def listed(items: list[str], limit: int = 3) -> str:
+        """Join items as one clause: they are sentences, so their periods must go."""
+
+        cleaned = [item.strip().rstrip("。") for item in items[:limit] if item.strip()]
+        suffix = f"（另有 {len(items) - limit} 项）" if len(items) > limit else ""
+        return "；".join(cleaned) + suffix
+
     resolved_hypotheses = sum(
         item.status in {"candidate_support", "not_supported"} for item in hypothesis_assessments
     )
@@ -1280,26 +1355,27 @@ def evaluate_agent_run(
     if within_items:
         decision = "revise"
         decision_text = (
-            f"还有 {len(within_items)} 项可以在你已批准的范围内自动补齐："
-            f"{'、'.join(within_items[:4])}。"
+            f"本轮还有 {len(within_items)} 项可以在你已批准的范围内自动补齐：{listed(within_items, 4)}。"
         )
     elif user_items:
         decision = "need_user"
-        parts = ["当前授权范围内已经没有可以自动改进的地方"]
+        parts = [f"本轮有 {len(user_items)} 项待你决定。"]
         if needs_approval_items:
             parts.append(
-                f"{len(needs_approval_items)} 项需要你同意扩大分析范围：{'、'.join(needs_approval_items[:3])}"
+                f"需要你同意扩大分析范围（{len(needs_approval_items)} 项）："
+                f"{listed(needs_approval_items)}。"
             )
         if needs_data_items:
             parts.append(
-                f"{len(needs_data_items)} 项需要补充或修复数据：{'、'.join(needs_data_items[:3])}"
+                f"需要补充或修复数据（{len(needs_data_items)} 项）：{listed(needs_data_items)}。"
             )
         if needs_restatement_items:
             parts.append(
-                f"{len(needs_restatement_items)} 项假设无法用已授权函数验证，需要改写或确认不再追踪："
-                f"{'、'.join(needs_restatement_items[:3])}"
+                f"需要改写或确认不再跟踪的说法（{len(needs_restatement_items)} 项）："
+                f"{listed(needs_restatement_items)}。"
             )
-        decision_text = "；".join(parts) + "。"
+        parts.append("逐条依据见 methods.md 的「假设验收」。")
+        decision_text = "".join(parts)
     else:
         decision = "accept"
         unsettled = [
@@ -1307,15 +1383,28 @@ def evaluate_agent_run(
         ]
         total_hypotheses = len(hypothesis_assessments)
         if unsettled:
+            # The header already carries the run's status; repeating it here says nothing.
             decision_text = (
-                f"本轮计划内的分析已全部完成：{total_hypotheses} 条假设中 {resolved_hypotheses} 条得到明确结论，"
-                f"{len(unsettled)} 条受方法本身限制无法在本轮判定，已在下方逐条列出。"
+                f"本轮登记的 {total_hypotheses} 条判断中，{resolved_hypotheses} 条得到了明确结论，"
+                f"{len(unsettled)} 条受方法本身限制无法在本轮判定。逐条依据见 methods.md 的「假设验收」。"
             )
         else:
             decision_text = (
-                f"本轮研究已收敛：{total_hypotheses} 条假设全部得到明确结论；"
-                "剩余内容属于方法本身的限制，已在下方逐条列出。"
+                f"本轮登记的 {total_hypotheses} 条判断全部得到明确结论。"
+                "逐条依据见 methods.md 的「假设验收」。"
             )
+
+    if variable_recommendations is not None:
+        decision = "need_user"
+        recommended_names = variable_recommendations["recommended_variables"]
+        decision_text = (
+            "外生变量自动筛查已完成。"
+            + (
+                f"推荐优先深入分析 {'、'.join(recommended_names)}；深入方法尚未执行。"
+                if recommended_names
+                else "没有变量达到优先推荐门槛；请查看探索性候选并决定是否继续。"
+            )
+        )
 
     agenda_payload = [
         {
@@ -1396,6 +1485,7 @@ def evaluate_agent_run(
         findings=findings,
         warnings=warnings,
         suggested_followups=list(dict.fromkeys(followups)),
+        variable_recommendations=variable_recommendations,
         feedback_packets=feedback_packets,
         agenda_fingerprint=agenda_fingerprint,
     )

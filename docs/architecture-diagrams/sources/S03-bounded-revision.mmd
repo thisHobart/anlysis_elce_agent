@@ -1,0 +1,23 @@
+sequenceDiagram
+    autonumber
+    participant G as M03 ResearchLoopGraph
+    participant ER as M06 评估
+    participant DP as M04 决策与计划
+    participant DT as M05 数据与执行
+    participant ST as M07 Checkpoint
+
+    G->>ER: 计划 + 本轮结构化证据
+    ER-->>G: revise + FeedbackPacket
+    G->>G: 检查预算和 AuthorizationEnvelope
+    G->>DP: 当前计划 + 结构化反馈 + 可收缩范围
+    DP-->>G: 修订后的 EDAPlan
+    G->>G: guards 校验未扩大函数、变量和滞后
+    G->>ST: checkpoint 新 iteration
+    loop 修订后 ToolCall
+        G->>DT: 执行已授权调用
+        DT-->>G: ToolResult
+    end
+    G->>ER: 下一轮合并证据
+    ER-->>G: accept / need_user / reject
+    Note over G,DP: 自动修订只能删除函数、减少变量或缩短范围；扩大授权必须回到用户审批
+

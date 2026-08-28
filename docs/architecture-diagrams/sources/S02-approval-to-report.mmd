@@ -1,0 +1,30 @@
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant UI as M01 桌面交互
+    participant APP as M02 应用协调
+    participant G as M03 ResearchLoopGraph
+    participant DT as M05 数据与执行
+    participant ER as M06 评估与交付
+    participant ST as M07 状态与契约
+
+    U->>UI: 确认当前方案
+    UI->>APP: resume(approve, plan_id, fingerprint)
+    APP->>G: Command(resume=approval)
+    G->>G: 校验审批事实并 lock_plan
+    G->>ST: checkpoint 授权信封与工具队列
+    loop 每个 ToolCall
+        G->>DT: execute_call(approved ToolCall)
+        DT-->>G: ToolResult + output_hash
+        G->>G: validate_tool_result
+        G->>ST: checkpoint 已提交结果
+    end
+    G->>ER: finalize(plan, quality, merged evidence)
+    ER-->>G: AgentEvaluation = accept
+    ER->>ST: 写入研究包、manifest 和哈希
+    ST-->>ER: ArtifactBundle 路径
+    ER-->>G: report_path + artifact_directory
+    G-->>APP: result interrupt + completed snapshot
+    APP-->>UI: 结果、事件和报告引用
+    UI-->>U: 展示结果卡并打开报告
+

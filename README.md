@@ -19,7 +19,7 @@
 - 真正执行分析时至少需要目标电价数据；没有文件时仍可讨论研究方法。
 - 方案由大模型生成、只读展示；想改就直接用自然语言说，助手会给出修订版。
 - 只想确认数据能不能用时，方案可以只包含数据体检一步。
-- 每版方案等待 30 秒，没有反馈就自动开始；开始输入修改意见时倒计时暂停。
+- 每版方案默认等待明确确认；可以继续询问、自然语言修改或拒绝，不会因用户暂时离开而自动执行。
 - 会话保存最新证据和多轮运行血缘，重启后仍可继续追问已有结果。
 - 单条会话记录损坏只影响它自己：其余会话照常载入，坏记录隔离到同目录的 `*.damaged-*.json`；整个文件无法解析时原文件改名保留，程序不会覆盖它。每次保存留一份 `.bak`。
 
@@ -35,8 +35,8 @@
 | 电价与因素的关系 | Pearson / Spearman、领先滞后扫描、互信息非线性依赖、Granger 样本内前置性、分小时/分月份差异、分位响应、滚动相关稳定性、分段关系对比 |
 | 可预测性判断 | 方差稳定变换检查、持续法/日naive/周naive 的朴素基线误差底线 |
 
-统计实现基于 numpy / pandas / scipy / statsmodels，不自行重写标准检验。方法依据与取舍记录在
-[app/research/skills/price-exogenous-eda/references/methodology.md](app/research/skills/price-exogenous-eda/references/methodology.md)。
+统计实现基于 numpy / pandas / scipy / statsmodels，不自行重写标准检验。研究顺序与方法取舍记录在
+[Skill 说明](app/research/skills/price-exogenous-eda/SKILL.md)和[研究协议](app/research/skills/price-exogenous-eda/references/research-protocol.yaml)中。
 
 ## 研究方法包（Skill）
 
@@ -49,12 +49,12 @@
 
 ## 研究报告
 
-每次分析生成一个独立结果文件夹，主报告是自包含的 `report.html`：
+每次分析生成一个独立结果文件夹，主报告是 `report.md`，由桌面端内置报告阅读器直接展示：
 
-- 概览卡片、结论与限制、分析步骤、数据体检、电价规律、影响因素、关系证据、可预测性，共八个可跳转章节。
-- 图表全部是内联 SVG（时序、分布、持续曲线、日历画像、自相关/偏自相关、成分占比、相关排序、相关矩阵、领先滞后曲线、互信息、前置性、滚动稳定性、分段对比），无外部依赖、可缩放、可直接打印成 PDF。
-- 面向复核人员的编号、指纹、函数版本和参数收在最后的折叠区，正文只讲结论和证据。
-- 同一内容另存一份 `report.md`；`figures/` 保留每张图的 SVG 源文件。
+- `report.md` 只回答“证据说明了什么”：结论、数据与口径，然后每个分析步骤一节，按“图 → 读图 → 关键数字”排列；读图文字由确定性模板按判读阈值生成。
+- 图表保存为 SVG（时序、分布、持续曲线、日历画像、自相关/偏自相关、成分占比、相关排序、相关矩阵、领先滞后曲线、互信息、前置性、滚动稳定性、分段对比），桌面阅读器按窗口宽度清晰缩放。
+- `methods.md` 是方法与验收台账：研究设计、逐函数参数与判读口径、判读阈值、有效性核验和假设验收，并回链到报告中对应的小节。同一件事只在一处说明，报告与桌面卡片不再重复。
+- 方案修订后的报告标题和议程只反映本轮实际执行函数；旧轮反馈进入历史，不会伪装成本轮限制。
 
 ## Agent 架构
 
@@ -119,18 +119,24 @@ start_desktop.bat
 
 ## LLM 配置
 
-复制 `.env.example` 为 `.env`，填写 OpenAI 兼容模型：
+复制 `.env.example` 为 `.env`，填写支持原生 Function Calling 的模型端点：
 
 ```dotenv
+VPP_LLM_PROVIDER=custom
+VPP_LLM_API_STYLE=chat
 VPP_LLM_BASE_URL=http://127.0.0.1:xxxx/v1
 VPP_LLM_API_KEY=local-placeholder
 VPP_LLM_MODEL=your-model-name
+# 后台可选；桌面配置不会改写该值
+VPP_LLM_REASONING_EFFORT=
 VPP_SKILL_PATHS=
 ```
 
-研究对话、函数提议和方案修订使用大模型。模型未配置、调用失败或返回无效方案时，任务会停止并提示重试，不存在本地关键词规划回退。大模型只承担受限路由和 Function Call 提议；研究阶段、函数顺序、门禁和停止条件来自本地领域协议。DeepSeek 全部模型固定发送 `enable_thinking=false`；自定义 OpenAI 兼容接口同时发送 `enable_thinking=false` 与 `chat_template_kwargs.enable_thinking=false`。任一路径返回非空 `reasoning_content` 或 `<think>...</think>` 时立即失败，不进入 LangGraph 状态。
+桌面端可以选择 `DeepSeek`、`Qwen` 或 `Custom`，以及 `Chat Completions` 或 `Responses` API；旧配置按 `custom + chat` 读取，不根据 URL 猜供应商，也不会在两种 API 间自动切换。Provider 只控制已知的附加请求参数：DeepSeek Chat 使用 `thinking.type=disabled`，Qwen Chat 使用 `enable_thinking=false`，两者的 Responses 请求使用 `reasoning.effort=none`。Custom 默认不注入推理参数；后台只有显式配置 `VPP_LLM_REASONING_EFFORT` 时才会映射为 Chat 的 `reasoning_effort` 或 Responses 的 `reasoning.effort`。桌面保存连接配置时不会覆盖该隐藏设置。
 
-结构化输出固定使用模型 Function Calling；模型或 OpenAI 兼容接口需要支持 Function Calling。
+研究对话、函数提议和方案修订使用大模型。模型未配置、调用失败或返回无效方案时，任务会停止并提示重试，不存在本地关键词规划回退。大模型只承担受限路由和 Function Call 提议；研究阶段、函数顺序、门禁和停止条件来自本地领域协议。响应中的 `reasoning_content`、reasoning 内容块或 `<think>...</think>` 不会进入 LangGraph 状态；默认丢弃，严格策略下拒绝本次响应。
+
+消息由 Agent 内部的类型化角色统一表达，再由所选 API 适配器编码。结构化决策和研究函数选择固定使用原生 Function Calling；若端点拒绝 `tools`、`tool_choice` 或未返回函数调用，系统会报告协议不兼容，不会改用提示词 JSON。只有温度、Provider 自动添加的推理控制和并行调用开关可以在端点明确拒绝后移除。
 
 大模型只能从 Skill 授权的原子研究函数中选择具体调用。每个函数名唯一对应一种确定性统计过程；本地编译器再按领域协议重排并校验。执行计划保存 Skill、领域协议、函数名、函数版本、参数、输入数据指纹和代码环境，版本不匹配时拒绝执行。
 
@@ -140,7 +146,7 @@ VPP_SKILL_PATHS=
 
 函数执行实例使用 `call_id` 记录计划与步骤溯源，可复用工作使用 `work_id` 标识“同一数据、函数版本和参数”。自动修订可以复用相同 `work_id` 的确定性结果；缓存最多 64 项。循环收敛直接比较工具 `work_id + output_hash`，可识别 A→B→A 振荡。
 
-Graph checkpoint 只保留最近 160 条带 sequence 的事件、80 条对话上下文和紧凑运行引用；完整界面轨迹保存在桌面会话投影中。Graph schema 升级前会安全识别旧 checkpoint，SQLite 原始状态先备份再重建。
+Graph checkpoint 只保留最近 160 条带 sequence 的事件、120 条对话上下文、与当前数据指纹匹配的结构化 Episode 摘要和紧凑运行引用；完整工具结果写入 checkpoint 同级的结果存储，Graph 中只留经过哈希校验的引用。每次运行到达用户交互点后仅保留最新可恢复 checkpoint，完整界面轨迹仍保存在桌面会话投影中。Graph schema 升级后，旧 checkpoint 只读保留并提示新建对话，不在旧会话中迁移或重建。
 
 正式桌面默认把研究结果写入用户 `Documents/PriceResearchAgent/research/`，可用 `PRICE_RESEARCH_OUTPUT_DIRECTORY` 覆盖；内部 SQLite、会话和循环审计写入用户应用数据目录，可用 `PRICE_RESEARCH_APP_DATA_DIRECTORY` 覆盖。打包程序不会向安装目录或 PyInstaller 临时目录写研究数据。
 
@@ -161,17 +167,6 @@ PyInstaller 必须在 Windows 上构建 Windows 程序。第一次建议使用�
 ```
 
 输出位于 `dist/PriceResearchAgent/`，或单文件模式下的 `dist/PriceResearchAgent.exe`。打包会自动包含 `app/research/skills/` 下的全部内置 Skill。
-
-## 确定性命令行
-
-桌面端是主要入口。算法回归仍可直接运行：
-
-```powershell
-.\venv\Scripts\python.exe -m app.research.cli `
-  --target data/target_rt_price.csv `
-  --actuals data/feature_actuals.csv `
-  --forecasts data/feature_forecasts.csv
-```
 
 ## 测试
 

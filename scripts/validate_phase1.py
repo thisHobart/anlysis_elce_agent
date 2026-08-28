@@ -121,7 +121,9 @@ def main() -> int:
         "feedback_count": len(values["feedback_packets"]),
         "loop_records": values.get("loop_records", []),
     }
-    evidence_path = Path(latest["artifact_directory"]) / "phase1_loop_acceptance.json"
+    acceptance_directory = args.output.resolve().parent / "acceptance"
+    acceptance_directory.mkdir(parents=True, exist_ok=True)
+    evidence_path = acceptance_directory / f"phase1-loop-{thread_id}.json"
     evidence_path.write_text(json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({**evidence, "explanation": values["assistant_message"][:200]}, ensure_ascii=True, indent=2))
     coordinator.close()

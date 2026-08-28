@@ -21,6 +21,7 @@ class MainWindow(QMainWindow):
         agent: ResearchCoordinator | None = None,
         session_store: SessionStore | None = None,
         plan_feedback_seconds: int = 30,
+        auto_execute_plan: bool = False,
     ) -> None:
         super().__init__()
         self.setObjectName("mainWindow")
@@ -32,6 +33,7 @@ class MainWindow(QMainWindow):
             agent=agent,
             store=session_store,
             plan_feedback_seconds=plan_feedback_seconds,
+            auto_execute_plan=auto_execute_plan,
         )
         toolbar = QToolBar("应用工具", self)
         toolbar.setObjectName("applicationToolbar")
@@ -67,7 +69,13 @@ class MainWindow(QMainWindow):
     def _refresh_model_status(self) -> None:
         settings = get_settings()
         if settings.llm_base_url and settings.llm_model:
-            self.model_status.setText(f"模型：已配置 · {settings.llm_model}")
+            provider = {
+                "deepseek": "DeepSeek",
+                "qwen": "Qwen",
+                "custom": "自定义",
+            }[settings.llm_provider]
+            api_style = "Responses" if settings.llm_api_style == "responses" else "Chat"
+            self.model_status.setText(f"模型：{provider} · {api_style} · {settings.llm_model}")
         else:
             self.model_status.setText("模型：未配置（研究规划不可用）")
 

@@ -54,12 +54,6 @@ def require_datetime_index(values: pd.Series | pd.DataFrame, *, what: str) -> No
         raise TypeError(f"{what} requires a DatetimeIndex")
 
 
-def evenly_spaced_values(values: pd.Series) -> pd.Series:
-    """Return the numeric series on its canonical axis with the original gaps preserved."""
-
-    return values.astype(float)
-
-
 def robust_scale(values: np.ndarray) -> tuple[float, float]:
     """Return the median and the MAD-based robust standard-deviation estimate."""
 

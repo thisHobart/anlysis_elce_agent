@@ -8,34 +8,11 @@ import numpy as np
 import pandas as pd
 
 from app.research.reporting import svg_charts as svg
+from app.research.reporting.capabilities import FIGURE_TITLES
 from app.research.schemas.study import StudyConfig
 
 MAX_TIMELINE_POINTS = 1_400
 WEEKDAY_LABELS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
-
-FIGURE_TITLES: dict[str, str] = {
-    "price_timeseries": "电价时间序列",
-    "price_distribution": "电价分布",
-    "price_duration_curve": "电价持续曲线",
-    "seasonal_patterns": "分小时平均电价",
-    "price_weekday_profile": "分星期平均电价",
-    "price_month_profile": "分月份平均电价",
-    "price_autocorrelation": "电价自相关",
-    "price_partial_autocorrelation": "电价偏自相关",
-    "price_decomposition_variance": "趋势与季节成分方差占比",
-    "price_daily_shape": "分解得到的日内季节形态",
-    "price_naive_baselines": "朴素基线误差底线",
-    "exogenous_multicollinearity": "影响因素方差膨胀因子",
-    "correlation_ranking": "电价—因素同期相关排序",
-    "correlation_matrix": "变量相关矩阵",
-    "lag_relationships": "因素领先电价的相关曲线",
-    "mutual_information": "非线性依赖强度（归一化互信息）",
-    "granger_precedence": "加入变量历史后的残差方差下降",
-    "rolling_stability": "关系随时间的稳定性",
-    "segment_price_comparison": "分段电价均值对比",
-    "segment_relationship_comparison": "分段关系强度对比",
-}
-
 
 def _percent_subtitle(label: str, value: object) -> str:
     if not isinstance(value, (int, float)) or isinstance(value, bool):

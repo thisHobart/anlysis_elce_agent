@@ -9,6 +9,7 @@ import pandas as pd
 
 from app.research.agent.errors import DuplicateResearchFunctionError, ResearchPlanValidationError
 from app.research.agent.schemas import EDAPlan, EDAPlanStep
+from app.research.evaluation.agenda import resolve_agenda_item
 from app.research.planning.contracts import DraftStep, EDAPlanDraft
 from app.research.schemas.study import StudyConfig
 from app.research.skills.contracts import SkillDefinition
@@ -46,12 +47,65 @@ FUNCTION_AGENDA_HYPOTHESES: dict[str, str] = {
     "relationship_rolling_correlation_stability": "电价与变量的关系可能随时间漂移甚至反号。",
 }
 
+FUNCTION_AGENDA_ITEM_IDS: dict[str, str] = {
+    "price_descriptive_distribution": "price.distribution",
+    "price_rolling_mean_std": "price.volatility",
+    "exogenous_descriptive_distribution": "exogenous.coverage",
+    "exogenous_linear_index_trend": "exogenous.trend",
+    "relationship_feature_quartile_response": "relationships.quantile_response",
+    "price_tukey_outer_fence": "price.extremes",
+    "price_calendar_group_profile": "price.seasonality",
+    "price_lag_autocorrelation": "price.autocorrelation",
+    "exogenous_iqr_outliers": "exogenous.outliers",
+    "exogenous_pearson_collinearity": "exogenous.collinearity",
+    "relationship_scipy_pearson_pairwise": "relationships.contemporaneous",
+    "relationship_scipy_spearman_pairwise": "relationships.monotonic",
+    "relationship_pearson_positive_lead_scan": "relationships.lead_lag",
+    "relationship_pearson_by_hour": "relationships.by_hour",
+    "relationship_pearson_by_month": "relationships.by_month",
+    "relationship_pearson_segment_comparison": "comparisons.relationship_segments",
+    "price_segment_distribution_comparison": "comparisons.price_segments",
+    "price_stationarity_tests": "price.stationarity",
+    "price_seasonal_decomposition": "price.decomposition",
+    "price_partial_autocorrelation": "price.partial_autocorrelation",
+    "price_spike_regime_profile": "price.spike_regime",
+    "price_duration_curve": "price.duration_curve",
+    "price_variance_stabilization_check": "price.variance_stabilization",
+    "price_naive_baseline_benchmark": "price.naive_baselines",
+    "exogenous_variance_inflation": "exogenous.multicollinearity",
+    "exogenous_stationarity_tests": "exogenous.stationarity",
+    "relationship_mutual_information_scan": "relationships.mutual_information",
+    "relationship_granger_causality_scan": "relationships.granger",
+    "relationship_rolling_correlation_stability": "relationships.rolling_stability",
+}
 
-def _agenda_hypotheses(draft: EDAPlanDraft, functions: list[str]) -> list[str]:
-    """Ensure atomic Function Calls also produce a deterministic research agenda."""
 
-    generated = [FUNCTION_AGENDA_HYPOTHESES[name] for name in functions if name in FUNCTION_AGENDA_HYPOTHESES]
-    return list(dict.fromkeys([*draft.hypotheses, *generated]))
+def _agenda_hypotheses(draft: EDAPlanDraft, functions: list[str]) -> tuple[list[str], list[str]]:
+    """Build the agenda from the selected functions, keeping one hypothesis per item.
+
+    The planner's own wording is preferred when it resolves to an item, because it
+    is usually the more specific sentence.  A wording that no selected or catalog
+    function can decide is parked instead of entering the agenda: letting it through
+    would make the run ask the user to restate a question the evaluator was never
+    able to answer.
+    """
+
+    generated = {
+        FUNCTION_AGENDA_ITEM_IDS[name]: FUNCTION_AGENDA_HYPOTHESES[name]
+        for name in functions
+        if name in FUNCTION_AGENDA_HYPOTHESES
+    }
+    agenda: dict[str, str] = {}
+    parked: list[str] = []
+    for hypothesis in draft.hypotheses:
+        item_id = resolve_agenda_item(hypothesis)
+        if item_id is None:
+            parked.append(hypothesis)
+            continue
+        agenda.setdefault(item_id, hypothesis)
+    for item_id, hypothesis in generated.items():
+        agenda.setdefault(item_id, hypothesis)
+    return list(agenda.values()), list(dict.fromkeys(parked))
 
 
 def _intervals_per_hour(frequency: str) -> float:
@@ -191,6 +245,11 @@ class EDAPlanCompiler:
         disallowed = sorted(set(functions).difference(skill.allowed_functions))
         if disallowed:
             raise ResearchPlanValidationError(f"Skill {skill.name} 未授权函数：{', '.join(disallowed)}")
+        disallowed_deferred = sorted(set(draft.deferred_functions).difference(skill.allowed_functions))
+        if disallowed_deferred:
+            raise ResearchPlanValidationError(
+                f"Skill {skill.name} 未授权延后函数：{', '.join(disallowed_deferred)}"
+            )
         if len(functions) != len(set(functions)):
             duplicate = next(name for name in functions if functions.count(name) > 1)
             spec = FUNCTION_CATALOG[duplicate]
@@ -213,7 +272,7 @@ class EDAPlanCompiler:
                 function="data_quality",
                 title=quality_catalog.title,
                 description=quality_catalog.description,
-                rationale="任何研究结论都必须先通过确定性数据质量和时间对齐门禁。",
+                rationale="任何研究结论都必须先通过确定性的数据质量与时间对齐核验。",
                 enabled=True,
                 required=True,
                 function_version=quality_catalog.version,
@@ -249,13 +308,18 @@ class EDAPlanCompiler:
                 ),
                 (
                     f"API 模型 {model_name or 'configured-model'} 只提出具体 Function Call；"
-                    "模型网关通过请求参数禁用 thinking，并拒绝任何非空思考响应。"
+                    "模型网关通过请求参数禁用 thinking，并丢弃响应中残留的思考内容。"
                 ),
             ]
         if config.target.unit.casefold() in {"", "unknown", "unspecified"}:
             notes.append("目标电价单位未知，绝对数值和阈值解释前需要用户确认单位。")
         if "unspecified" in config.study.market.casefold():
             notes.append("市场范围尚未明确，当前不生成依赖具体市场规则的解释。")
+        agenda, parked = _agenda_hypotheses(draft, ordered_names)
+        if parked:
+            notes.append(
+                "以下说法没有对应的确定性检验，未列入本轮议程：" + "；".join(parked[:3])
+            )
         return EDAPlan(
             plan_id=uuid4().hex[:12],
             question=question,
@@ -277,8 +341,13 @@ class EDAPlanCompiler:
                 if skill.research_protocol is not None
                 else []
             ),
-            hypotheses=_agenda_hypotheses(draft, ordered_names),
+            hypotheses=agenda,
+            unverifiable_hypotheses=parked,
             selected_variables=selected,
+            variable_selection_mode=draft.variable_selection_mode,
+            variable_selection_stage=draft.variable_selection_stage,
+            deferred_functions=draft.deferred_functions,
+            variable_recommendation_limit=draft.variable_recommendation_limit,
             steps=steps,
             assumptions=assumptions,
             planning_notes=notes,

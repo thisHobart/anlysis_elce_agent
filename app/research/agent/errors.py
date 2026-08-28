@@ -28,6 +28,10 @@ class PlanCompatibilityError(ResearchPlanValidationError):
     """Installed Skill, function, or plan version cannot execute the approved plan."""
 
 
+class SkillVersionMismatchError(PlanCompatibilityError):
+    """A persisted plan belongs to a different installed Skill version."""
+
+
 class DataFingerprintMismatchError(ResearchDataError):
     """Input content no longer matches the fingerprint approved in the plan."""
 

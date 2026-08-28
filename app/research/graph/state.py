@@ -12,9 +12,14 @@ class ResearchLoopState(TypedDict, total=False):
     session_id: str
     phase: str
     control: str
+    return_to_gate: str | None
     loop_cursor: dict[str, Any]
     episode_history: list[dict[str, Any]]
+    episode_summaries: list[dict[str, Any]]
     pending_user_message: str
+    pending_message_id: str | None
+    pending_turn_id: str | None
+    active_turn_id: str | None
     user_request: str
     latest_turn: str
     explanation_request: str
@@ -30,9 +35,12 @@ class ResearchLoopState(TypedDict, total=False):
     planning_failure_fingerprints: list[str]
     user_interrupt_kind: str | None
     plan_origin: str
+    revision_cycle_id: str
+    progress_records: list[dict[str, Any]]
     authorization_envelope: dict[str, Any] | None
     approval_state: dict[str, Any]
     approval_timeout_seconds: int
+    automatic_approval_enabled: bool
     tool_queue: list[dict[str, Any]]
     tool_cursor: int
     tool_records: dict[str, dict[str, Any]]

@@ -1,0 +1,51 @@
+stateDiagram-v2
+    direction TB
+
+    [*] --> idle
+    idle --> understanding: 提交问题 / 恢复会话
+
+    understanding --> planning: 形成或修订研究目标
+    understanding --> awaiting_user: 普通回复 / 请求补充信息
+
+    planning --> validating_plan: 生成 EDAPlan
+    planning --> awaiting_user: 规划失败，需用户决定
+    validating_plan --> planning: 计划错误可自动修复
+    validating_plan --> awaiting_approval: 计划有效
+    validating_plan --> awaiting_user: 计划错误不可自动修复
+
+    awaiting_approval --> executing_tools: approve / timeout_accept
+    awaiting_approval --> understanding: modify
+    awaiting_approval --> stopped: reject / stop
+
+    executing_tools --> validating_result: 单个 ToolCall 完成
+    executing_tools --> evaluating: 工具队列耗尽
+    validating_result --> executing_tools: 校验通过 / 执行下一项
+    validating_result --> planning: 证据问题可修订
+    validating_result --> awaiting_user: 证据限制需用户决定
+
+    evaluating --> planning: revise（授权范围内）
+    evaluating --> awaiting_user: accept / need_user / reject
+
+    awaiting_user --> understanding: followup / next_round / modify
+    awaiting_user --> planning: retry plan
+    awaiting_user --> evaluating: retry finalize / accept limitations
+    awaiting_user --> completed: 接受结果并结束
+    awaiting_user --> stopped: stop
+
+    validating_plan --> failed: 不可恢复的契约错误
+    executing_tools --> failed: 不可恢复的执行错误
+    evaluating --> failed: 不可恢复的最终化错误
+
+    completed --> [*]
+    stopped --> [*]
+    failed --> [*]
+
+    note right of awaiting_user
+      Graph interrupt 暂停运行；
+      ResumePayload 决定下一条迁移。
+    end note
+
+    note right of failed
+      phase 是会话主状态；
+      LoopCursor 另行记录 episode / iteration / call。
+    end note

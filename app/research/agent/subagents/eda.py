@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+import re
 from typing import Any
 
 from pydantic import ValidationError
@@ -13,13 +15,18 @@ from app.llm.gateway import (
     ModelConfigurationError,
     ModelGateway,
     ModelGatewayError,
+    ModelMessage,
     ModelResponseError,
     ModelToolCall,
 )
+from app.research.agent.context import bounded_recent_history
 from app.research.agent.errors import ResearchModelUnavailableError, ResearchPlanValidationError
+from app.research.agent.prompts import PLANNING_PROMPT_VERSION, PLANNING_SYSTEM_PROMPT
 from app.research.agent.schemas import EDAPlan
 from app.research.planning.compiler import EDAPlanCompiler, max_lag_limit
 from app.research.planning.contracts import EDAPlanDraft
+from app.research.planning.variables import eligible_exogenous_variables, screening_function_set
+from app.research.reporting.capabilities import report_capabilities_context
 from app.research.schemas.feedback import FeedbackPacket
 from app.research.schemas.results import DataQualityReport
 from app.research.schemas.study import StudyConfig
@@ -27,8 +34,6 @@ from app.research.skills.contracts import SkillDefinition
 from app.research.tools.catalog import FUNCTION_CATALOG, function_metadata, optional_function_names
 from app.research.tools.eda.functions import build_eda_tool_registry
 from app.research.tools.registry import ToolRegistry
-
-PLANNING_PROMPT_VERSION = "eda-plan-v10"
 
 AGENDA_FUNCTION_NAME = "declare_research_agenda"
 """Planning-protocol call that carries the agenda; never registered, never executed."""
@@ -61,6 +66,20 @@ AGENDA_FUNCTION_SCHEMA: dict[str, Any] = {
                     "items": {"type": "string"},
                     "description": "本轮依赖的前提，例如时区、市场产品或变量可获得性。",
                 },
+                "variable_selection_mode": {
+                    "type": "string",
+                    "enum": ["explicit", "all_eligible", "auto_recommend"],
+                    "description": (
+                        "用户明确给变量用 explicit；要求全部合格变量用 all_eligible；"
+                        "不知道选什么或要求系统推荐用 auto_recommend。"
+                    ),
+                },
+                "variable_recommendation_limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 32,
+                    "description": "auto_recommend 最多推荐多少个变量，默认 8。",
+                },
             },
             "required": ["objective"],
         },
@@ -69,28 +88,17 @@ AGENDA_FUNCTION_SCHEMA: dict[str, Any] = {
 FUNCTION_METADATA = function_metadata()
 OPTIONAL_FUNCTIONS = optional_function_names()
 
-PLANNING_SYSTEM_PROMPT = """你负责一个离线、只读的电价与外生变量探索性数据分析规划任务。
 
-目标：根据研究问题、对话历史、数据质量和已激活 Skill，选择最小但充分的原子研究函数。
+def _accepts_keyword(callback: Any, name: str) -> bool:
+    """Preserve compatibility with deterministic test/custom planners."""
 
-规划边界：
-- 你只是受限函数选择器，不自行设计通用推理步骤；严格服从 active_skill.research_protocol 的阶段、函数规则和停止条件。
-- 每个函数名只对应一种确定性统计过程；只调用当前提供的函数，不生成 methods 参数。
-- 每个研究函数在一个计划中最多调用一次。多变量合并到 variables，多滞后用一个最大 max_lag，峰谷、季节或事件前后对比合并到一个 segments 集合。
-- segments 中的小时、月份和时间边界必须由用户明确给出；不得自行猜测市场峰谷时段、季节定义或政策事件日期。
-- 外生变量参数使用 variables 中的精确名称；目标序列是单独的 target，不放入 variables。
-- data_quality 由方案编译器作为必需步骤加入，不由模型调用。
-- 方案阶段只描述将要运行的本地确定性分析；统计量由工具生成，当前回复不做计算或因果判断。
-- 每次回复必须调用一次 declare_research_agenda，声明本轮目标、假设和前提；它不执行计算，只记录议程。
-- declare_research_agenda 中的每条假设都必须能被同一次回复选择的分析函数验证；写不出对应函数的猜想不要列入。
-- 只记录上下文能够支持的假设、限制和可获得性说明。
-- 只需要判断数据能不能用时，可以只调用 declare_research_agenda，不选任何分析函数；编译器会生成仅含数据体检的最小方案。
-- 优先选择最小函数集合；不要因为函数可用就全部调用。
-- 如果 revision_context 存在，必须把 current_plan 作为修订基线；只调整 allowed_changes 中允许的字段，其他字段保持不变。
-- 自动修订不得改变研究问题、Skill、数据指纹、分段定义或审批范围；无法在边界内修复时返回原方案边界内的最小变更。
-
-输出：只通过 Function Calling 返回 declare_research_agenda 以及本轮选择的研究函数调用，不输出推理文本；程序只把调用编译为候选计划，不会立即执行。"""
-
+    try:
+        parameters = inspect.signature(callback).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    # Require an explicit opt-in.  A wrapper may expose **kwargs and forward
+    # them to an older planner that does not understand the new argument.
+    return any(parameter.name == name for parameter in parameters)
 
 def _agenda_text(agenda: ModelToolCall | None, field: str) -> str:
     """Read one string field from the agenda call, tolerating a model that skipped it."""
@@ -110,6 +118,29 @@ def _agenda_list(agenda: ModelToolCall | None, field: str) -> list[str]:
     if not isinstance(values, list):
         return []
     return list(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
+
+
+def _validate_agenda_function_coverage(
+    agenda: ModelToolCall | None,
+    analysis_calls: list[ModelToolCall],
+) -> None:
+    """Reject an agenda that claims coverage from functions it did not call."""
+
+    hypotheses = _agenda_list(agenda, "hypotheses")
+    if not hypotheses:
+        return
+    selected = {call.name for call in analysis_calls}
+    text = "\n".join(hypotheses)
+    referenced = {
+        name
+        for name in FUNCTION_CATALOG
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", text)
+    }
+    missing = sorted(referenced.difference(selected))
+    if missing:
+        raise ResearchPlanValidationError(f"议程引用了未选择的研究函数：{', '.join(missing)}")
+    if not analysis_calls:
+        raise ResearchPlanValidationError("研究议程包含待判定假设，但没有选择任何研究函数")
 
 
 class ModelEDAPlanner:
@@ -145,6 +176,7 @@ class ModelEDAPlanner:
         skill: SkillDefinition | None = None,
         feedback: list[FeedbackPacket] | None = None,
         revision_context: dict[str, Any] | None = None,
+        episode_memory: list[dict[str, Any]] | None = None,
     ) -> EDAPlanDraft:
         if not self.enabled:
             raise ResearchModelUnavailableError("大模型尚未配置，无法生成研究方案。")
@@ -173,9 +205,16 @@ class ModelEDAPlanner:
                 parameters["required"] = [name for name in parameters["required"] if name not in hidden]
         payload = {
             "prompt_version": PLANNING_PROMPT_VERSION,
-            "task_scope": "离线本地文件上的描述性 EDA；工具读取研究数据并返回结构化证据。",
+            "output_capabilities": report_capabilities_context(),
             "question": question,
-            "conversation_history": (history or [])[-self.history_messages :],
+            "conversation_history": bounded_recent_history(
+                history or [],
+                max_messages=self.history_messages,
+            ),
+            # Episode memory has its own budget and scope policy.  Keeping it
+            # outside conversation_history prevents a long chat from trimming
+            # the durable evidence before the planner sees it.
+            "episode_memory": episode_memory or [],
             "active_skill": skill.prompt_context() if skill is not None else None,
             "validation_feedback": [item.model_dump(mode="json") for item in (feedback or [])],
             "revision_context": revision_context,
@@ -214,18 +253,24 @@ class ModelEDAPlanner:
                 "research_agenda": "declare_research_agenda_once_alongside_analysis_functions",
                 "minimum_plan": "declare_research_agenda_alone_yields_a_data_quality_only_plan",
             },
-            "output_schema": EDAPlanDraft.model_json_schema(),
         }
         messages = [
-            ("system", PLANNING_SYSTEM_PROMPT),
-            ("human", json.dumps(payload, ensure_ascii=False)),
+            ModelMessage(role="system", content=PLANNING_SYSTEM_PROMPT),
+            ModelMessage(role="user", content=json.dumps(payload, ensure_ascii=False)),
         ]
         try:
             invoke_calls = getattr(self.gateway, "invoke_tool_calls", None)
-            if callable(invoke_calls) and function_schemas:
+            # The agenda call is always offered, even for a skill whose only
+            # function is the compiler-managed data_quality step; otherwise the
+            # planner would be told to declare an agenda with no way to send it.
+            if callable(invoke_calls):
                 calls = invoke_calls(messages=messages, tools=[*function_schemas, AGENDA_FUNCTION_SCHEMA])
                 agenda = next((call for call in calls if call.name == AGENDA_FUNCTION_NAME), None)
                 analysis_calls = [call for call in calls if call.name != AGENDA_FUNCTION_NAME]
+                _validate_agenda_function_coverage(agenda, analysis_calls)
+                mode_value = _agenda_text(agenda, "variable_selection_mode") or "explicit"
+                if mode_value not in {"explicit", "all_eligible", "auto_recommend"}:
+                    raise ResearchPlanValidationError(f"未知外生变量选择模式：{mode_value}")
                 selected_set = {
                     str(name)
                     for call in analysis_calls
@@ -233,10 +278,65 @@ class ModelEDAPlanner:
                     if isinstance(name, str)
                 }
                 selected_variables = [spec.name for spec in config.exogenous if spec.name in selected_set]
+                deferred_functions: list[str] = []
+                selection_stage = "direct"
+                if mode_value in {"all_eligible", "auto_recommend"}:
+                    selected_variables = eligible_exogenous_variables(config, quality)
+                    if not selected_variables:
+                        raise ResearchPlanValidationError("没有外生变量满足自动筛查的最低数据门槛")
+                    rewritten: list[ModelToolCall] = []
+                    for call in analysis_calls:
+                        if FUNCTION_CATALOG[call.name].uses_variables:
+                            rewritten.append(
+                                ModelToolCall(
+                                    name=call.name,
+                                    arguments={**call.arguments, "variables": selected_variables},
+                                    call_id=call.call_id,
+                                )
+                            )
+                        else:
+                            rewritten.append(call)
+                    analysis_calls = rewritten
+                if mode_value == "auto_recommend":
+                    requested = {call.name for call in analysis_calls}
+                    screening, deferred_functions = screening_function_set(
+                        requested,
+                        allowed_functions=set(allowed_functions),
+                    )
+                    by_name = {call.name: call for call in analysis_calls}
+                    analysis_calls = []
+                    for function_name in allowed_functions:
+                        if function_name not in screening:
+                            continue
+                        previous = by_name.get(function_name)
+                        arguments = dict(previous.arguments) if previous is not None else {}
+                        if FUNCTION_CATALOG[function_name].uses_variables:
+                            arguments["variables"] = selected_variables
+                        analysis_calls.append(
+                            ModelToolCall(
+                                name=function_name,
+                                arguments=arguments,
+                                call_id=previous.call_id if previous is not None else None,
+                            )
+                        )
+                    selection_stage = "screening"
+                recommendation_limit = 8
+                if agenda is not None:
+                    raw_limit = agenda.arguments.get("variable_recommendation_limit", 8)
+                    if isinstance(raw_limit, int) and not isinstance(raw_limit, bool):
+                        recommendation_limit = min(32, max(1, raw_limit))
                 return EDAPlanDraft(
                     objective=_agenda_text(agenda, "objective") or question.strip(),
-                    hypotheses=_agenda_list(agenda, "hypotheses"),
+                    hypotheses=(
+                        []
+                        if mode_value == "auto_recommend"
+                        else _agenda_list(agenda, "hypotheses")
+                    ),
                     selected_variables=selected_variables,
+                    variable_selection_mode=mode_value,
+                    variable_selection_stage=selection_stage,
+                    deferred_functions=deferred_functions,
+                    variable_recommendation_limit=recommendation_limit,
                     steps=[
                         {
                             "function": call.name,
@@ -266,6 +366,7 @@ class ModelEDAPlanner:
         skill: SkillDefinition | None = None,
         feedback: list[FeedbackPacket] | None = None,
         revision_context: dict[str, Any],
+        episode_memory: list[dict[str, Any]] | None = None,
     ) -> EDAPlanDraft:
         """Generate a constrained draft while exposing the approved revision baseline."""
 
@@ -277,6 +378,7 @@ class ModelEDAPlanner:
             skill=skill,
             feedback=feedback,
             revision_context=revision_context,
+            episode_memory=episode_memory,
         )
 
 class EDASubagent:
@@ -295,6 +397,7 @@ class EDASubagent:
         skill: SkillDefinition | None = None,
         feedback: list[FeedbackPacket] | None = None,
         revision_context: dict[str, Any] | None = None,
+        episode_memory: list[dict[str, Any]] | None = None,
     ) -> EDAPlan:
         normalized = question.strip()
         if not normalized:
@@ -309,6 +412,8 @@ class EDASubagent:
         if revision_context is not None:
             contextual_propose = getattr(self.model_planner, "propose_with_context", None)
             if callable(contextual_propose):
+                if episode_memory and _accepts_keyword(contextual_propose, "episode_memory"):
+                    planner_kwargs["episode_memory"] = episode_memory
                 draft_value = contextual_propose(
                     normalized,
                     config,
@@ -317,8 +422,12 @@ class EDASubagent:
                     revision_context=revision_context,
                 )
             else:
+                if episode_memory and _accepts_keyword(self.model_planner.propose, "episode_memory"):
+                    planner_kwargs["episode_memory"] = episode_memory
                 draft_value = self.model_planner.propose(normalized, config, quality, **planner_kwargs)
         else:
+            if episode_memory and _accepts_keyword(self.model_planner.propose, "episode_memory"):
+                planner_kwargs["episode_memory"] = episode_memory
             draft_value = self.model_planner.propose(normalized, config, quality, **planner_kwargs)
         try:
             draft = draft_value if isinstance(draft_value, EDAPlanDraft) else EDAPlanDraft.model_validate(draft_value)

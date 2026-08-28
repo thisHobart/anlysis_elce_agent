@@ -110,6 +110,7 @@ def test_segment_comparisons_share_one_summary_and_evaluation(synthetic_study: P
     assert "load" in comparisons["relationships"]["peak_vs_valley"]["series"]
     assert any(check.name == "分段比较证据" for check in result.evaluation.checks)
     assert result.evaluation.hypothesis_assessments[0].status == "candidate_support"
+    assert "标准差" in result.evaluation.hypothesis_assessments[0].evidence
 
     envelope = authorization_envelope(proposal.plan, approved_at="2026-08-25T00:00:00+00:00")
     changed_steps = [
@@ -166,6 +167,33 @@ def test_event_before_after_time_ranges_are_compared_on_one_snapshot(synthetic_s
     assert comparison["segments"]["after"]["observations"] > 0
     assert comparison["contrasts"][0]["overlap_rows"] == 0
     assert comparison["contrasts"][0]["mean_difference_left_minus_right"] is not None
+
+
+def test_mixed_segment_dimensions_are_never_compared_with_each_other(synthetic_study: Path):
+    config = load_study_config(synthetic_study)
+    prepared = prepare_research_data(config)
+    result = compare_price_segments(
+        prepared.aligned.frame[config.target.name],
+        comparison_id="hour_month",
+        segments=[
+            SegmentDefinition(segment_id="valley", label="谷段", kind="hours", hours=[0, 1, 2, 3, 4, 5]),
+            SegmentDefinition(segment_id="peak", label="峰段", kind="hours", hours=[18, 19, 20, 21, 22, 23]),
+            SegmentDefinition(segment_id="january", label="一月", kind="months", months=[1]),
+            SegmentDefinition(segment_id="february", label="二月", kind="months", months=[2]),
+        ],
+        min_observations=12,
+    )
+
+    contrasts = result["price"]["hour_month"]["contrasts"]
+    assert len(contrasts) == 2
+    assert {row["comparison_group"] for row in contrasts} == {"hours", "months"}
+    assert not any(
+        {row["left_segment_id"], row["right_segment_id"]} & {"valley", "peak"}
+        and {row["left_segment_id"], row["right_segment_id"]} & {"january", "february"}
+        for row in contrasts
+    )
+    hour_contrast = next(row for row in contrasts if row["comparison_group"] == "hours")
+    assert hour_contrast["std_difference_left_minus_right"] is not None
 
 
 def test_execution_reuses_one_prepared_snapshot_for_queue_and_finalize(
@@ -427,6 +455,54 @@ def test_finalize_failure_offers_a_retry_over_the_preserved_tool_results(synthet
     assert not completed.values.get("stop_reason")
 
 
+def test_finalize_retry_reuses_a_package_committed_before_the_checkpoint(
+    synthetic_study: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from app.research.agent.schemas import AgentEvaluation, EvaluationCheck
+
+    monkeypatch.setattr(
+        "app.research.application.execution.evaluate_agent_run",
+        lambda **_kwargs: AgentEvaluation(
+            decision="accept",
+            summary="通过。",
+            checks=[EvaluationCheck(name="完整性", status="pass", message="通过。")],
+        ),
+    )
+
+    class FailAfterCommitExecution(EDAExecutionService):
+        attempts = 0
+
+        def finalize(self, **kwargs):
+            result = super().finalize(**kwargs)
+            type(self).attempts += 1
+            if type(self).attempts == 1:
+                raise RuntimeError("simulated crash after artifact commit")
+            return result
+
+    config = load_study_config(synthetic_study)
+    coordinator = _coordinator(execution=FailAfterCommitExecution())
+    coordinator.submit_user_message(
+        session_id="p0-finalize-idempotent",
+        message="分析电价",
+        study_config=config,
+    )
+    interrupted = coordinator.resume(session_id="p0-finalize-idempotent", action="approve")
+    committed_before_retry = sorted(
+        path for path in config.analysis.output_directory.glob("agent-*") if path.is_dir()
+    )
+
+    completed = coordinator.resume(session_id="p0-finalize-idempotent", action="retry")
+    committed_after_retry = sorted(
+        path for path in config.analysis.output_directory.glob("agent-*") if path.is_dir()
+    )
+
+    assert interrupted.interrupt and interrupted.interrupt.kind == "finalization_error"
+    assert len(committed_before_retry) == 1
+    assert committed_after_retry == committed_before_retry
+    assert completed.values["latest_run"]["run_id"] == committed_before_retry[0].name
+
+
 def test_a_finalize_failure_the_user_stops_still_leaves_a_terminal_record(synthetic_study: Path):
     class BrokenFinalizeExecution(EDAExecutionService):
         def finalize(self, **_kwargs):
@@ -478,3 +554,26 @@ def test_explanation_failure_routes_to_visible_response_error(synthetic_study: P
     assert failed.interrupt.choices == ["retry", "stop"]
     assert failed.values["assistant_message"] == ""
     assert any("模型没有返回结果解释" in item["message"] for item in failed.values["feedback_packets"])
+
+
+def test_model_dialogue_failure_stops_without_a_second_schema_error(synthetic_study: Path):
+    """A failed routing call pauses on the model error, not on a missing decision."""
+
+    from app.research.agent.errors import ResearchModelUnavailableError
+
+    class UnavailableDialogue(ResearchDialogue):
+        def decide(self, **kwargs):
+            raise ResearchModelUnavailableError("大模型对话调用失败：大模型调用失败：APITimeoutError")
+
+    coordinator = _coordinator(dialogue=UnavailableDialogue())
+    failed = coordinator.submit_user_message(
+        session_id="p0-dialogue-unavailable",
+        message="分析电价",
+        study_config=load_study_config(synthetic_study),
+    )
+
+    assert failed.interrupt and failed.interrupt.kind == "plan_error"
+    assert "APITimeoutError" in failed.values["stop_reason"]
+    events = [item["name"] for item in failed.values["events"]]
+    assert any(name.startswith("主 Agent 调用失败") for name in events)
+    assert not any(name.startswith("研究回复失败") for name in events)

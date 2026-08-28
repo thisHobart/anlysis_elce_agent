@@ -1,0 +1,28 @@
+flowchart TB
+    IN(["入口：初始状态或 Command(resume)"])
+
+    subgraph M03["M03 持久化研究循环 · app/research/graph"]
+        direction TB
+        A["阶段 1 · 入口路由<br/>ingest_user → main_agent<br/>识别 new_plan / revise / execute / reply"]
+        B["阶段 2 · 规划与审批<br/>begin_episode → resolve_skill → eda_subagent<br/>validate_plan → approval_interrupt"]
+        C["阶段 3 · 锁定与执行<br/>lock_plan → mark_tool_running<br/>execute_tool → validate_tool_result → advance_tool"]
+        D["阶段 4 · 最终化与评估<br/>finalize_iteration<br/>accept / revise / need_user / reject"]
+        E["阶段 5 · 交互与终止<br/>result_interrupt / user_interrupt<br/>persist_stop / persist_failure"]
+
+        A -->|需要新计划或修订| B
+        B -->|审批通过| C
+        C -->|队列耗尽| D
+        D -->|accept / need_user / reject| E
+        B -.修改方案.-> A
+        C -.单工具重试.-> C
+        D -.原授权范围内 revise.-> B
+        E -.继续、解释或修复.-> A
+    end
+
+    OUT1(["出口：plan / user / result interrupt"])
+    OUT2(["出口：completed / stopped / failed 快照与事件"])
+
+    IN --> A
+    B -->|等待审批| OUT1
+    E --> OUT1
+    E --> OUT2

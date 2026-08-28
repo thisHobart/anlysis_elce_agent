@@ -59,7 +59,7 @@ class ResearchProtocol(BaseModel):
         if len(functions) != len(set(functions)):
             raise ValueError("一个研究函数只能属于一个领域协议阶段")
         if "data_quality" not in functions:
-            raise ValueError("领域研究协议必须包含 data_quality 门禁")
+            raise ValueError("领域研究协议必须包含 data_quality 核验步骤")
         return self
 
     @property
