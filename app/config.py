@@ -35,7 +35,9 @@ class Settings(BaseSettings):
     llm_thinking_policy: Literal["strip", "reject"] = "strip"
     """``strip`` discards provider reasoning; ``reject`` fails closed when it is present."""
     llm_history_messages: int = Field(default=8, ge=1, le=100)
-    """Backend conversation window; intentionally hidden from the end-user dialog."""
+    """Approximate recent-message budget, selected as half as many complete turns."""
+    llm_retrieved_turns: int = Field(default=3, ge=0, le=10)
+    """Earlier related conversation turns retrieved beyond the recent window; 0 disables retrieval."""
     skill_paths: str = ""
     model_config = SettingsConfigDict(
         env_file=str(runtime_env_file()),

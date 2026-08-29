@@ -532,6 +532,7 @@ def build_research_workflow(
                 active_gate=state.get("user_interrupt_kind") or state.get("return_to_gate"),
                 episode_goal=_episode_goal(state),
                 latest_run=state.get("latest_run"),
+                current_turn_id=state.get("active_turn_id"),
             )
             active_gate = state.get("user_interrupt_kind") or state.get("return_to_gate")
             if (
@@ -2113,6 +2114,7 @@ def build_research_workflow(
                 active_gate=state.get("user_interrupt_kind") or state.get("return_to_gate"),
                 episode_goal=_episode_goal(state),
                 latest_run=state.get("latest_run"),
+                current_turn_id=state.get("active_turn_id"),
             )
             answer = decision.response.strip()
             if not answer:

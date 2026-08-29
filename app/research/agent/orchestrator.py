@@ -16,9 +16,10 @@ from app.llm.gateway import (
     ModelMessage,
     ModelResponseError,
 )
-from app.research.agent.context import bounded_recent_history, compact_episode_context
+from app.research.agent.context import compact_episode_context
 from app.research.agent.errors import ResearchModelUnavailableError, ResearchPlanValidationError
 from app.research.agent.prompts import DIALOGUE_PROMPT_VERSION, DIALOGUE_SYSTEM_PROMPT
+from app.research.agent.retrieval import select_conversation_context
 from app.research.agent.schemas import ConversationMessage, EDAPlan, EDAToolName
 from app.research.planning.variables import (
     VariableSelectionMode,
@@ -249,7 +250,9 @@ class ModelResearchDialogue:
         gateway: ModelGateway | None = None,
     ) -> None:
         self.gateway = gateway or build_model_gateway(settings)
-        self.history_messages = (settings or get_settings()).llm_history_messages
+        resolved = settings or get_settings()
+        self.recent_turns = max(1, resolved.llm_history_messages // 2)
+        self.retrieved_turns = resolved.llm_retrieved_turns
 
     @property
     def enabled(self) -> bool:
@@ -278,6 +281,7 @@ class ModelResearchDialogue:
         active_gate: str | None = None,
         episode_goal: str | None = None,
         latest_run: dict[str, Any] | None = None,
+        current_turn_id: str | None = None,
     ) -> DialogueDecision:
         if not self.enabled:
             raise ResearchModelUnavailableError("大模型尚未配置，无法处理研究对话。")
@@ -291,6 +295,15 @@ class ModelResearchDialogue:
                 }
                 for spec in config.exogenous
             ]
+        # The window answers "what was just said"; retrieval reaches the rest of
+        # this session's state for anything else about the same question.
+        recent_history, earlier_related_turns = select_conversation_context(
+            history,
+            question=question,
+            current_turn_id=current_turn_id,
+            recent_turns=self.recent_turns,
+            retrieved_turns=self.retrieved_turns,
+        )
         payload = {
             "prompt_version": DIALOGUE_PROMPT_VERSION,
             "output_capabilities": report_capabilities_context(),
@@ -302,10 +315,8 @@ class ModelResearchDialogue:
             "question": question,
             "session_status": status,
             "has_executable_data": config is not None,
-            "conversation_history": [
-                item.model_dump(mode="json")
-                for item in bounded_recent_history(history, max_messages=self.history_messages)
-            ],
+            "conversation_history": [item.model_dump(mode="json") for item in recent_history],
+            "earlier_related_turns": [item.as_payload() for item in earlier_related_turns],
             "episode_memory": compact_episode_context(episode_summaries or []),
             "current_plan": plan.model_dump(mode="json") if plan is not None else None,
             "study": {

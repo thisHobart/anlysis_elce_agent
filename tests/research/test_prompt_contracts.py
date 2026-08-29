@@ -93,12 +93,41 @@ def test_planning_prompt_keeps_episode_memory_outside_trimmed_chat(synthetic_stu
     prepared = prepare_research_data(config)
     skill = load_skill(Path("app/research/skills/price-exogenous-eda/SKILL.md"), source="builtin")
     gateway = CaptureGateway()
-    history = [{"role": "user", "content": f"消息 {index}"} for index in range(20)]
+    history = [
+        {
+            "message_id": "old-user",
+            "turn_id": "turn-old",
+            "role": "user",
+            "content": "actual_wind 的 max_lag 不超过 24",
+        },
+        {
+            "message_id": "old-assistant",
+            "turn_id": "turn-old",
+            "role": "assistant",
+            "content": "已记录这项历史偏好。",
+        },
+        *[
+            {
+                "message_id": f"m-{turn}-{role}",
+                "turn_id": f"turn-{turn}",
+                "role": role,
+                "content": f"第 {turn} 轮普通天气记录",
+            }
+            for turn in range(1, 6)
+            for role in ("user", "assistant")
+        ],
+        {
+            "message_id": "current-user",
+            "turn_id": "turn-current",
+            "role": "user",
+            "content": "继续分析 actual_wind 的滞后关系",
+        },
+    ]
     memory = [{"episode_id": "episode-kept", "summary": "已验证历史证据。"}]
 
     with pytest.raises(RuntimeError, match="captured EDAPlanDraft"):
         ModelEDAPlanner(gateway=gateway).propose(
-            "分析电价分布",
+            "继续分析 actual_wind 的滞后关系",
             config,
             prepared.quality,
             history=history,
@@ -108,6 +137,14 @@ def test_planning_prompt_keeps_episode_memory_outside_trimmed_chat(synthetic_stu
 
     payload = _payload(gateway.calls[0])
     assert len(payload["conversation_history"]) == 8
+    assert "继续分析 actual_wind 的滞后关系" not in {
+        item["content"] for item in payload["conversation_history"]
+    }
+    assert [item["turn_id"] for item in payload["earlier_related_turns"]] == ["turn-old"]
+    assert [item["role"] for item in payload["earlier_related_turns"][0]["messages"]] == [
+        "user",
+        "assistant",
+    ]
     assert payload["episode_memory"] == memory
 
 

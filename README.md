@@ -42,8 +42,8 @@
 
 内置两个核心 Skill：
 
-- `price-exogenous-eda@3.2.0`：电价 + 外生变量联合研究，加载本地版本化协议 `electricity-price-evidence-ladder@2.2.0`，按“市场时钟 → 数据体检 → 电价自身规律 → 影响因素质量 → 关系证据 → 可预测性判断”组织研究，可使用全部 30 个函数。
-- `price-forecastability-audit@1.2.0`：只用目标电价序列判断“这条序列有多可预测、后续模型的误差底线在哪”，加载 `price-forecastability-ladder@1.2.0`，只授权 14 个电价侧函数。没有外生变量数据时用它。
+- `price-exogenous-eda@3.2.1`：电价 + 外生变量联合研究，加载本地版本化协议 `electricity-price-evidence-ladder@2.2.1`，按“市场时钟 → 数据体检 → 电价自身规律 → 影响因素质量 → 关系证据 → 可预测性判断”组织研究，可使用全部 30 个函数。
+- `price-forecastability-audit@1.2.1`：只用目标电价序列判断“这条序列有多可预测、后续模型的误差底线在哪”，加载 `price-forecastability-ladder@1.2.1`，只授权 14 个电价侧函数。没有外生变量数据时用它。
 
 外部专业 Skill 可以放在项目或 EXE 同级的 `skills/<skill-name>/SKILL.md`，也可以通过 `VPP_SKILL_PATHS` 添加搜索目录。外部 Skill 只提供专业流程和工具许可，不会自动执行其 `scripts/`。
 
@@ -176,6 +176,8 @@ $env:QT_QPA_PLATFORM="offscreen"
 .\venv\Scripts\python.exe -m pytest -q
 ```
 
-第一阶段说明见 [docs/phase1-price-exogenous-eda.md](docs/phase1-price-exogenous-eda.md)，长期路线见 [docs/research-agent-development.md](docs/research-agent-development.md)。
-
-循环设计见 [docs/research-loop.md](docs/research-loop.md)；验收记录见 [docs/phase1-acceptance.md](docs/phase1-acceptance.md)。
+完整文档入口见 [docs/README.md](docs/README.md)。当前实现说明见
+[docs/phase1-price-exogenous-eda.md](docs/phase1-price-exogenous-eda.md)，循环设计见
+[docs/research-loop.md](docs/research-loop.md)，验收状态见
+[docs/phase1-acceptance.md](docs/phase1-acceptance.md)。P2 的测试先行候选方案见
+[docs/phase2-news-price-analysis-proposal.md](docs/phase2-news-price-analysis-proposal.md)；模拟新闻规范化和明显事件抽取已有独立测试原型，尚未接入桌面流程或生产新闻接口。

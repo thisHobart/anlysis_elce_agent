@@ -7,7 +7,7 @@
 | 变更 | 影响 |
 |---|---|
 | 研究函数从 18 个扩展到 30 个（新增平稳性、趋势季节分解、偏自相关、尖峰状态、持续曲线、方差稳定、朴素基线、VIF、驱动平稳性、互信息、Granger 前置性、滚动稳定性） | 计划、执行、评估和报告全部涉及；新增 statsmodels 运行依赖 |
-| 内置 Skill 从 1 个变为 2 个；`price-exogenous-eda` 升到 `3.2.0`，协议升到 `electricity-price-evidence-ladder@2.2.0`；新增 `price-forecastability-audit@1.2.0` | 旧方案的 Skill/协议版本不再匹配，必须重新规划 |
+| 内置 Skill 从 1 个变为 2 个；当前 `price-exogenous-eda` 为 `3.2.1`，协议为 `electricity-price-evidence-ladder@2.2.1`；新增并更新 `price-forecastability-audit@1.2.1` | 旧方案的 Skill/协议版本不再匹配，必须重新规划 |
 | 主报告统一为 `report.md`，桌面端新增内置 Markdown/SVG 阅读器 | 产物清单、`report_path` 与“查看完整报告”入口变化 |
 | 研究包按复核动作分为 `evidence/`、`provenance/`、`data/`，新增自动生成的 `methods.md`；删除旧 CLI 聚合报告链 | 产物路径、方法说明、manifest 和桌面报告验收变化 |
 | 对话中新增可展开的研究过程卡；循环事件统一经 `narration.py` 翻译为用户语言 | 桌面时间线、会话投影与运行记录展示变化 |
@@ -42,8 +42,8 @@ $env:QT_QPA_PLATFORM="offscreen"
 |---|---|
 | 统一连续对话 | PySide6 真实验收完成讨论、规划、修订、执行和追问 |
 | 所有研究判断调用模型 | `ModelResearchDialogue` 和 `ModelEDAPlanner` 无本地规划回退；模型中断测试明确停止 |
-| Skill 选择 | LangGraph `resolve_skill`；内置 `price-exogenous-eda@3.2.0` 与 `price-forecastability-audit@1.2.0` |
-| 领域研究协议 | 本地 `electricity-price-evidence-ladder@2.2.0` 与 `price-forecastability-ladder@1.2.0`；计划和 manifest 记录协议版本，编译器按协议排序 |
+| Skill 选择 | LangGraph `resolve_skill`；内置 `price-exogenous-eda@3.2.1` 与 `price-forecastability-audit@1.2.1` |
+| 领域研究协议 | 本地 `electricity-price-evidence-ladder@2.2.1` 与 `price-forecastability-ladder@1.2.1`；计划和 manifest 记录协议版本，编译器按协议排序 |
 | 研究函数覆盖度 | 30 个原子函数按五个阶段分组，全量执行回归通过 |
 | 统计实现可信 | ADF/KPSS/MSTL/PACF/Ljung-Box 直接调用 statsmodels，不自行重写 |
 | 分段比较 | 峰谷、季节和时间范围通过单次 `segments` 调用进入同一 summary；小时、月份、时间范围只在各自维度内生成差值 |

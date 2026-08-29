@@ -1,0 +1,103 @@
+{
+  "N01": {
+    "relevance": "short_term",
+    "event_type": "generation_outage",
+    "affected_regions": [
+      "TEST_NORTH"
+    ],
+    "affected_assets": [
+      "GEN_A"
+    ],
+    "capacity_mw": 500.0,
+    "effective_start_at": "2026-01-12T10:00:00Z",
+    "effective_end_at": "2026-01-12T18:00:00Z",
+    "direction": "up",
+    "time_basis": "stated_absolute"
+  },
+  "N04": {
+    "relevance": "short_term",
+    "event_type": "generation_restore",
+    "affected_regions": [
+      "TEST_NORTH"
+    ],
+    "affected_assets": [
+      "GEN_A"
+    ],
+    "capacity_mw": 350.0,
+    "effective_start_at": "2026-01-12T17:30:00Z",
+    "effective_end_at": null,
+    "direction": "down",
+    "time_basis": "stated_absolute"
+  },
+  "N05": {
+    "relevance": "short_term",
+    "event_type": "transmission_constraint",
+    "affected_regions": [
+      "TEST_NORTH"
+    ],
+    "affected_assets": [
+      "INTERCONNECTOR_NS"
+    ],
+    "capacity_mw": 400.0,
+    "effective_start_at": "2026-01-20T09:00:00Z",
+    "effective_end_at": "2026-01-20T15:00:00Z",
+    "direction": "up",
+    "time_basis": "stated_absolute"
+  },
+  "N06": {
+    "relevance": "short_term",
+    "event_type": "demand_shock",
+    "affected_regions": [
+      "TEST_NORTH"
+    ],
+    "affected_assets": [
+      "DEMAND_SYSTEM"
+    ],
+    "capacity_mw": 600.0,
+    "effective_start_at": "2026-01-22T14:00:00Z",
+    "effective_end_at": "2026-01-22T19:00:00Z",
+    "direction": "up",
+    "time_basis": "derived_from_publication"
+  },
+  "N07": {
+    "relevance": "short_term",
+    "event_type": "renewable_supply_change",
+    "affected_regions": [
+      "TEST_SOUTH"
+    ],
+    "affected_assets": [
+      "WIND_FLEET"
+    ],
+    "capacity_mw": 700.0,
+    "effective_start_at": "2026-01-25T00:00:00Z",
+    "effective_end_at": "2026-01-25T12:00:00Z",
+    "direction": "down",
+    "time_basis": "stated_absolute"
+  },
+  "N08": {
+    "relevance": "long_horizon",
+    "event_type": "policy_long_horizon",
+    "affected_regions": [
+      "TEST_SOUTH"
+    ],
+    "affected_assets": [
+      "GEN_B"
+    ],
+    "capacity_mw": null,
+    "effective_start_at": "2030-01-01T00:00:00Z",
+    "effective_end_at": null,
+    "direction": "unknown",
+    "time_basis": "stated_absolute"
+  },
+  "N09": {
+    "relevance": "irrelevant",
+    "event_type": "irrelevant",
+    "affected_regions": [],
+    "affected_assets": [],
+    "capacity_mw": null,
+    "effective_start_at": null,
+    "effective_end_at": null,
+    "direction": "unknown",
+    "time_basis": null
+  }
+}

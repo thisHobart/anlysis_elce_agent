@@ -123,8 +123,16 @@ class EDAPlanningService:
         callback(65, "EDA Subagent 分析问题与数据画像")
         history = [
             {
+                "message_id": str(
+                    item.message_id if isinstance(item, ConversationMessage) else item.get("message_id", "")
+                ),
+                "turn_id": item.turn_id if isinstance(item, ConversationMessage) else item.get("turn_id"),
+                "episode_id": item.episode_id if isinstance(item, ConversationMessage) else item.get("episode_id"),
                 "role": str(item.role if isinstance(item, ConversationMessage) else item.get("role", "user")),
                 "content": str(item.content if isinstance(item, ConversationMessage) else item.get("content", "")),
+                "created_at": str(
+                    item.created_at if isinstance(item, ConversationMessage) else item.get("created_at", "")
+                ),
             }
             for item in (conversation or [])
         ]

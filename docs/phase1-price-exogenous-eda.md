@@ -40,8 +40,8 @@ Agent 只有一条模型函数提议路径：已配置模型通过显式选择�
 
 | Skill | 领域协议 | 授权函数 | 适用场景 |
 |---|---|---:|---|
-| `price-exogenous-eda@3.2.0` | `electricity-price-evidence-ladder@2.2.0` | 30 | 电价与外生变量联合研究 |
-| `price-forecastability-audit@1.2.0` | `price-forecastability-ladder@1.2.0` | 14 | 只有目标电价数据，或需要先判断序列本身有多可预测 |
+| `price-exogenous-eda@3.2.1` | `electricity-price-evidence-ladder@2.2.1` | 30 | 电价与外生变量联合研究 |
+| `price-forecastability-audit@1.2.1` | `price-forecastability-ladder@1.2.1` | 14 | 只有目标电价数据，或需要先判断序列本身有多可预测 |
 
 两个 Skill 都可以从程序同级 `skills/` 或 `VPP_SKILL_PATHS` 之外加载外部专业 Skill。Skill 通过受限相对路径声明本地 YAML 研究协议；加载器禁止协议引用越出 Skill 目录。外部 Skill 不能注册或执行代码，只能使用应用已注册且经策略授权的函数。协议函数集合必须与 Skill 授权集合完全一致，否则加载失败。
 

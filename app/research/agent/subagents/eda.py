@@ -19,9 +19,9 @@ from app.llm.gateway import (
     ModelResponseError,
     ModelToolCall,
 )
-from app.research.agent.context import bounded_recent_history
 from app.research.agent.errors import ResearchModelUnavailableError, ResearchPlanValidationError
 from app.research.agent.prompts import PLANNING_PROMPT_VERSION, PLANNING_SYSTEM_PROMPT
+from app.research.agent.retrieval import select_conversation_context
 from app.research.agent.schemas import EDAPlan
 from app.research.planning.compiler import EDAPlanCompiler, max_lag_limit
 from app.research.planning.contracts import EDAPlanDraft
@@ -155,7 +155,9 @@ class ModelEDAPlanner:
     ) -> None:
         self.gateway = gateway or build_model_gateway(settings)
         self.tools = tools or build_eda_tool_registry()
-        self.history_messages = (settings or get_settings()).llm_history_messages
+        resolved = settings or get_settings()
+        self.recent_turns = max(1, resolved.llm_history_messages // 2)
+        self.retrieved_turns = resolved.llm_retrieved_turns
 
     @property
     def enabled(self) -> bool:
@@ -172,7 +174,7 @@ class ModelEDAPlanner:
         question: str,
         config: StudyConfig,
         quality: DataQualityReport,
-        history: list[dict[str, str]] | None = None,
+        history: list[dict[str, Any]] | None = None,
         skill: SkillDefinition | None = None,
         feedback: list[FeedbackPacket] | None = None,
         revision_context: dict[str, Any] | None = None,
@@ -203,14 +205,18 @@ class ModelEDAPlanner:
                 properties.pop(name, None)
             if isinstance(parameters.get("required"), list):
                 parameters["required"] = [name for name in parameters["required"] if name not in hidden]
+        recent_history, earlier_related_turns = select_conversation_context(
+            history or [],
+            question=question,
+            recent_turns=self.recent_turns,
+            retrieved_turns=self.retrieved_turns,
+        )
         payload = {
             "prompt_version": PLANNING_PROMPT_VERSION,
             "output_capabilities": report_capabilities_context(),
             "question": question,
-            "conversation_history": bounded_recent_history(
-                history or [],
-                max_messages=self.history_messages,
-            ),
+            "conversation_history": recent_history,
+            "earlier_related_turns": [turn.as_payload() for turn in earlier_related_turns],
             # Episode memory has its own budget and scope policy.  Keeping it
             # outside conversation_history prevents a long chat from trimming
             # the durable evidence before the planner sees it.
@@ -362,7 +368,7 @@ class ModelEDAPlanner:
         config: StudyConfig,
         quality: DataQualityReport,
         *,
-        history: list[dict[str, str]] | None = None,
+        history: list[dict[str, Any]] | None = None,
         skill: SkillDefinition | None = None,
         feedback: list[FeedbackPacket] | None = None,
         revision_context: dict[str, Any],
@@ -393,7 +399,7 @@ class EDASubagent:
         question: str,
         config: StudyConfig,
         quality: DataQualityReport,
-        history: list[dict[str, str]] | None = None,
+        history: list[dict[str, Any]] | None = None,
         skill: SkillDefinition | None = None,
         feedback: list[FeedbackPacket] | None = None,
         revision_context: dict[str, Any] | None = None,
