@@ -52,6 +52,12 @@ def test_plan_approval_text_shortcuts_never_turn_rejection_into_modification(
             "为什么这一轮没有图表？",
             "followup",
         ),
+        (
+            "result_limitations",
+            ["modify", "followup", "stop"],
+            "接受当前限制",
+            "stop",
+        ),
     ],
 )
 def test_interrupt_shortcuts_respect_the_gate_contract(

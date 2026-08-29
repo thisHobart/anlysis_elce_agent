@@ -574,6 +574,63 @@ def test_model_dialogue_failure_stops_without_a_second_schema_error(synthetic_st
 
     assert failed.interrupt and failed.interrupt.kind == "plan_error"
     assert "APITimeoutError" in failed.values["stop_reason"]
+    assert any(item["retryable"] for item in failed.values["feedback_packets"])
     events = [item["name"] for item in failed.values["events"]]
     assert any(name.startswith("主 Agent 调用失败") for name in events)
     assert not any(name.startswith("研究回复失败") for name in events)
+
+
+def test_limited_result_followup_failure_retries_without_losing_its_gate_or_evidence(
+    synthetic_study: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from app.research.agent.errors import ResearchModelUnavailableError
+    from app.research.agent.schemas import AgentEvaluation, EvaluationCheck
+
+    class OneFailedResultFollowup(ResearchDialogue):
+        def __init__(self) -> None:
+            self.failed = False
+
+        def decide(self, **kwargs):
+            if kwargs.get("summary") and not self.failed:
+                self.failed = True
+                raise ResearchModelUnavailableError("大模型结果追问暂时不可用：ConnectionError")
+            return super().decide(**kwargs)
+
+    monkeypatch.setattr(
+        "app.research.application.execution.evaluate_agent_run",
+        lambda **_kwargs: AgentEvaluation(
+            decision="need_user",
+            summary="已有结果需要用户确认限制。",
+            checks=[EvaluationCheck(name="限制", status="warning", message="需要用户确认")],
+        ),
+    )
+    coordinator = _coordinator(dialogue=OneFailedResultFollowup())
+    config = load_study_config(synthetic_study)
+    session_id = "p0-limited-followup-retry"
+    coordinator.submit_user_message(
+        session_id=session_id,
+        message="分析电价",
+        study_config=config,
+    )
+    limited = coordinator.resume(session_id=session_id, action="approve")
+    assert limited.interrupt and limited.interrupt.kind == "result_limitations"
+    run_id = limited.values["latest_run"]["run_id"]
+
+    failed = coordinator.submit_user_message(
+        session_id=session_id,
+        message="这些结果说明什么？",
+        study_config=config,
+    )
+
+    assert failed.interrupt and failed.interrupt.kind == "response_error"
+    assert failed.interrupt.choices == ["retry", "stop"]
+    assert failed.values["latest_run"]["run_id"] == run_id
+    assert len(failed.values["run_history"]) == 1
+
+    recovered = coordinator.resume(session_id=session_id, action="retry")
+
+    assert recovered.interrupt and recovered.interrupt.kind == "result_limitations"
+    assert recovered.values["latest_run"]["run_id"] == run_id
+    assert len(recovered.values["run_history"]) == 1
+    assert recovered.values["assistant_message"] == "只解释确定性证据。"

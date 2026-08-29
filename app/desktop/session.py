@@ -11,10 +11,10 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from PySide6.QtCore import QStandardPaths
 
 from app.research.agent.schemas import rename_legacy_step_keys
 from app.research.tools.catalog import FUNCTION_CATALOG
+from app.runtime_paths import application_data_directory
 
 SessionStatus = Literal[
     "idle",
@@ -320,8 +320,7 @@ class SessionStore:
 
     def __init__(self, path: str | Path | None = None) -> None:
         if path is None:
-            root = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))
-            path = root / "research_sessions.json"
+            path = application_data_directory() / "research_sessions.json"
         self.path = Path(path)
         self.recovery_notices: list[str] = []
         self._write_path: Path | None = None

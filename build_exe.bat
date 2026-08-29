@@ -12,4 +12,5 @@ if not exist "venv\Scripts\python.exe" (
 if errorlevel 1 exit /b 1
 
 "venv\Scripts\python.exe" scripts\build_desktop_exe.py %*
-endlocal
+set "BUILD_EXIT_CODE=%ERRORLEVEL%"
+endlocal & exit /b %BUILD_EXIT_CODE%

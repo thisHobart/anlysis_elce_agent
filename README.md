@@ -167,6 +167,7 @@ PyInstaller 必须在 Windows 上构建 Windows 程序。第一次建议使用�
 ```
 
 输出位于 `dist/PriceResearchAgent/`，或单文件模式下的 `dist/PriceResearchAgent.exe`。打包会自动包含 `app/research/skills/` 下的全部内置 Skill。
+构建结束前会在隔离目录中实际启动刚生成的程序，构造桌面窗口，并校验两个内置 Skill、30 个研究函数和 Skill 加载错误；探针失败时构建命令返回非零退出码。
 
 ## 测试
 
@@ -174,7 +175,11 @@ PyInstaller 必须在 Windows 上构建 Windows 程序。第一次建议使用�
 .\venv\Scripts\python.exe -m ruff check app tests
 $env:QT_QPA_PLATFORM="offscreen"
 .\venv\Scripts\python.exe -m pytest -q
+.\venv\Scripts\python.exe scripts\validate_phase1.py
+.\venv\Scripts\python.exe scripts\validate_desktop_phase1.py
 ```
+
+两个验证脚本使用真实模型和真实数据；为避免较大的 Function Calling 请求被过短的本地配置误杀，验证进程使用 120 秒请求超时下限，但不会改写 `.env`。`validate_phase1.py` 会分别验证仅目标电价和包含外生变量的两个 Skill 场景。
 
 完整文档入口见 [docs/README.md](docs/README.md)。当前实现说明见
 [docs/phase1-price-exogenous-eda.md](docs/phase1-price-exogenous-eda.md)，循环设计见

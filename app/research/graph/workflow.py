@@ -341,6 +341,19 @@ def _planning_interrupt_kind(state: ResearchLoopState) -> str:
     return "plan_error"
 
 
+def _dialogue_interrupt_kind(state: ResearchLoopState) -> str:
+    """Keep conversational provider failures distinct from plan validation failures."""
+
+    if state.get("return_to_gate") in {
+        "plan_approval",
+        "result",
+        "result_limitations",
+        "result_rejected",
+    }:
+        return "response_error"
+    return _planning_interrupt_kind(state)
+
+
 def _latest_turn(state: ResearchLoopState) -> str:
     return str(state.get("latest_turn") or state.get("user_request") or "").strip()
 
@@ -585,7 +598,12 @@ def build_research_workflow(
                     ),
                 )
         except Exception as exc:  # noqa: BLE001 - converted into structured loop feedback
-            packet = exception_feedback(exc, source="plan_validator", requires_user=True)
+            packet = exception_feedback(
+                exc,
+                source="plan_validator",
+                retryable=isinstance(exc, ResearchModelUnavailableError),
+                requires_user=True,
+            )
             return {
                 "phase": "awaiting_user",
                 # Route straight to the pause: without a decision the reply node
@@ -593,7 +611,7 @@ def build_research_workflow(
                 "control": "need_user",
                 "feedback_packets": _append_feedback(state, packet),
                 "stop_reason": packet.message,
-                "user_interrupt_kind": _planning_interrupt_kind(state),
+                "user_interrupt_kind": _dialogue_interrupt_kind(state),
                 "events": _event(
                     state,
                     f"主 Agent 调用失败：{_short(packet.message)}",
@@ -1985,11 +2003,15 @@ def build_research_workflow(
             packets = _append_feedback({**state, "feedback_packets": packets}, packet)
             stop_reason = evaluation_summary
         interrupt_kind = state.get("user_interrupt_kind") or state.get("return_to_gate")
-        if interrupt_kind not in {"plan_error", "result_limitations"}:
+        if interrupt_kind not in {"plan_error", "result_limitations", "response_error"}:
             interrupt_kind = "result_limitations" if state.get("latest_run") else "plan_error"
         cursor = _cursor(state).model_copy(
             update={
-                "episode_status": "limited" if interrupt_kind == "result_limitations" else "plan_error",
+                "episode_status": (
+                    "limited"
+                    if state.get("latest_run") and interrupt_kind in {"result_limitations", "response_error"}
+                    else "plan_error"
+                ),
                 "stage": "human_gate",
                 "terminal_reason": stop_reason or interrupt_kind,
             }
@@ -2438,6 +2460,7 @@ def build_research_workflow(
                 "latest_turn": message,
                 "active_turn_id": response.turn_id or state.get("active_turn_id"),
                 "explanation_request": "",
+                "return_to_gate": "result" if response.action == "followup" else None,
                 "messages": _bounded_graph_messages([
                     *_messages_before_user_turn(
                         _resume_messages(state, response),
