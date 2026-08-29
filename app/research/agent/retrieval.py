@@ -360,26 +360,36 @@ def bounded_recent_turn_history(
     history: Sequence[Any],
     *,
     max_turns: int,
-    max_characters: int = DEFAULT_RECENT_TURN_CHARACTER_BUDGET,
+    max_characters: int | None = DEFAULT_RECENT_TURN_CHARACTER_BUDGET,
+    max_messages: int | None = None,
     roles: tuple[str, ...] = ("user", "assistant"),
 ) -> list[Any]:
     """Return recent complete turns without splitting a user/assistant pair."""
 
-    if max_turns < 1 or max_characters < 1:
+    if max_turns < 1 or (max_characters is not None and max_characters < 1):
         return []
     turns = _group_turns(history, roles)
     selected: list[tuple[Any, ...]] = []
     used = 0
+    used_messages = 0
     for turn in reversed(turns):
         if len(selected) >= max_turns:
             break
-        remaining = max_characters - used
-        if remaining <= 0:
+        if max_messages is not None and used_messages and used_messages + len(turn.messages) > max_messages:
+            break
+        if max_messages is not None and not used_messages and len(turn.messages) > max_messages:
+            # A pathological turn larger than the whole window is still safer
+            # intact than as a user-less or assistant-less fragment.
+            selected.append(turn.messages)
+            break
+        remaining = max_characters - used if max_characters is not None else None
+        if remaining is not None and remaining <= 0:
             break
         turn_characters = sum(len(str(_field(item, "content", ""))) for item in turn.messages)
-        if turn_characters <= remaining:
+        if remaining is None or turn_characters <= remaining:
             selected.append(turn.messages)
             used += turn_characters
+            used_messages += len(turn.messages)
             continue
         if not selected and turn.messages and remaining >= len(turn.messages):
             per_message_limit = max(1, remaining // len(turn.messages))
@@ -394,6 +404,98 @@ def bounded_recent_turn_history(
             )
         break
     return [message for turn in reversed(selected) for message in turn]
+
+
+def select_persisted_conversation_history(
+    history: Sequence[Any],
+    *,
+    question: str,
+    current_turn_id: str | None = None,
+    max_messages: int,
+    retrieved_turns: int = DEFAULT_RETRIEVED_TURNS,
+) -> list[Any]:
+    """Select bounded complete turns for the next Graph checkpoint.
+
+    The complete desktop transcript is the candidate source. Relevant earlier
+    turns are selected first with the existing lexical retriever, then the
+    remaining capacity is filled with the newest complete turns. Selection uses
+    bounded retrieval projections for ranking, while the checkpoint retains the
+    original messages of every selected turn; prompt construction applies its
+    own character budgets later.
+    """
+
+    if max_messages < 1:
+        return []
+    prior = _history_before_current_turn(
+        history,
+        question=question,
+        current_turn_id=current_turn_id,
+    )
+    if not prior:
+        return []
+
+    recent_prompt_window = bounded_recent_turn_history(
+        prior,
+        max_turns=4,
+        max_characters=DEFAULT_RECENT_TURN_CHARACTER_BUDGET,
+    )
+    retrieved = retrieve_related(
+        prior,
+        question=question,
+        exclude=recent_prompt_window,
+        limit=retrieved_turns,
+        max_characters=DEFAULT_RETRIEVAL_CHARACTER_BUDGET,
+    )
+    candidates = _group_turns(prior, ("user", "assistant"))
+    candidate_by_key = {candidate.key: candidate for candidate in candidates}
+    selected: dict[str, tuple[Any, ...]] = {}
+    used_messages = 0
+
+    for turn in retrieved:
+        if turn.turn_id:
+            key = f"turn:{turn.turn_id}"
+        else:
+            message_ids = {message.message_id for message in turn.messages if message.message_id}
+            key = next(
+                (
+                    candidate.key
+                    for candidate in candidates
+                    if any(str(_field(item, "message_id", "")) in message_ids for item in candidate.messages)
+                ),
+                "",
+            )
+        if not key or key not in candidate_by_key or key in selected:
+            continue
+        original_messages = candidate_by_key[key].messages
+        if used_messages and used_messages + len(original_messages) > max_messages:
+            continue
+        if not used_messages and len(original_messages) > max_messages:
+            selected[key] = original_messages
+            used_messages = len(original_messages)
+            break
+        selected[key] = original_messages
+        used_messages += len(original_messages)
+
+    for candidate in reversed(candidates):
+        if candidate.key in selected:
+            continue
+        if used_messages and used_messages + len(candidate.messages) > max_messages:
+            continue
+        if not used_messages and len(candidate.messages) > max_messages:
+            selected[candidate.key] = candidate.messages
+            used_messages = len(candidate.messages)
+            break
+        selected[candidate.key] = candidate.messages
+        used_messages += len(candidate.messages)
+        if used_messages >= max_messages:
+            break
+
+    return [
+        message
+        for candidate in candidates
+        if candidate.key in selected
+        for message in selected[candidate.key]
+    ]
 
 
 def select_conversation_context(

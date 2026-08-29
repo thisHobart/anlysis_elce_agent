@@ -24,7 +24,6 @@ from app.desktop.session import (
     VariableEvidence,
 )
 from app.desktop.worker import FunctionWorker
-from app.research.agent.context import MAX_PERSISTED_CONVERSATION_MESSAGES, bounded_recent_history
 from app.research.agent.schemas import (
     ConversationMessage,
     EDAPlan,
@@ -380,7 +379,7 @@ class ResearchWorkspace(QSplitter):
         self._task_previous_status = session.status
         session.status = "understanding"
         self._start_thinking("read", "解析研究问题", "识别本轮的处理方式")
-        conversation = self._agent_conversation(session)[:-1]
+        conversation = self._agent_conversation(session, exclude_message_id=user_message.message_id)
         imported_state = self._legacy_graph_import(session) if not self.agent.has_thread(session.session_id) else None
         self._start_worker(
             kind="dialogue",
@@ -1251,8 +1250,15 @@ class ResearchWorkspace(QSplitter):
         if plan is not None:
             message.payload["plan"] = plan.model_dump(mode="json")
 
-    def _agent_conversation(self, session: ResearchSession) -> list[ConversationMessage]:
-        messages = [
+    @staticmethod
+    def _agent_conversation(
+        session: ResearchSession,
+        *,
+        exclude_message_id: str | None = None,
+    ) -> list[ConversationMessage]:
+        """Expose the complete durable text transcript as the recall source."""
+
+        return [
             ConversationMessage(
                 message_id=message.message_id,
                 turn_id=message.turn_id,
@@ -1262,12 +1268,11 @@ class ResearchWorkspace(QSplitter):
                 created_at=message.created_at,
             )
             for message in session.messages
-            if message.kind == "text" and message.role in {"user", "assistant"} and message.content
+            if message.kind == "text"
+            and message.role in {"user", "assistant"}
+            and message.content
+            and message.message_id != exclude_message_id
         ]
-        return bounded_recent_history(
-            messages,
-            max_messages=MAX_PERSISTED_CONVERSATION_MESSAGES,
-        )
 
     def _persist_and_render(self, *, keep_timeline: bool = False) -> None:
         self.current_session.touch()

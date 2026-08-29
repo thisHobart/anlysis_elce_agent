@@ -146,7 +146,7 @@ VPP_SKILL_PATHS=
 
 函数执行实例使用 `call_id` 记录计划与步骤溯源，可复用工作使用 `work_id` 标识“同一数据、函数版本和参数”。自动修订可以复用相同 `work_id` 的确定性结果；缓存最多 64 项。循环收敛直接比较工具 `work_id + output_hash`，可识别 A→B→A 振荡。
 
-Graph checkpoint 只保留最近 160 条带 sequence 的事件、120 条对话上下文、与当前数据指纹匹配的结构化 Episode 摘要和紧凑运行引用；完整工具结果写入 checkpoint 同级的结果存储，Graph 中只留经过哈希校验的引用。每次运行到达用户交互点后仅保留最新可恢复 checkpoint，完整界面轨迹仍保存在桌面会话投影中。Graph schema 升级后，旧 checkpoint 只读保留并提示新建对话，不在旧会话中迁移或重建。
+Graph checkpoint 只保留最近 160 条带 sequence 的事件、按完整 turn 原子选择的最多 120 条对话上下文、与当前数据指纹匹配的结构化 Episode 摘要和紧凑运行引用。完整桌面文本会话是每次提问的召回候选源；协调层先保留与当前问题相关的旧 turn，再用近期完整 turn 填充有界 Graph 上下文，并为当前 user/assistant 预留两个位置。完整工具结果写入 checkpoint 同级的结果存储，Graph 中只留经过哈希校验的引用。每次运行到达用户交互点后仅保留最新可恢复 checkpoint，完整界面轨迹仍保存在桌面会话投影中。Graph schema 升级后，旧 checkpoint 只读保留并提示新建对话，不在旧会话中迁移或重建。
 
 正式桌面默认把研究结果写入用户 `Documents/PriceResearchAgent/research/`，可用 `PRICE_RESEARCH_OUTPUT_DIRECTORY` 覆盖；内部 SQLite、会话和循环审计写入用户应用数据目录，可用 `PRICE_RESEARCH_APP_DATA_DIRECTORY` 覆盖。打包程序不会向安装目录或 PyInstaller 临时目录写研究数据。
 

@@ -19,6 +19,7 @@ from app.research.agent.errors import (
     SkillVersionMismatchError,
 )
 from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
+from app.research.agent.retrieval import bounded_recent_turn_history, select_persisted_conversation_history
 from app.research.agent.schemas import ConversationMessage, EDAPlan
 from app.research.application.execution import EDAExecutionService
 from app.research.application.planning import EDAPlanningService, noop_progress
@@ -122,6 +123,38 @@ def _event(
 
 def _messages(state: ResearchLoopState) -> list[ConversationMessage]:
     return [ConversationMessage.model_validate(item) for item in state.get("messages", [])]
+
+
+def _bounded_graph_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Apply the checkpoint limit without retaining half a turn."""
+
+    return bounded_recent_turn_history(
+        messages,
+        max_turns=MAX_GRAPH_MESSAGES,
+        max_messages=MAX_GRAPH_MESSAGES,
+        max_characters=None,
+    )
+
+
+def _messages_before_user_turn(
+    messages: list[dict[str, Any]],
+    *,
+    question: str,
+    turn_id: str | None,
+) -> list[dict[str, Any]]:
+    """Reserve one user/assistant pair while retaining relevant old turns."""
+
+    selected = select_persisted_conversation_history(
+        messages,
+        question=question,
+        current_turn_id=turn_id,
+        max_messages=max(1, MAX_GRAPH_MESSAGES - 2),
+    )
+    return [ConversationMessage.model_validate(item).model_dump(mode="json") for item in selected]
+
+
+def _resume_messages(state: ResearchLoopState, response: ResumePayload) -> list[dict[str, Any]]:
+    return list(response.conversation) if response.conversation is not None else list(state.get("messages", []))
 
 
 def _conversation_message(
@@ -471,8 +504,12 @@ def build_research_workflow(
 
     def ingest_user(state: ResearchLoopState) -> dict[str, Any]:
         message = state.get("pending_user_message", "").strip()
-        messages = list(state.get("messages", []))
         turn_id = state.get("pending_turn_id")
+        messages = _messages_before_user_turn(
+            list(state.get("messages", [])),
+            question=message,
+            turn_id=turn_id,
+        )
         if message:
             messages.append(
                 _conversation_message(
@@ -491,7 +528,7 @@ def build_research_workflow(
             "pending_user_message": "",
             "pending_message_id": None,
             "pending_turn_id": None,
-            "messages": messages[-MAX_GRAPH_MESSAGES:],
+            "messages": _bounded_graph_messages(messages),
             "events": _event(
                 state,
                 f"接收研究问题：{_short(message)}",
@@ -711,7 +748,7 @@ def build_research_workflow(
             "control": "validate",
             "stop_reason": None,
             "user_interrupt_kind": None,
-            "messages": [
+            "messages": _bounded_graph_messages([
                 *state.get("messages", []),
                 _conversation_message(
                     role="assistant",
@@ -719,7 +756,7 @@ def build_research_workflow(
                     turn_id=state.get("active_turn_id"),
                     episode_id=_cursor(state).episode_id,
                 ),
-            ][-MAX_GRAPH_MESSAGES:],
+            ]),
             "events": _event(
                 state,
                 f"生成修订方案：{revised.plan_id} · v{revised.revision}",
@@ -1183,8 +1220,12 @@ def build_research_workflow(
                 "latest_turn": message,
                 "active_turn_id": response.turn_id or state.get("active_turn_id"),
                 "return_to_gate": "plan_approval",
-                "messages": [
-                    *state.get("messages", []),
+                "messages": _bounded_graph_messages([
+                    *_messages_before_user_turn(
+                        _resume_messages(state, response),
+                        question=message,
+                        turn_id=response.turn_id,
+                    ),
                     _conversation_message(
                         role="user",
                         content=message,
@@ -1192,7 +1233,7 @@ def build_research_workflow(
                         turn_id=response.turn_id,
                         episode_id=_cursor(state).episode_id,
                     ),
-                ][-MAX_GRAPH_MESSAGES:],
+                ]),
             }
         elif response.action == "modify":
             approval.status = "none"
@@ -1208,8 +1249,12 @@ def build_research_workflow(
                 "active_turn_id": response.turn_id or state.get("active_turn_id"),
                 "plan_origin": "user_revision",
                 "return_to_gate": None,
-                "messages": [
-                    *state.get("messages", []),
+                "messages": _bounded_graph_messages([
+                    *_messages_before_user_turn(
+                        _resume_messages(state, response),
+                        question=message,
+                        turn_id=response.turn_id,
+                    ),
                     _conversation_message(
                         role="user",
                         content=message,
@@ -1217,7 +1262,7 @@ def build_research_workflow(
                         turn_id=response.turn_id,
                         episode_id=_cursor(state).episode_id,
                     ),
-                ][-MAX_GRAPH_MESSAGES:],
+                ]),
             }
         else:
             approval.status = "rejected"
@@ -2148,7 +2193,7 @@ def build_research_workflow(
                 }
             ).model_dump(mode="json"),
             "assistant_message": answer,
-            "messages": [
+            "messages": _bounded_graph_messages([
                 *state.get("messages", []),
                 _conversation_message(
                     role="assistant",
@@ -2156,7 +2201,7 @@ def build_research_workflow(
                     turn_id=state.get("active_turn_id"),
                     episode_id=_cursor(state).episode_id,
                 ),
-            ][-MAX_GRAPH_MESSAGES:],
+            ]),
             "events": _event(
                 state,
                 f"解释验证结果：{(state.get('latest_run') or {}).get('run_id', '当前证据')}",
@@ -2190,7 +2235,7 @@ def build_research_workflow(
             "phase": "awaiting_approval" if return_to_approval else "awaiting_user",
             "control": "result",
             "assistant_message": answer,
-            "messages": [
+            "messages": _bounded_graph_messages([
                 *state.get("messages", []),
                 _conversation_message(
                     role="assistant",
@@ -2198,7 +2243,7 @@ def build_research_workflow(
                     turn_id=state.get("active_turn_id"),
                     episode_id=_cursor(state).episode_id,
                 ),
-            ][-MAX_GRAPH_MESSAGES:],
+            ]),
             "events": _event(
                 state,
                 f"回答用户：{_short(_latest_turn(state), 44)}",
@@ -2335,8 +2380,12 @@ def build_research_workflow(
                 # evaluation. Keep its reason for the gate shown after reply.
                 "stop_reason": state.get("stop_reason"),
                 "user_interrupt_kind": None,
-                "messages": [
-                    *state.get("messages", []),
+                "messages": _bounded_graph_messages([
+                    *_messages_before_user_turn(
+                        _resume_messages(state, response),
+                        question=message,
+                        turn_id=response.turn_id,
+                    ),
                     _conversation_message(
                         role="user",
                         content=message,
@@ -2344,7 +2393,7 @@ def build_research_workflow(
                         turn_id=response.turn_id,
                         episode_id=_cursor(state).episode_id,
                     ),
-                ][-MAX_GRAPH_MESSAGES:],
+                ]),
             }
         # Stopping out of an error interrupt must keep the cause in the terminal record.
         cause = state.get("stop_reason") if interrupt_kind in {"response_error", "finalization_error"} else None
@@ -2389,8 +2438,12 @@ def build_research_workflow(
                 "latest_turn": message,
                 "active_turn_id": response.turn_id or state.get("active_turn_id"),
                 "explanation_request": "",
-                "messages": [
-                    *state.get("messages", []),
+                "messages": _bounded_graph_messages([
+                    *_messages_before_user_turn(
+                        _resume_messages(state, response),
+                        question=message,
+                        turn_id=response.turn_id,
+                    ),
                     _conversation_message(
                         role="user",
                         content=message,
@@ -2398,7 +2451,7 @@ def build_research_workflow(
                         turn_id=response.turn_id,
                         episode_id=_cursor(state).episode_id,
                     ),
-                ][-MAX_GRAPH_MESSAGES:],
+                ]),
                 "plan_origin": "initial" if response.action == "next_round" else state.get("plan_origin", "initial"),
             }
         return {"phase": "completed", "control": "end", "stop_reason": "用户结束当前研究。"}

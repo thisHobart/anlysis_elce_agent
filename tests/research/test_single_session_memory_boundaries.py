@@ -302,18 +302,15 @@ def test_graph_retention_is_exactly_120_messages_and_survives_restart(graph_boun
     assert MAX_PERSISTED_CONVERSATION_MESSAGES == 120
     assert len(completed) == MAX_PERSISTED_CONVERSATION_MESSAGES
     assert restored == completed
-    assert completed[0]["turn_id"] == "graph-turn-0002"
+    assert completed[0]["turn_id"] == "graph-turn-0001"
     assert completed[-1]["turn_id"] == "graph-turn-0061"
+    assert "graph-turn-0002" not in {item["turn_id"] for item in completed}
     assert all(
         [item["role"] for item in completed if item.get("turn_id") == turn_id] == ["user", "assistant"]
         for turn_id in dict.fromkeys(item.get("turn_id") for item in completed)
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Graph trims by individual message before retrieval, exposing an orphan assistant at the 120-message boundary.",
-)
 def test_graph_never_injects_an_incomplete_retrieved_turn(graph_boundary_observation: dict) -> None:
     target = next(
         turn

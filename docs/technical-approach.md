@@ -113,7 +113,7 @@
 
 **机制**　Graph 以 `ingest_user → main_agent` 为入口，经条件路由分派至 `resolve_skill → eda_subagent → validate_plan → prepare_approval → approval_interrupt`，审批通过后进入 `advance_tool → mark_tool_running` 的逐函数执行循环，最终经评估路由至 `prepare_evaluation_revision`（回到 `eda_subagent`）、`prepare_need_user`（进入 `user_interrupt`）或终止节点 `persist_stop` / `persist_failure`。状态、守卫与迁移分别由 `state.py`、`guards.py`、`migrations.py` 承载，过程叙述由 `narration.py` 生成。
 
-方案审批同时校验方案 ID、方案指纹与审批事实三者，模型意图不能绕过审批。非法 action 不改变原 checkpoint，状态保持可恢复。规划失败、函数重试与崩溃恢复与已完成评估的 Iteration 分开计数。自动修订只能在原审批范围内收缩工具、变量或滞后，扩大范围必须回到用户门禁。Graph 事件、消息与运行历史有界保存，完整桌面轨迹由会话投影保留。
+方案审批同时校验方案 ID、方案指纹与审批事实三者，模型意图不能绕过审批。非法 action 不改变原 checkpoint，状态保持可恢复。规划失败、函数重试与崩溃恢复与已完成评估的 Iteration 分开计数。自动修订只能在原审批范围内收缩工具、变量或滞后，扩大范围必须回到用户门禁。Graph 事件、消息与运行历史有界保存；完整桌面文本轨迹由会话投影保留并作为每次提问的召回候选源，Graph 的 120 条边界按完整 turn 原子选择。
 
 **选型理由** 〔待确认〕　候选方案 A 为自研状态机加数据库持久化，控制力最强，但中断恢复、部分执行、重试计数与状态迁移的正确性需要自行验证，而这恰是易出错且难以测试的部分；候选方案 B 为不做持久化，审批超时即丢弃，实现最简但与桌面长会话的使用形态冲突。选择 LangGraph 的核心理由在于 interrupt 与 checkpoint 是其原生语义而非附加能力，人在环审批这一需求被框架直接覆盖。
 

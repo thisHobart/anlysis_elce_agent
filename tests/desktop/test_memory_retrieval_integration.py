@@ -142,10 +142,6 @@ def test_real_desktop_survives_sixty_one_turns_without_losing_its_archive(
     assert sum(item["role"] == "assistant" and item["kind"] == "text" for item in desktop_messages) == 62
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="The desktop archive is complete, but Graph retrieval cannot reach the first turn after its 120-message cap.",
-)
 def test_real_desktop_can_recall_the_first_turn_after_sixty_one_turns(
     desktop_boundary_observation: dict,
 ) -> None:
@@ -159,10 +155,6 @@ def test_real_desktop_can_recall_the_first_turn_after_sixty_one_turns(
     assert "窗口设成48小时" in "\n".join(item["content"] for item in target["messages"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Desktop-to-Graph bootstrap applies a message-level character budget and can keep only half of a long turn.",
-)
 def test_desktop_bootstrap_never_splits_an_oversized_complete_turn() -> None:
     session = ResearchSession(
         messages=[
@@ -181,9 +173,21 @@ def test_desktop_bootstrap_never_splits_an_oversized_complete_turn() -> None:
         ]
     )
 
-    projected = ResearchWorkspace._agent_conversation(None, session)  # type: ignore[arg-type]
+    projected = ResearchWorkspace._agent_conversation(session)
+    state = ResearchCoordinator._initial_state(
+        thread_id="oversized-bootstrap",
+        message="继续上一轮",
+        message_id="oversized-current-message",
+        turn_id="oversized-current-turn",
+        study_config=None,
+        conversation=projected,
+        approval_timeout_seconds=30,
+        automatic_approval_enabled=False,
+    )
 
     assert [item.role for item in projected] == ["user", "assistant"]
+    assert [item["role"] for item in state["messages"]] == ["user", "assistant"]
+    assert all(item["turn_id"] == "oversized-bootstrap-turn" for item in state["messages"])
 
 
 def test_real_desktop_flow_retrieves_complete_precise_turns_after_restart(

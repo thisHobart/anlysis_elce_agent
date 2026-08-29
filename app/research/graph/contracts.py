@@ -282,6 +282,7 @@ class ResumePayload(BaseModel):
     message: str = ""
     message_id: str | None = None
     turn_id: str | None = None
+    conversation: list[dict[str, Any]] | None = None
     interrupt_id: str | None = None
     state_revision: int | None = Field(default=None, ge=0)
     automatic_timeout: bool = False

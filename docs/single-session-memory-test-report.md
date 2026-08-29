@@ -6,13 +6,13 @@
 
 ## 结论
 
-当前方案足以支持中短会话、主题词或技术标识明确的 Agent 工作，但不能称为可靠的长会话记忆。
+修复复验：M1～M3 已在 `ce809363` 基础上修复；M4～M6 仍是已知词法召回边界。当前方案足以支持完整桌面会话中的明确主题词或技术标识召回，但不能称为可靠的语义长会话记忆。
 
 - 最近连续上下文可靠范围是默认 4 个完整 turn。
-- 更早内容只有在仍位于 Graph 最近 120 条消息内且与当前问题存在足够词面重合时，才可能被召回。
-- Graph 完成一轮后最多保留 120 条消息，通常等于 60 个完整 turn；处理下一条用户消息时，安全可用的是 59 个完整历史 turn，最老 turn 会先变成只有 assistant 的半个 turn。
+- 桌面提问会以完整桌面文本历史为候选源，先召回与当前问题有足够词面重合的旧完整 turn，再以近期完整 turn 填充 Graph 的有界上下文。
+- Graph 完成一轮后最多保留 120 条消息，处理下一条用户消息前为当前 user/assistant 预留两个位置；边界不会产生只有 assistant 的半个 turn。
 - 默认每次请求最多注入 4 个最近 turn 和 3 个早期相关 turn，总对话正文硬预算为 24,000 + 6,000 = 30,000 字符；早期召回单条消息最多 1,200 字符。
-- 桌面 JSON 存档没有应用层消息数量上限，10,000 条测试无损，但完整存档没有成为 Graph 召回的数据源。因此“存下来了”不等于“模型还能记得”。
+- 桌面 JSON 存档没有应用层消息数量上限，10,000 条测试无损；完整文本存档现在是 Desktop 提问的召回候选源。
 - 一次真实模型冒烟测试成功使用了第 1 个召回 turn 的 `KAPPA-7319`，并忽略了历史里的 `WRONG-0000` 伪指令；这证明成功召回后模型可以正确使用该字段，但不能弥补召回缺失。
 
 ## 实际记忆链路
@@ -22,10 +22,10 @@ ResearchSession.messages
   │  SessionStore.save(): 全量 JSON，未按消息数截断
   ▼
 桌面会话存档
-  │  新建/重建 Graph 时：只投影 text 类型，最多 120 条、24,000 字符
+  │  每次提问：完整 text 历史参与 BM25 turn 召回
   ▼
 LangGraph state + SQLite checkpoint
-  │  每次写入按单条消息 messages[-120:] 截断
+  │  相关旧 turn 优先 + 近期 turn 填充；最多 120 条且 turn 原子
   ▼
 select_conversation_context()
   ├─ 最近：默认 4 个完整 turn，最多 24,000 字符
@@ -52,8 +52,8 @@ dialogue / planner JSON payload
 | 层 | 代码硬边界 | 本次实测 | 实际含义 |
 |---|---:|---:|---|
 | 桌面 JSON 存档 | 未设置消息数/字符数上限 | 10,000 条无损，3,285,340 bytes | 可以保存很长，但每次保存会重写完整 JSON |
-| Desktop → Graph 首次投影 | 120 条且 24,000 字符 | 长 turn 可能只保留 assistant 半边 | checkpoint 丢失或重建时不能从完整桌面历史恢复全部记忆 |
-| Graph 对话状态 | 120 条消息 | 61 turn 后只保留 turn 2～61 | 完成态约 60 个完整 turn，是当前绝对原文召回边界 |
+| Desktop → Graph 投影 | 完整桌面 text 历史作为候选，Graph 前置选择最多 118 条 | 长 turn 的 user/assistant 同时保留 | 为当前 user/assistant 预留两个位置 |
+| Graph 对话状态 | 最多 120 条消息，完整 turn 原子 | 61 turn 边界仍为 120 条，相关 turn 1 完整保留并淘汰无关 turn 2 | checkpoint 有界但不会形成孤立 assistant |
 | 最近窗口 | 默认 4 turn，24,000 字符 | 两条各约 10,000 字的消息时只保留 1 turn，共 20,034 字符 | turn 原子性优先，字符预算可能有未利用空间 |
 | 早期召回 | 默认 3 turn，6,000 字符 | 长 turn 召回 2,384 字符 | 每条召回消息另有 1,200 字符上限 |
 | 默认模型对话正文 | 最多 7 turn、30,000 字符 | 长文本样本为 22,379 tokens（`o200k_base`） | 不含 system prompt、工具 schema、Episode memory 等额外内容 |
@@ -66,7 +66,7 @@ dialogue / planner JSON payload
 
 ### BM25 + turn 选择
 
-这是对独立检索层的测试；超过 120 条的行用于观察算法扩展性，不代表当前 Graph 能提供这么多候选。
+这是对独立检索层的测试；Desktop 现在会让超过 120 条的完整文本历史参与候选选择，但最终 Graph checkpoint 仍只保存最多 120 条。
 
 | 消息数 | turn 数 | 目标位置 | p50 | p95 |
 |---:|---:|---|---:|---:|
@@ -78,7 +78,7 @@ dialogue / planner JSON payload
 | 5,000 | 2,500 | 早期召回 | 29.396 ms | 54.825 ms |
 | 10,000 | 5,000 | 早期召回 | 86.693 ms | 150.157 ms |
 
-检索在 1,000 条仍很轻，性能不是当前主要瓶颈；主要瓶颈是 Graph 在 120 条处已经删除候选。
+检索在 1,000 条仍很轻；当前完整桌面候选会在进入 Graph 前完成相关 turn 选择，Graph 的 120 条上限不再是 Desktop 长会话的绝对召回边界。
 
 ### SessionStore
 
@@ -94,11 +94,11 @@ dialogue / planner JSON payload
 ### Graph + SQLite checkpoint
 
 - 连续提交 61 个 turn 后，完成态仍严格保持 120 条消息。
-- 最早保留 `graph-turn-0002`，最新为 `graph-turn-0061`。
+- 边界查询命中第 1 turn 时，最早保留 `graph-turn-0001`，无关的 `graph-turn-0002` 被淘汰，最新为 `graph-turn-0061`。
 - 重启后恢复 120/120 条，checkpoint 相关文件合计约 307,200 bytes。
-- 重启读取约 119.312 ms。
-- fake gateway 下整轮 Graph p50 24.580 ms、p95 30.421 ms；不含真实模型网络时间。
-- 第 61 次模型请求期间，若查询第 1 个 turn，召回结果只有 assistant，证明按单条消息截断破坏了 turn 原子性。
+- 本次修复复验重启读取约 68.710 ms。
+- fake gateway 下整轮 Graph p50 19.193 ms、p95 22.034 ms；不含真实模型网络时间。
+- 第 61 次模型请求查询第 1 个 turn 时，召回结果同时包含 user 与 assistant。
 
 ## 召回质量
 
@@ -117,26 +117,23 @@ dialogue / planner JSON payload
 
 ## 已确认缺陷
 
-### M1：完整桌面历史无法参与长期召回（高，边界缺口）
+### M1：完整桌面历史无法参与长期召回（高，已修复）
 
 复现：在实际桌面链路完成 61 个 turn，再询问第 1 个 turn 的明确主题。  
 预期：桌面存档仍有完整问答，模型可召回。  
-实际：桌面记录完整，Graph 已删除第 1 个 turn，`earlier_related_turns` 无目标。  
-影响：第 60 个历史 turn 之外的普通对话事实、偏好和约束不可访问。
+修复：Desktop 每次提问传入完整文本历史；协调层用当前问题检索相关旧 turn，并将有界结果同步到新建、普通继续和 interrupt/resume Graph 路径。
 
-### M2：Graph 120 条临界点破坏完整 turn（高，正确性缺陷）
+### M2：Graph 120 条临界点破坏完整 turn（高，已修复）
 
 复现：Graph 已有 60 个完整 turn 时提交第 61 个问题，并让问题匹配第 1 个 assistant 回答。  
 预期：召回完整的 user + assistant。  
-实际：新 user 先占用一个位置，`messages[-120:]` 删除第 1 个 user；模型请求可能收到只有 assistant 的旧 turn。  
-影响：每个超过边界的新请求都会短暂产生一个最老的孤立 assistant，不只发生一次。
+修复：Graph 写入统一按完整 turn 原子裁剪，并在写入当前 user 前用当前问题保留相关旧 turn、预留当前 user/assistant 的两个位置。
 
-### M3：Desktop → Graph 重建会按消息字符截断半个 turn（高，恢复缺陷）
+### M3：Desktop → Graph 重建会按消息字符截断半个 turn（高，已修复）
 
 复现：桌面存档末尾一个 turn 的 user 和 assistant 各约 15,000 字符，然后在 Graph 不存在时投影。  
 预期：保留完整 turn，或按 turn 内规则同时截断两边。  
-实际：只保留最新 assistant。  
-影响：重建 Graph 时可能把没有问题上下文的回答作为历史导入。
+修复：Desktop 不再在排除当前消息前执行单消息字符裁剪；重建选择保持完整 turn，长 user/assistant 会同时进入 Graph，并在模型最近窗口内按双方公平预算截取。
 
 ### M4：跨窗口纯指代无法召回（中，常用交互缺陷）
 
@@ -180,8 +177,8 @@ dialogue / planner JSON payload
 
 优先修复顺序：
 
-1. 将 Graph 和 Desktop → Graph 的裁剪改为完整 turn 原子裁剪。
-2. 让召回读取完整会话存档，而不是只读取 Graph 最近 120 条。
+1. ~~将 Graph 和 Desktop → Graph 的裁剪改为完整 turn 原子裁剪。~~ 已完成。
+2. ~~让召回读取完整会话存档，而不是只读取 Graph 最近 120 条。~~ 已完成。
 3. 改进长 turn 摘录：对 assistant 优先保留结论段、数字/标识符附近片段，或同时保留头尾。
 4. 为“继续、刚才、上次那个”等指代建立最近主题/当前任务的结构化引用，不要只依赖 BM25。
 5. 在固定标注集上再评估 hybrid lexical + semantic retrieval。
@@ -207,4 +204,4 @@ dialogue / planner JSON payload
 .\.venv\Scripts\python.exe -m pytest -q -rxX
 ```
 
-最终全量回归结果：303 passed、6 xfailed，耗时 78.18 秒。6 个 xfail 均对应本报告 M1～M6 的已确认、尚未修复行为。
+修复后全量回归结果：312 passed、3 xfailed，耗时 52.83 秒。剩余 3 个 xfail 对应 M4～M6；M1～M3 的原严格 xfail 已转为通过。

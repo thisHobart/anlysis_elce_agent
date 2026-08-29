@@ -12,7 +12,9 @@ from uuid import uuid4
 from langgraph.types import Command
 
 from app.llm.factory import build_model_gateway
+from app.research.agent.context import MAX_PERSISTED_CONVERSATION_MESSAGES
 from app.research.agent.orchestrator import MainResearchAgent, ModelResearchDialogue
+from app.research.agent.retrieval import select_persisted_conversation_history
 from app.research.agent.schemas import (
     AgentRunResult,
     ConversationMessage,
@@ -50,6 +52,11 @@ from app.research.tools.registry import ToolRegistry
 
 GRAPH_SCHEMA_VERSION = 11
 GRAPH_RECURSION_LIMIT = 1000
+MAX_RECALLED_CONVERSATION_MESSAGES = max(1, MAX_PERSISTED_CONVERSATION_MESSAGES - 2)
+
+
+def _conversation_payloads(history: list[Any]) -> list[dict[str, Any]]:
+    return [ConversationMessage.model_validate(item).model_dump(mode="json") for item in history]
 
 
 class ResearchCoordinator:
@@ -152,7 +159,7 @@ class ResearchCoordinator:
         message_id: str,
         turn_id: str,
         study_config: StudyConfig | None,
-        conversation: list[ConversationMessage] | None,
+        conversation: list[ConversationMessage | dict[str, Any]] | None,
         approval_timeout_seconds: int,
         automatic_approval_enabled: bool,
         imported: dict[str, Any] | None = None,
@@ -175,7 +182,14 @@ class ResearchCoordinator:
             "user_request": "",
             "latest_turn": "",
             "explanation_request": "",
-            "messages": [item.model_dump(mode="json") for item in (conversation or [])],
+            "messages": _conversation_payloads(
+                select_persisted_conversation_history(
+                    conversation or [],
+                    question=message,
+                    current_turn_id=turn_id,
+                    max_messages=MAX_RECALLED_CONVERSATION_MESSAGES,
+                )
+            ),
             "study_config": study_config.model_dump(mode="json") if study_config is not None else None,
             "data_profile": None,
             "quality_report": None,
@@ -238,6 +252,14 @@ class ResearchCoordinator:
             base["pending_turn_id"] = turn_id
             base["study_config"] = study_config.model_dump(mode="json") if study_config is not None else base.get(
                 "study_config"
+            )
+            base["messages"] = _conversation_payloads(
+                select_persisted_conversation_history(
+                    base.get("messages", []),
+                    question=message,
+                    current_turn_id=turn_id,
+                    max_messages=MAX_RECALLED_CONVERSATION_MESSAGES,
+                )
             )
         return base
 
@@ -323,7 +345,7 @@ class ResearchCoordinator:
         message_id: str | None = None,
         turn_id: str | None = None,
         study_config: StudyConfig | None = None,
-        conversation: list[ConversationMessage] | None = None,
+        conversation: list[ConversationMessage | dict[str, Any]] | None = None,
         approval_timeout_seconds: int = 30,
         automatic_approval_enabled: bool = False,
         imported_state: dict[str, Any] | None = None,
@@ -334,6 +356,12 @@ class ResearchCoordinator:
             raise ValueError("用户消息不能为空")
         resolved_message_id = message_id or uuid4().hex
         resolved_turn_id = turn_id or uuid4().hex
+        recalled_conversation = select_persisted_conversation_history(
+            conversation or [],
+            question=text,
+            current_turn_id=resolved_turn_id,
+            max_messages=MAX_RECALLED_CONVERSATION_MESSAGES,
+        )
         with self._lock:
             has_compatible_thread = self.has_thread(session_id)
             if has_compatible_thread:
@@ -347,7 +375,7 @@ class ResearchCoordinator:
                     message_id=resolved_message_id,
                     turn_id=resolved_turn_id,
                     study_config=study_config,
-                    conversation=conversation,
+                    conversation=recalled_conversation,
                     approval_timeout_seconds=approval_timeout_seconds,
                     automatic_approval_enabled=automatic_approval_enabled,
                     imported=imported_state,
@@ -368,6 +396,9 @@ class ResearchCoordinator:
                                 message=text,
                                 message_id=resolved_message_id,
                                 turn_id=resolved_turn_id,
+                                conversation=_conversation_payloads(recalled_conversation)
+                                if conversation is not None
+                                else None,
                                 interrupt_id=snapshot.interrupt.interrupt_id or None,
                                 state_revision=snapshot.interrupt.state_revision,
                             ).model_dump(mode="json")
@@ -376,13 +407,16 @@ class ResearchCoordinator:
                         progress=progress,
                     )
                 else:
+                    update = {
+                        "pending_user_message": text,
+                        "pending_message_id": resolved_message_id,
+                        "pending_turn_id": resolved_turn_id,
+                        "study_config": study_config.model_dump(mode="json") if study_config else None,
+                    }
+                    if conversation is not None:
+                        update["messages"] = _conversation_payloads(recalled_conversation)
                     self._run_graph(
-                        {
-                            "pending_user_message": text,
-                            "pending_message_id": resolved_message_id,
-                            "pending_turn_id": resolved_turn_id,
-                            "study_config": study_config.model_dump(mode="json") if study_config else None,
-                        },
+                        update,
                         thread_id=session_id,
                         progress=progress,
                     )
