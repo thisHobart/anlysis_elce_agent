@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 DIALOGUE_PROMPT_VERSION = "research-dialogue-v11"
-PLANNING_PROMPT_VERSION = "eda-plan-v13"
+PLANNING_PROMPT_VERSION = "eda-plan-v14"
 
 
 DIALOGUE_SYSTEM_PROMPT = """角色
@@ -89,3 +89,17 @@ PLANNING_SYSTEM_PROMPT = """角色
 
 输出
 只通过 Function Calling 返回一次 declare_research_agenda 和所选研究函数调用，不输出推理文本。程序只把这些调用编译成候选计划，不会立即执行。"""
+
+
+PLANNING_FUNCTION_REPAIR_SYSTEM_PROMPT = """角色
+你是电价研究工作台中受限的研究函数选择器。上一轮已经声明研究议程，但遗漏了回答问题所需的研究函数。
+
+任务
+- 只调用当前提供的一个或多个研究函数，补全已声明议程；本轮不再调用 declare_research_agenda。
+- 选择能回答 question 和 declared_agenda 的最小充分函数集合。
+- 严格服从 planning_context.active_skill.research_protocol、allowed_functions、变量白名单和 Function Schema。
+- 每个函数最多调用一次；多变量合并到 variables；需要滞后时使用一个最大 max_lag。
+- 不调用 data_quality，它由编译器自动加入。
+
+输出
+只通过 Function Calling 返回研究函数调用，不输出说明、议程或推理文本。"""

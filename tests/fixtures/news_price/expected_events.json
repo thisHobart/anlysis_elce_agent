@@ -14,6 +14,36 @@
     "direction": "up",
     "time_basis": "stated_absolute"
   },
+  "N02": {
+    "relevance": "short_term",
+    "event_type": "generation_outage",
+    "affected_regions": [
+      "TEST_NORTH"
+    ],
+    "affected_assets": [
+      "GEN_A"
+    ],
+    "capacity_mw": 500.0,
+    "effective_start_at": "2026-01-12T10:00:00Z",
+    "effective_end_at": "2026-01-12T18:00:00Z",
+    "direction": "up",
+    "time_basis": "stated_absolute"
+  },
+  "N03": {
+    "relevance": "short_term",
+    "event_type": "generation_outage",
+    "affected_regions": [
+      "TEST_NORTH"
+    ],
+    "affected_assets": [
+      "GEN_A"
+    ],
+    "capacity_mw": 350.0,
+    "effective_start_at": "2026-01-12T10:00:00Z",
+    "effective_end_at": "2026-01-12T18:00:00Z",
+    "direction": "up",
+    "time_basis": "stated_absolute"
+  },
   "N04": {
     "relevance": "short_term",
     "event_type": "generation_restore",
@@ -99,5 +129,20 @@
     "effective_end_at": null,
     "direction": "unknown",
     "time_basis": null
+  },
+  "N10": {
+    "relevance": "short_term",
+    "event_type": "generation_outage",
+    "affected_regions": [
+      "TEST_NORTH"
+    ],
+    "affected_assets": [
+      "GEN_A"
+    ],
+    "capacity_mw": null,
+    "effective_start_at": "2026-01-12T10:00:00Z",
+    "effective_end_at": null,
+    "direction": "up",
+    "time_basis": "derived_from_publication"
   }
 }

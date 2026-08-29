@@ -10,7 +10,7 @@ import pytest
 from app.llm.gateway import ModelMessage
 from app.research.agent.context import bounded_recent_history
 from app.research.agent.orchestrator import ModelResearchDialogue
-from app.research.agent.retrieval import retrieve_related, tokenize
+from app.research.agent.retrieval import retrieve_related, select_conversation_context, tokenize
 from app.research.agent.schemas import ConversationMessage
 from app.research.agent.subagents.eda import EDASubagent, ModelEDAPlanner
 from app.research.application.planning import EDAPlanningService, prepare_research_data
@@ -126,6 +126,31 @@ def test_unrelated_history_costs_nothing():
     history = [_message(index, f"完全无关的第 {index} 条") for index in range(1, 12)]
 
     assert retrieve_related(history, question="max_lag 应该设成多少", exclude=[]) == []
+
+
+def test_one_generic_semantic_concept_is_not_enough_to_recall_a_turn():
+    history = [
+        *_turn(1, "把图表导出到报告目录", "输出保存为 HTML。"),
+        *_turn(2, "记录天气信息", "已经记录。"),
+    ]
+
+    assert retrieve_related(history, question="请落盘", exclude=[]) == []
+
+
+def test_reference_only_query_stays_unresolved_when_two_topics_are_equally_salient():
+    history = [
+        *_turn(1, "蓝鲸调度窗口设为 48 小时", "已经记录这个参数。"),
+        *_turn(2, "海豚备用容量设为百分之十五", "已经记录这项约束。"),
+        *[
+            message
+            for index in range(3, 8)
+            for message in _turn(index, f"普通天气记录 {index}", "普通回答。")
+        ],
+    ]
+
+    _recent, retrieved = select_conversation_context(history, question="继续按刚才那个做")
+
+    assert retrieved == []
 
 
 def test_exact_identifier_is_a_strong_match_by_itself():

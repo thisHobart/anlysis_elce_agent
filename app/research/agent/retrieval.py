@@ -32,6 +32,79 @@ _MIN_QUERY_COVERAGE = 0.25
 _COMMON_ONLY_QUERY_COVERAGE = 0.75
 _LEADING_TRUNCATION_MARKER = "…[前文已截断]"
 _TRAILING_TRUNCATION_MARKER = "…[后文已截断]"
+_MIDDLE_TRUNCATION_MARKER = "…[中间已截断]"
+_SEMANTIC_TERM_PREFIX = "@concept."
+_REFERENCE_FOCUS_TERM = "@reference.focus"
+
+# A small, auditable domain lexicon supplies semantic bridges for common research-
+# workspace wording without adding a heavyweight embedding runtime to the desktop
+# package. These terms supplement BM25; they do not replace exact identifiers.
+_SEMANTIC_ALIAS_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        f"{_SEMANTIC_TERM_PREFIX}visual",
+        ("图表", "图形", "可视化", "绘图", "chart", "plot", "visualization"),
+    ),
+    (
+        f"{_SEMANTIC_TERM_PREFIX}persist",
+        ("导出", "写入", "保存", "输出", "落盘", "export", "save", "write"),
+    ),
+    (
+        f"{_SEMANTIC_TERM_PREFIX}artifact_directory",
+        (
+            "报告目录",
+            "报告文件夹",
+            "产物目录",
+            "产物文件夹",
+            "输出目录",
+            "结果目录",
+            "artifact directory",
+            "artifact folder",
+            "report directory",
+        ),
+    ),
+    (
+        f"{_SEMANTIC_TERM_PREFIX}contemporaneous",
+        ("同期", "同时关系", "当期关系", "同步关系", "contemporaneous"),
+    ),
+    (
+        f"{_SEMANTIC_TERM_PREFIX}lead_lag",
+        ("领先滞后", "时滞关系", "延迟关系", "lead-lag", "lead lag", "lagged relationship"),
+    ),
+    (
+        f"{_SEMANTIC_TERM_PREFIX}feature",
+        ("外生变量", "驱动变量", "驱动因子", "候选特征", "exogenous variable", "driver feature"),
+    ),
+)
+_REFERENCE_ONLY_CUES = (
+    "刚才那个",
+    "之前那个",
+    "前面那个",
+    "上次那个",
+    "按刚才",
+    "按之前",
+    "照刚才",
+    "照之前",
+    "沿用之前",
+    "按原来",
+    "照旧",
+)
+_FOCUS_ACTION_CUES = (
+    "设为",
+    "设置",
+    "调整",
+    "改为",
+    "要求",
+    "限制",
+    "目标",
+    "方案",
+    "参数",
+    "分析",
+    "导出",
+    "保存",
+    "使用",
+    "采用",
+    "窗口",
+)
 
 
 @dataclass(frozen=True)
@@ -106,6 +179,46 @@ def tokenize(text: str) -> list[str]:
         else:
             tokens.extend(run[index : index + 2] for index in range(len(run) - 1))
     return tokens
+
+
+def _semantic_terms(text: str) -> list[str]:
+    """Map common paraphrases to stable domain concepts for hybrid retrieval."""
+
+    lowered = text.casefold()
+    return [
+        concept
+        for concept, aliases in _SEMANTIC_ALIAS_GROUPS
+        if any(alias in lowered for alias in aliases)
+    ]
+
+
+def _retrieval_terms(text: str) -> list[str]:
+    """Return lexical terms plus auditable semantic concept terms."""
+
+    return list(dict.fromkeys([*tokenize(text), *_semantic_terms(text)]))
+
+
+def _surface_terms(content: str, matched_terms: Sequence[str]) -> list[str]:
+    """Resolve synthetic concept matches back to phrases present in one message."""
+
+    lowered = content.casefold()
+    surface: list[str] = []
+    aliases_by_concept = dict(_SEMANTIC_ALIAS_GROUPS)
+    for term in matched_terms:
+        if term.startswith(_SEMANTIC_TERM_PREFIX):
+            surface.extend(alias for alias in aliases_by_concept.get(term, ()) if alias in lowered)
+        elif term == _REFERENCE_FOCUS_TERM:
+            continue
+        elif term.casefold() in lowered:
+            surface.append(term)
+    return list(dict.fromkeys(surface))
+
+
+def _is_reference_only_query(question: str) -> bool:
+    """Detect follow-ups whose antecedent is carried entirely by conversation state."""
+
+    normalized = question.casefold().strip()
+    return any(cue in normalized for cue in _REFERENCE_ONLY_CUES)
 
 
 def _field(item: Any, name: str, default: Any = "") -> Any:
@@ -184,6 +297,19 @@ def _truncate_recent_end(content: str, limit: int) -> str:
     return _LEADING_TRUNCATION_MARKER + content[-(limit - len(_LEADING_TRUNCATION_MARKER)) :]
 
 
+def _truncate_head_and_tail(content: str, limit: int) -> str:
+    """Keep both setup and final conclusion when no lexical anchor is available."""
+
+    if len(content) <= limit:
+        return content
+    if limit <= len(_MIDDLE_TRUNCATION_MARKER):
+        return _MIDDLE_TRUNCATION_MARKER[:limit]
+    remaining = limit - len(_MIDDLE_TRUNCATION_MARKER)
+    tail = max(1, remaining // 3)
+    head = remaining - tail
+    return content[:head] + _MIDDLE_TRUNCATION_MARKER + content[-tail:]
+
+
 def _excerpt_around_matches(content: str, matched_terms: Sequence[str], limit: int) -> str:
     """Keep a bounded excerpt containing the densest available lexical match."""
 
@@ -210,6 +336,25 @@ def _excerpt_around_matches(content: str, matched_terms: Sequence[str], limit: i
     prefix = _LEADING_TRUNCATION_MARKER if start else ""
     suffix = _TRAILING_TRUNCATION_MARKER if end < len(content) else ""
     return f"{prefix}{excerpt}{suffix}"[:limit]
+
+
+def _excerpt_around_matches_with_tail(
+    content: str,
+    matched_terms: Sequence[str],
+    limit: int,
+) -> str:
+    """Keep the lexical anchor and the answer tail inside one hard limit."""
+
+    primary = _excerpt_around_matches(content, matched_terms, limit)
+    if len(content) <= limit or not primary.endswith(_TRAILING_TRUNCATION_MARKER):
+        return primary
+    if limit <= len(_MIDDLE_TRUNCATION_MARKER) + 2:
+        return primary
+    available = limit - len(_MIDDLE_TRUNCATION_MARKER)
+    tail_budget = max(1, available // 3)
+    anchor_budget = available - tail_budget
+    anchor = primary[: -len(_TRAILING_TRUNCATION_MARKER)][:anchor_budget]
+    return (anchor + _MIDDLE_TRUNCATION_MARKER + content[-tail_budget:])[:limit]
 
 
 def _bm25_scores(
@@ -255,7 +400,9 @@ def _strong_identifier_terms(query_terms: Sequence[str]) -> set[str]:
     return {
         term
         for term in query_terms
-        if term[0].isascii() and ("_" in term or "-" in term or any(character.isdigit() for character in term))
+        if not term.startswith(_SEMANTIC_TERM_PREFIX)
+        and term[0].isascii()
+        and ("_" in term or "-" in term or any(character.isdigit() for character in term))
     }
 
 
@@ -270,6 +417,10 @@ def _relevance_gate(
 
     if not matched_terms:
         return False, 0.0
+    semantic_query = {term for term in query_terms if term.startswith(_SEMANTIC_TERM_PREFIX)}
+    semantic_matches = semantic_query.intersection(matched_terms)
+    if len(semantic_matches) >= 2 and len(semantic_matches) / len(semantic_query) >= 0.5:
+        return True, len(semantic_matches) / len(semantic_query)
     strong_identifiers = _strong_identifier_terms(query_terms)
     if strong_identifiers.intersection(matched_terms):
         return True, 1.0
@@ -292,6 +443,63 @@ def _relevance_gate(
     return True, coverage
 
 
+def _candidate_focus_text(candidate: _TurnCandidate) -> str:
+    """Prefer the user's request when deriving a turn-level reference focus."""
+
+    user_text = "\n".join(
+        str(_field(message, "content", ""))
+        for message in candidate.messages
+        if str(_field(message, "role", "")) == "user"
+    )
+    return user_text or candidate.text
+
+
+def _reference_focus_candidate(
+    candidates: Sequence[_TurnCandidate],
+    all_turns: Sequence[_TurnCandidate],
+) -> tuple[float, _TurnCandidate] | None:
+    """Resolve a pure reference only when one earlier task is clearly salient.
+
+    This is a conservative fallback for phrases such as "继续按刚才那个做". It
+    derives a structured focus score from rare terms and task-setting language
+    across the complete available transcript. If two topics are similarly
+    plausible, retrieval stays empty so the dialogue model can ask for clarity.
+    """
+
+    if not candidates:
+        return None
+    all_documents = [_retrieval_terms(_candidate_focus_text(turn)) for turn in all_turns]
+    document_frequency: Counter[str] = Counter()
+    for document in all_documents:
+        document_frequency.update(set(document))
+    document_count = max(1, len(all_documents))
+
+    scored: list[tuple[float, int, _TurnCandidate]] = []
+    for candidate in candidates:
+        focus_text = _candidate_focus_text(candidate)
+        terms = set(_retrieval_terms(focus_text))
+        weights = sorted(
+            (
+                math.log(1 + (document_count - document_frequency[term] + 0.5) / (document_frequency[term] + 0.5))
+                for term in terms
+                if not term.startswith(_SEMANTIC_TERM_PREFIX)
+            ),
+            reverse=True,
+        )
+        information = sum(weights[:8])
+        action = min(3, sum(cue in focus_text.casefold() for cue in _FOCUS_ACTION_CUES)) * 1.25
+        scored.append((information + action, candidate.order, candidate))
+    scored.sort(key=lambda entry: (-entry[0], -entry[1]))
+    best_score, _order, best = scored[0]
+    if best_score < 4.0:
+        return None
+    if len(scored) > 1:
+        second_score = scored[1][0]
+        if best_score < second_score + 2.0 and best_score < second_score * 1.35:
+            return None
+    return best_score, best
+
+
 def _project_turn(
     candidate: _TurnCandidate,
     *,
@@ -311,11 +519,11 @@ def _project_turn(
     projected: list[RetrievedMessage] = []
     for item in candidate.messages:
         content = str(_field(item, "content", ""))
-        message_terms = [term for term in matched_terms if term.lower() in content.lower()]
+        message_terms = _surface_terms(content, matched_terms)
         excerpt = (
-            _excerpt_around_matches(content, message_terms, per_message_limit)
+            _excerpt_around_matches_with_tail(content, message_terms, per_message_limit)
             if message_terms
-            else _truncate_start(content, per_message_limit)
+            else _truncate_head_and_tail(content, per_message_limit)
         )
         projected.append(
             RetrievedMessage(
@@ -549,7 +757,7 @@ def retrieve_related(
 
     if limit < 1 or max_characters < 1:
         return []
-    query_terms = list(dict.fromkeys(tokenize(question)))
+    query_terms = _retrieval_terms(question)
     if not query_terms:
         return []
 
@@ -562,7 +770,7 @@ def retrieve_related(
     if not candidates:
         return []
 
-    documents = [tokenize(candidate.text) for candidate in candidates]
+    documents = [_retrieval_terms(candidate.text) for candidate in candidates]
     scored, _idf, document_frequency = _bm25_scores(query_terms, documents)
     ranked: list[tuple[float, float, int, _TurnCandidate, list[str]]] = []
     for candidate, (score, matched) in zip(candidates, scored, strict=True):
@@ -575,6 +783,22 @@ def retrieve_related(
         if eligible and score > 0:
             ranked.append((score, coverage, candidate.order, candidate, matched))
     ranked.sort(key=lambda entry: (-entry[0], -entry[1], -entry[2]))
+
+    if not ranked and _is_reference_only_query(question):
+        focus = _reference_focus_candidate(
+            candidates,
+            _group_turns(history, roles),
+        )
+        if focus is not None:
+            score, candidate = focus
+            projected = _project_turn(
+                candidate,
+                score=score,
+                matched_terms=[_REFERENCE_FOCUS_TERM],
+                query_coverage=0.0,
+                character_budget=max_characters,
+            )
+            return [projected] if projected is not None else []
 
     selected: list[tuple[int, RetrievedTurn]] = []
     used = 0

@@ -1,4 +1,4 @@
-"""Weakly coupled P2 news normalization and explicit-fixture event extraction."""
+"""Weakly coupled P2 news domain: normalization, extraction, merging and price analysis."""
 
 from app.research.news.adapters import (
     CollectedNewsAdapter,
@@ -7,36 +7,116 @@ from app.research.news.adapters import (
     ExternalNewsApiPlaceholder,
     JsonlCollectedNewsAdapter,
 )
+from app.research.news.analysis import (
+    AnalysisMethod,
+    AnalysisResult,
+    EventAnalysisError,
+    EventPriceAnalyzer,
+    EventWindowResult,
+    WindowSpec,
+)
+from app.research.news.clock import (
+    LeadTimeReading,
+    MarketClock,
+    MarketClockError,
+    TimeAxis,
+    is_usable_at,
+    lead_time_table,
+    zero_point,
+)
 from app.research.news.contracts import (
     CollectedNewsRecord,
+    DocumentRef,
     EventExtractionBatch,
     EventExtractionResult,
+    EventFeatureRow,
+    EventFeatureSnapshot,
     EventRecord,
     EvidenceSpan,
     ExtractionQuarantine,
+    MergedEvent,
     NewsDocument,
     QuarantineReason,
+    ReviewStatus,
     TimeResolution,
 )
+from app.research.news.evidence import (
+    DataQualityReport,
+    EvidenceChainError,
+    EvidenceLink,
+    ResearchPackage,
+    build_evidence_links,
+    build_quality_report,
+    render_report,
+)
 from app.research.news.extraction import ObviousNewsEventExtractor
+from app.research.news.features import (
+    EventFeatureError,
+    build_event_features,
+    snapshot_to_csv_rows,
+)
+from app.research.news.merging import AsOfEventAssembler, EventView, merge_event_records
 from app.research.news.normalization import NewsNormalizer, normalize_news_text
+from app.research.news.pipeline import NewsPriceStudy, collect_evidence_spans, run_news_price_study
+from app.research.news.prices import PriceObservations, PriceSeriesError, load_price_csv
+from app.research.news.versioning import NewsVersionError, NewsVersionStore, document_ref
 
 __all__ = [
+    "AnalysisMethod",
+    "AnalysisResult",
+    "AsOfEventAssembler",
     "CollectedNewsAdapter",
     "CollectedNewsAdapterError",
     "CollectedNewsRecord",
+    "DataQualityReport",
+    "DocumentRef",
+    "EventAnalysisError",
     "EventExtractionBatch",
     "EventExtractionResult",
+    "EventFeatureError",
+    "EventFeatureRow",
+    "EventFeatureSnapshot",
+    "EventPriceAnalyzer",
     "EventRecord",
+    "EventView",
+    "EventWindowResult",
+    "EvidenceChainError",
+    "EvidenceLink",
     "EvidenceSpan",
     "ExternalNewsAdapterNotConfigured",
     "ExternalNewsApiPlaceholder",
     "ExtractionQuarantine",
     "JsonlCollectedNewsAdapter",
+    "LeadTimeReading",
+    "MarketClock",
+    "MarketClockError",
+    "MergedEvent",
     "NewsDocument",
     "NewsNormalizer",
+    "NewsPriceStudy",
+    "NewsVersionError",
+    "NewsVersionStore",
     "ObviousNewsEventExtractor",
+    "PriceObservations",
+    "PriceSeriesError",
     "QuarantineReason",
+    "ResearchPackage",
+    "ReviewStatus",
+    "TimeAxis",
     "TimeResolution",
+    "WindowSpec",
+    "build_event_features",
+    "build_evidence_links",
+    "build_quality_report",
+    "collect_evidence_spans",
+    "document_ref",
+    "is_usable_at",
+    "lead_time_table",
+    "load_price_csv",
+    "merge_event_records",
     "normalize_news_text",
+    "render_report",
+    "run_news_price_study",
+    "snapshot_to_csv_rows",
+    "zero_point",
 ]

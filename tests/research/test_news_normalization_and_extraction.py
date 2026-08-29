@@ -47,15 +47,16 @@ def test_collected_news_is_normalized_with_stable_identity_and_three_source_time
     second = normalizer.normalize_many(records)
 
     assert first == second
-    assert len(first) == 7
-    assert len({document.document_id for document in first}) == len(first)
+    assert len(first) == 10
+    # N01 and its 12:00 correction are two versions of ONE document, so identities are 9.
+    assert len({document.document_id for document in first}) == 9
     assert len({document.document_version_id for document in first}) == len(first)
 
     for document in first:
         assert document.source_name
         assert document.source_document_id
         assert document.source_ref.startswith("fixture://news/")
-        assert document.version == 1
+        assert document.version >= 1
         assert len(document.content_hash) == 64
         assert document.available_at == max(document.published_at, document.first_seen_at)
         assert document.published_at.utcoffset().total_seconds() == 0
@@ -106,7 +107,8 @@ def test_obvious_news_extracts_all_expected_event_fields_and_exact_evidence() ->
     extractor = ObviousNewsEventExtractor()
 
     for document in _load_documents():
-        expected = expected_by_id[document.source_document_id]
+        # Keyed by fixture id, not source id: the correction shares its source document.
+        expected = expected_by_id[document.raw_metadata["fixture_id"]]
         first = extractor.extract(document)
         second = extractor.extract(document)
         assert first == second

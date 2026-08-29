@@ -398,6 +398,45 @@ class _AgendaGateway:
         ]
 
 
+class _AgendaThenFunctionsGateway:
+    """Reproduce a model that needs the executable tool set narrowed once."""
+
+    enabled = True
+    model_name = "agenda-repair-model"
+
+    def __init__(self) -> None:
+        self.offered_tool_names: list[list[str]] = []
+
+    def invoke_tool_calls(self, *, messages, tools):
+        del messages
+        names = [tool["function"]["name"] for tool in tools]
+        self.offered_tool_names.append(names)
+        if AGENDA_FUNCTION_NAME in names:
+            return [
+                ModelToolCall(
+                    name=AGENDA_FUNCTION_NAME,
+                    arguments={
+                        "objective": "判定 load、wind 与电价的同期和领先滞后关系",
+                        "hypotheses": [
+                            "load、wind 与电价可能存在同期关系。",
+                            "load、wind 可能存在领先滞后关系。",
+                        ],
+                        "variable_selection_mode": "explicit",
+                    },
+                )
+            ]
+        return [
+            ModelToolCall(
+                name="relationship_scipy_pearson_pairwise",
+                arguments={"variables": ["load", "wind"]},
+            ),
+            ModelToolCall(
+                name="relationship_pearson_positive_lead_scan",
+                arguments={"variables": ["load", "wind"], "max_lag": 48},
+            ),
+        ]
+
+
 def _agenda_coordinator(gateway) -> ResearchCoordinator:
     return ResearchCoordinator(
         eda_subagent=EDASubagent(model_planner=ModelEDAPlanner(gateway=gateway)),
@@ -443,6 +482,26 @@ def test_an_agenda_only_answer_produces_the_data_quality_only_plan(synthetic_stu
     assert [step.function for step in plan.enabled_steps] == ["data_quality"]
     assert plan.objective == "先确认这批数据能不能用"
     assert plan.hypotheses == []
+
+
+def test_an_agenda_only_analysis_answer_is_repaired_with_executable_tools(
+    synthetic_study: Path,
+):
+    gateway = _AgendaThenFunctionsGateway()
+
+    plan = _agenda_coordinator(gateway).propose(
+        question="分析 load、wind 与实时电价的同期和领先滞后关系",
+        config_path=synthetic_study,
+    ).plan
+
+    assert [step.function for step in plan.enabled_steps] == [
+        "data_quality",
+        "relationship_scipy_pearson_pairwise",
+        "relationship_pearson_positive_lead_scan",
+    ]
+    assert len(gateway.offered_tool_names) == 2
+    assert AGENDA_FUNCTION_NAME in gateway.offered_tool_names[0]
+    assert AGENDA_FUNCTION_NAME not in gateway.offered_tool_names[1]
 
 
 def test_agenda_cannot_name_analysis_functions_without_calling_them(synthetic_study: Path):

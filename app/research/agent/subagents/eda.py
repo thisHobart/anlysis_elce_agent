@@ -20,7 +20,11 @@ from app.llm.gateway import (
     ModelToolCall,
 )
 from app.research.agent.errors import ResearchModelUnavailableError, ResearchPlanValidationError
-from app.research.agent.prompts import PLANNING_PROMPT_VERSION, PLANNING_SYSTEM_PROMPT
+from app.research.agent.prompts import (
+    PLANNING_FUNCTION_REPAIR_SYSTEM_PROMPT,
+    PLANNING_PROMPT_VERSION,
+    PLANNING_SYSTEM_PROMPT,
+)
 from app.research.agent.retrieval import select_conversation_context
 from app.research.agent.schemas import EDAPlan
 from app.research.planning.compiler import EDAPlanCompiler, max_lag_limit
@@ -44,6 +48,7 @@ AGENDA_FUNCTION_SCHEMA: dict[str, Any] = {
         "name": AGENDA_FUNCTION_NAME,
         "description": (
             "声明本轮研究议程。必须调用一次，与分析函数在同一次回复中一起返回。"
+            "只有当用户明确只要求数据可用性核验时才可单独调用；其他问题单独调用无效。"
             "这个调用不执行任何计算，只记录本轮要判定什么、要验证哪些假设。"
         ),
         "parameters": {
@@ -81,12 +86,48 @@ AGENDA_FUNCTION_SCHEMA: dict[str, Any] = {
                     "description": "auto_recommend 最多推荐多少个变量，默认 8。",
                 },
             },
-            "required": ["objective"],
+            "required": ["objective", "variable_selection_mode"],
         },
     },
 }
 FUNCTION_METADATA = function_metadata()
 OPTIONAL_FUNCTIONS = optional_function_names()
+
+_DATA_QUALITY_ONLY_CUES = (
+    "数据质量",
+    "质量检查",
+    "质量核验",
+    "数据可用",
+    "能不能用",
+    "是否可用",
+    "缺失率",
+    "覆盖率",
+    "重复时间戳",
+    "时间戳对齐",
+)
+_ANALYSIS_CUES = (
+    "关系",
+    "相关",
+    "滞后",
+    "领先",
+    "分布",
+    "周期",
+    "季节",
+    "平稳",
+    "趋势",
+    "波动",
+    "尖峰",
+    "极端",
+    "异常值",
+    "共线",
+    "因果",
+    "granger",
+    "pearson",
+    "spearman",
+    "互信息",
+    "基线",
+    "可预测",
+)
 
 
 def _accepts_keyword(callback: Any, name: str) -> bool:
@@ -141,6 +182,21 @@ def _validate_agenda_function_coverage(
         raise ResearchPlanValidationError(f"议程引用了未选择的研究函数：{', '.join(missing)}")
     if not analysis_calls:
         raise ResearchPlanValidationError("研究议程包含待判定假设，但没有选择任何研究函数")
+
+
+def _allows_data_quality_only_plan(question: str) -> bool:
+    """Recognize the narrow case where the compiler-managed quality step is sufficient.
+
+    The default is deliberately conservative. A mixed request mentioning both data
+    readiness and an analytical objective must still select at least one research
+    function; otherwise the agenda pseudo-function could satisfy ``tool_choice`` on
+    its own and silently turn a substantive request into a quality-only plan.
+    """
+
+    normalized = question.casefold()
+    return any(cue in normalized for cue in _DATA_QUALITY_ONLY_CUES) and not any(
+        cue in normalized for cue in _ANALYSIS_CUES
+    )
 
 
 class ModelEDAPlanner:
@@ -257,7 +313,10 @@ class ModelEDAPlanner:
                 "trusted_arguments": "compiler_injects_thresholds_and_minimum_observations",
                 "function_cardinality": "each_function_at_most_once_per_plan",
                 "research_agenda": "declare_research_agenda_once_alongside_analysis_functions",
-                "minimum_plan": "declare_research_agenda_alone_yields_a_data_quality_only_plan",
+                "minimum_plan": (
+                    "declare_research_agenda_alone_is_valid_only_when_question_explicitly_requests_"
+                    "data_quality_only"
+                ),
             },
         }
         messages = [
@@ -273,6 +332,31 @@ class ModelEDAPlanner:
                 calls = invoke_calls(messages=messages, tools=[*function_schemas, AGENDA_FUNCTION_SCHEMA])
                 agenda = next((call for call in calls if call.name == AGENDA_FUNCTION_NAME), None)
                 analysis_calls = [call for call in calls if call.name != AGENDA_FUNCTION_NAME]
+                if (
+                    function_schemas
+                    and not analysis_calls
+                    and not _allows_data_quality_only_plan(question)
+                ):
+                    # ``tool_choice=required`` only means "call any offered tool".
+                    # The agenda pseudo-function therefore satisfies the transport
+                    # contract by itself. Repair the missing half with a narrowed
+                    # tool set in which every permitted call is executable.
+                    repair_payload = {
+                        "planning_context": payload,
+                        "declared_agenda": agenda.model_dump(mode="json") if agenda is not None else None,
+                        "repair_requirement": (
+                            "The previous response selected no executable research function. "
+                            "Choose the minimum sufficient research functions now."
+                        ),
+                    }
+                    repair_messages = [
+                        ModelMessage(role="system", content=PLANNING_FUNCTION_REPAIR_SYSTEM_PROMPT),
+                        ModelMessage(role="user", content=json.dumps(repair_payload, ensure_ascii=False)),
+                    ]
+                    repaired_calls = invoke_calls(messages=repair_messages, tools=function_schemas)
+                    analysis_calls = [
+                        call for call in repaired_calls if call.name != AGENDA_FUNCTION_NAME
+                    ]
                 _validate_agenda_function_coverage(agenda, analysis_calls)
                 mode_value = _agenda_text(agenda, "variable_selection_mode") or "explicit"
                 if mode_value not in {"explicit", "all_eligible", "auto_recommend"}:

@@ -356,6 +356,7 @@ class ObviousNewsEventExtractor:
                 affected_regions=regions,
                 affected_assets=assets,
                 capacity_mw=capacity_mw,
+                announcement_available_at=document.available_at,
                 effective_start_at=effective_start_at,
                 effective_end_at=effective_end_at,
                 direction=rule.direction,

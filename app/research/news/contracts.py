@@ -27,6 +27,7 @@ QuarantineReason = Literal[
     "event_contract_violation",
 ]
 TimeBasis = Literal["stated_absolute", "derived_from_publication"]
+ReviewStatus = Literal["unreviewed", "accepted", "corrected", "rejected"]
 
 
 def _require_aware(value: datetime, *, field_name: str) -> datetime:
@@ -186,6 +187,7 @@ class EventRecord(BaseModel):
     affected_regions: tuple[str, ...] = ()
     affected_assets: tuple[str, ...] = ()
     capacity_mw: float | None = Field(default=None, gt=0)
+    announcement_available_at: datetime
     effective_start_at: datetime | None = None
     effective_end_at: datetime | None = None
     direction: EventDirection = "unknown"
@@ -194,7 +196,7 @@ class EventRecord(BaseModel):
     extractor_version: str = Field(min_length=1, max_length=32)
     evidence: tuple[EvidenceSpan, ...] = ()
 
-    @field_validator("effective_start_at", "effective_end_at")
+    @field_validator("announcement_available_at", "effective_start_at", "effective_end_at")
     @classmethod
     def validate_event_time(cls, value: datetime | None, info) -> datetime | None:
         if value is None:
@@ -269,4 +271,142 @@ class EventExtractionBatch(BaseModel):
     @property
     def quarantined(self) -> tuple[ExtractionQuarantine, ...]:
         return tuple(result.quarantine for result in self.results if result.quarantine is not None)
+
+
+class DocumentRef(BaseModel):
+    """One news version that contributed to a merged event, kept for provenance."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    document_id: str = Field(pattern=r"^news_[a-f0-9]{24}$")
+    document_version_id: str = Field(pattern=r"^newsv_[a-f0-9]{24}$")
+    version: int = Field(ge=1)
+    source_name: str = Field(min_length=1, max_length=128)
+    content_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+    available_at: datetime
+
+    @field_validator("available_at")
+    @classmethod
+    def validate_available_at(cls, value: datetime, info) -> datetime:
+        aware = _require_aware(value, field_name=info.field_name)
+        if aware.utcoffset().total_seconds() != 0:
+            raise ValueError(f"{info.field_name} must be normalized to UTC")
+        return aware
+
+
+class MergedEvent(BaseModel):
+    """One real-world event assembled from every version and repost visible at `as_of`."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    merger_version: str = Field(min_length=1, max_length=32)
+    event_id: str = Field(pattern=r"^evt_[a-f0-9]{24}$")
+    as_of: datetime
+    relevance: NewsRelevance
+    event_type: NewsEventType
+    affected_regions: tuple[str, ...] = ()
+    affected_assets: tuple[str, ...] = ()
+    capacity_mw: float | None = Field(default=None, gt=0)
+    announcement_available_at: datetime
+    effective_start_at: datetime | None = None
+    effective_end_at: datetime | None = None
+    direction: EventDirection = "unknown"
+    document_refs: tuple[DocumentRef, ...] = Field(min_length=1)
+    revision_count: int = Field(ge=1)
+    review_status: ReviewStatus = "unreviewed"
+
+    @field_validator("as_of", "announcement_available_at", "effective_start_at", "effective_end_at")
+    @classmethod
+    def validate_merged_time(cls, value: datetime | None, info) -> datetime | None:
+        if value is None:
+            return None
+        aware = _require_aware(value, field_name=info.field_name)
+        if aware.utcoffset().total_seconds() != 0:
+            raise ValueError(f"{info.field_name} must be normalized to UTC")
+        return aware
+
+    @model_validator(mode="after")
+    def validate_merge_is_leak_free(self) -> MergedEvent:
+        if self.announcement_available_at > self.as_of:
+            raise ValueError("a merged event cannot be announced after the as_of it belongs to")
+        if any(ref.available_at > self.as_of for ref in self.document_refs):
+            raise ValueError("a merged event cannot cite a document version that was not yet available")
+        earliest = min(ref.available_at for ref in self.document_refs)
+        if self.announcement_available_at != earliest:
+            raise ValueError("announcement_available_at must equal the earliest contributing document")
+        if self.revision_count != len(self.document_refs):
+            raise ValueError("revision_count must match the number of contributing document versions")
+        return self
+
+    @property
+    def lead_time_hours(self) -> float | None:
+        """How long the market could act before the event took effect; negative means late news."""
+
+        if self.effective_start_at is None:
+            return None
+        return (self.effective_start_at - self.announcement_available_at).total_seconds() / 3600
+
+
+class EventFeatureRow(BaseModel):
+    """Event-derived numeric features for one settlement interval."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    interval_start: datetime
+    active_event_count: int = Field(ge=0)
+    active_capacity_mw: float | None = Field(default=None, ge=0)
+    direction_up_count: int = Field(ge=0)
+    direction_down_count: int = Field(ge=0)
+    event_type_counts: dict[str, int] = Field(default_factory=dict)
+    source_event_ids: tuple[str, ...] = ()
+
+    @field_validator("interval_start")
+    @classmethod
+    def validate_interval_start(cls, value: datetime, info) -> datetime:
+        aware = _require_aware(value, field_name=info.field_name)
+        if aware.utcoffset().total_seconds() != 0:
+            raise ValueError(f"{info.field_name} must be normalized to UTC")
+        return aware
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> EventFeatureRow:
+        if self.active_event_count != len(self.source_event_ids):
+            raise ValueError("active_event_count must match the listed source events")
+        if self.active_event_count == 0 and self.active_capacity_mw is not None:
+            raise ValueError("an interval with no active event cannot carry a capacity value")
+        return self
+
+
+class EventFeatureSnapshot(BaseModel):
+    """A numeric event-feature table valid as of one instant; this is the P1 hand-off shape."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    feature_version: str = Field(min_length=1, max_length=32)
+    market: str = Field(min_length=1, max_length=128)
+    market_timezone: str = Field(min_length=1, max_length=64)
+    interval_minutes: int = Field(gt=0)
+    as_of: datetime
+    rows: tuple[EventFeatureRow, ...] = Field(min_length=1)
+    source_event_ids: tuple[str, ...] = ()
+    content_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+    @field_validator("as_of")
+    @classmethod
+    def validate_as_of(cls, value: datetime, info) -> datetime:
+        aware = _require_aware(value, field_name=info.field_name)
+        if aware.utcoffset().total_seconds() != 0:
+            raise ValueError(f"{info.field_name} must be normalized to UTC")
+        return aware
+
+    @model_validator(mode="after")
+    def validate_rows_are_ordered_and_gated(self) -> EventFeatureSnapshot:
+        starts = [row.interval_start for row in self.rows]
+        if starts != sorted(starts):
+            raise ValueError("feature rows must be ordered by interval_start")
+        if len(set(starts)) != len(starts):
+            raise ValueError("feature rows must not repeat an interval_start")
+        return self
 

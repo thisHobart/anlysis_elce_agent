@@ -18,6 +18,8 @@ import pytest
         "app.research.agent.retrieval",
         "app.research.agent.subagents.eda",
         "app.research.news",
+        "app.research.news.analysis",
+        "app.research.news.pipeline",
     ],
 )
 def test_research_modules_import_without_order_dependencies(module_name: str) -> None:
@@ -85,3 +87,75 @@ def test_news_domain_does_not_import_p1_eda_domain_modules() -> None:
                 violations.append(f"{path.name}: {module_name}")
 
     assert violations == []
+
+
+def _imported_modules(path: Path) -> list[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    modules: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            modules.append(node.module)
+    return modules
+
+
+def test_p1_domain_does_not_import_the_p2_news_domain() -> None:
+    """The boundary must hold in both directions, or the two phases drift into one."""
+
+    repository_root = Path(__file__).resolve().parents[2]
+    research_root = repository_root / "app" / "research"
+    violations: list[str] = []
+
+    for path in research_root.rglob("*.py"):
+        if "news" in path.relative_to(research_root).parts:
+            continue
+        for module_name in _imported_modules(path):
+            if module_name.startswith("app.research.news"):
+                violations.append(f"{path.relative_to(repository_root)}: {module_name}")
+
+    assert violations == [], f"P1 侧不得依赖 P2 新闻领域：{violations}"
+
+
+def test_the_price_analysis_cannot_see_the_fixture_answer_key() -> None:
+    """If the statistics could read the injected effects, recovering them would prove nothing."""
+
+    repository_root = Path(__file__).resolve().parents[2]
+    news_root = repository_root / "app" / "research" / "news"
+    answer_key_modules = {"app.research.news.synthetic"}
+    analysis_side = ("analysis.py", "clock.py", "prices.py", "features.py", "evidence.py")
+    violations: list[str] = []
+
+    for file_name in analysis_side:
+        path = news_root / file_name
+        for module_name in _imported_modules(path):
+            if module_name in answer_key_modules:
+                violations.append(f"{file_name}: {module_name}")
+        source = path.read_text(encoding="utf-8")
+        for forbidden in ("fixture_manifest", "EffectSpec", "effect_spec"):
+            assert forbidden not in source, f"{file_name} 不得引用夹具答案：{forbidden}"
+
+    assert violations == [], f"分析代码不得导入夹具生成器：{violations}"
+
+
+def test_the_fixture_generator_is_never_pulled_in_by_the_news_package_import() -> None:
+    """Importing the domain must not drag the answer key into the process at all."""
+
+    repository_root = Path(__file__).resolve().parents[2]
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import app.research.news; "
+                "print('app.research.news.synthetic' in sys.modules)"
+            ),
+        ],
+        cwd=repository_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "False", "app.research.news 不应连带导入夹具生成器"

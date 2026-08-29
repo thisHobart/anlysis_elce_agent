@@ -1,8 +1,8 @@
 """Characterization and stress checks for the complete single-session memory path.
 
 These tests deliberately distinguish durable desktop storage, Graph retention,
-and model-visible prompt context.  Known lexical/turn-boundary limitations are
-kept as strict xfails so they remain visible without making the normal suite red.
+and model-visible prompt context, including semantic, reference-only, and long-
+answer retrieval boundaries.
 """
 
 from __future__ import annotations
@@ -321,10 +321,6 @@ def test_graph_never_injects_an_incomplete_retrieved_turn(graph_boundary_observa
     assert [item["role"] for item in target["messages"]] == ["user", "assistant"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Lexical BM25 cannot connect a pure synonym/paraphrase with no shared terms.",
-)
 def test_semantic_paraphrase_without_lexical_overlap_is_recalled() -> None:
     history = [
         *_turn(1, "把图表导出到报告目录", "输出保存为 HTML。"),
@@ -340,10 +336,6 @@ def test_semantic_paraphrase_without_lexical_overlap_is_recalled() -> None:
     assert [turn.turn_id for turn in retrieved] == ["boundary-turn-0001"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A pronoun-only query beyond the four recent turns supplies no lexical key for retrieval.",
-)
 def test_pronoun_only_reference_beyond_recent_window_is_recalled() -> None:
     history = [
         *_turn(1, "蓝鲸调度窗口设为 48 小时", "已经记录这个参数。"),
@@ -359,10 +351,6 @@ def test_pronoun_only_reference_beyond_recent_window_is_recalled() -> None:
     assert [turn.turn_id for turn in retrieved] == ["boundary-turn-0001"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="The paired long answer is excerpted near its first lexical match, which can discard a conclusion at the tail.",
-)
 def test_long_paired_answer_keeps_its_tail_conclusion() -> None:
     history = _turn(
         1,
