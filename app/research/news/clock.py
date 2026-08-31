@@ -55,10 +55,16 @@ class MarketClock:
     def floor(self, instant: datetime) -> datetime:
         """Snap down to the settlement interval this instant falls inside."""
 
-        moment = self._utc(instant)
-        day_start = moment.replace(hour=0, minute=0, second=0, microsecond=0)
-        elapsed = (moment - day_start) // self.interval
-        return day_start + elapsed * self.interval
+        local = self.local(instant)
+        minute_of_day = local.hour * 60 + local.minute
+        floored_minute = (minute_of_day // self.interval_minutes) * self.interval_minutes
+        floored_local = local.replace(
+            hour=floored_minute // 60,
+            minute=floored_minute % 60,
+            second=0,
+            microsecond=0,
+        )
+        return floored_local.astimezone(UTC)
 
     def ceil(self, instant: datetime) -> datetime:
         moment = self._utc(instant)

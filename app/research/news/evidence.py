@@ -14,6 +14,7 @@ from app.research.news.contracts import (
     EventFeatureSnapshot,
     EvidenceSpan,
     ExtractionQuarantine,
+    ExtractionTrace,
     MergedEvent,
     NewsDocument,
 )
@@ -47,6 +48,7 @@ class EvidenceLink:
     document_version_ids: tuple[str, ...]
     content_hashes: tuple[str, ...]
     source_names: tuple[str, ...]
+    extraction_traces: tuple[ExtractionTrace, ...] = ()
     quotes: tuple[tuple[str, str], ...] = ()
 
     @property
@@ -130,6 +132,9 @@ class ResearchPackage:
                     {
                         "conclusion": link.conclusion,
                         "event_id": link.event_id,
+                        "extraction_traces": [
+                            trace.model_dump(mode="json") for trace in link.extraction_traces
+                        ],
                         "quotes": [list(quote) for quote in link.quotes],
                         "window": link.window_label,
                     }
@@ -186,9 +191,23 @@ def _quotes_for(
 ) -> tuple[tuple[str, str], ...]:
     quotes: list[tuple[str, str]] = []
     for ref in _refs_by_authority(event):
-        for span in spans_by_version.get(ref.document_version_id, ()):
+        for span in _spans_for_event(event, ref.document_version_id, spans_by_version):
             quotes.append((span.field_name, span.quote))
     return tuple(dict.fromkeys(quotes))
+
+
+def _spans_for_event(
+    event: MergedEvent,
+    document_version_id: str,
+    spans_by_version: dict[str, tuple[EvidenceSpan, ...]],
+) -> tuple[EvidenceSpan, ...]:
+    """Keep sibling events in one document from borrowing each other's evidence."""
+
+    spans = spans_by_version.get(document_version_id, ())
+    if not event.source_event_ids:
+        return spans
+    source_ids = set(event.source_event_ids)
+    return tuple(span for span in spans if span.event_id is None or span.event_id in source_ids)
 
 
 def build_evidence_links(
@@ -229,6 +248,7 @@ def _link(
         document_version_ids=tuple(ref.document_version_id for ref in event.document_refs),
         content_hashes=tuple(ref.content_hash for ref in event.document_refs),
         source_names=tuple(dict.fromkeys(ref.source_name for ref in event.document_refs)),
+        extraction_traces=event.extraction_traces,
         quotes=_quotes_for(event, spans_by_version),
     )
 
@@ -240,15 +260,12 @@ def build_quality_report(
     duplicate_version_count: int,
     quarantined: Sequence[ExtractionQuarantine],
     view: EventView,
+    spans_by_version: dict[str, tuple[EvidenceSpan, ...]],
 ) -> DataQualityReport:
     reasons: dict[str, int] = {}
     for item in quarantined:
         reasons[item.reason_code] = reasons.get(item.reason_code, 0) + 1
-    full_evidence = sum(
-        1
-        for event in view.events
-        if event.document_refs and (event.effective_start_at is not None or event.relevance != "short_term")
-    )
+    full_evidence = sum(1 for event in view.events if _has_required_evidence(event, spans_by_version))
     after_the_fact = sum(
         1
         for event in view.events
@@ -264,6 +281,32 @@ def build_quality_report(
         events_with_full_evidence=full_evidence,
         after_the_fact_event_count=after_the_fact,
     )
+
+
+def _has_required_evidence(
+    event: MergedEvent,
+    spans_by_version: dict[str, tuple[EvidenceSpan, ...]],
+) -> bool:
+    """Whether every populated critical field has at least one source text span."""
+
+    required = {"event_type", "relevance", "direction"}
+    if event.affected_regions:
+        required.add("affected_regions")
+    if event.affected_assets:
+        required.add("affected_assets")
+    if event.capacity_mw is not None:
+        required.add("capacity_mw")
+    if event.effective_start_at is not None:
+        required.add("effective_start_at")
+    if event.effective_end_at is not None:
+        required.add("effective_end_at")
+
+    available = {
+        span.field_name
+        for ref in event.document_refs
+        for span in _spans_for_event(event, ref.document_version_id, spans_by_version)
+    }
+    return bool(event.document_refs) and required.issubset(available)
 
 
 _REPORT_QUOTE_FIELDS = ("event_type", "capacity_mw", "effective_start_at", "effective_end_at")
@@ -433,6 +476,12 @@ def _render_event_section(
             f"- 受影响量值：{capacity}｜事件语义预期：{DIRECTION_LABELS.get(event.direction, event.direction)}"
         )
     lines.append(f"- 来源：{'、'.join(head.source_names)}（{len(head.document_version_ids)} 个文档版本）")
+    for trace in head.extraction_traces:
+        lines.append(
+            "- 抽取方法："
+            f"{trace.model_name}｜Prompt {trace.prompt_version}｜Schema {trace.output_schema_version}｜"
+            f"输入 `{trace.input_hash}`｜输出 `{trace.output_hash}`"
+        )
 
     quotes = _report_quotes(head)
     if quotes:

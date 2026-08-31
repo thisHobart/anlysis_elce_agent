@@ -7,7 +7,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
-from typing import Literal
+from typing import Literal, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import ValidationError
@@ -28,6 +28,17 @@ from app.research.news.contracts import (
 
 EXTRACTOR_ID = "obvious-news-rule-baseline"
 EXTRACTOR_VERSION = "1.1.0"
+
+
+class NewsEventExtractor(Protocol):
+    """Provider-neutral boundary shared by deterministic and model extractors."""
+
+    extractor_id: str
+    extractor_version: str
+
+    def extract(self, document: NewsDocument) -> EventExtractionResult: ...
+
+    def extract_many(self, documents: tuple[NewsDocument, ...]) -> EventExtractionBatch: ...
 
 _ISO_INSTANT = r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})"
 _START_PATTERN = re.compile(rf"(?:事件开始|生效开始|事件发生时间)[:：]\s*(?P<value>{_ISO_INSTANT})")
@@ -363,7 +374,7 @@ class ObviousNewsEventExtractor:
                 time_resolution=times.resolution,
                 extractor_id=self.extractor_id,
                 extractor_version=self.extractor_version,
-                evidence=tuple(evidence),
+                evidence=tuple(span.model_copy(update={"event_id": event_id}) for span in evidence),
             )
         except ValidationError as exc:
             return self._quarantine(

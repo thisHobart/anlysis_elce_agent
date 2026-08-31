@@ -26,6 +26,11 @@ FEATURE_EVENT_TYPES: tuple[str, ...] = (
     "fuel_supply_change",
 )
 
+# A restoration is an event impulse, not a state that stays "active" forever. If its
+# source gives no end, it contributes to exactly the settlement interval in which it
+# occurs. Persistent event types retain their open-ended semantics until a later update.
+POINT_EVENT_TYPES = frozenset({"generation_restore"})
+
 
 class EventFeatureError(ValueError):
     """Raised when features cannot be built without violating the availability rule."""
@@ -34,13 +39,21 @@ class EventFeatureError(ValueError):
 def _is_active(event: MergedEvent, interval_start: datetime, interval_end: datetime) -> bool:
     """Active means the event is both already announced and currently in effect."""
 
-    if event.announcement_available_at > interval_start:
-        return False
     if event.effective_start_at is None:
+        return False
+    if event.event_type in POINT_EVENT_TYPES:
+        # A point event contributes once, at the first decision interval where it is both
+        # effective and knowable. This preserves a late-arriving restoration without
+        # leaking it into the interval that began before the bulletin arrived.
+        observable_at = max(event.effective_start_at, event.announcement_available_at)
+        duration = interval_end - interval_start
+        return observable_at <= interval_start < observable_at + duration
+    if event.announcement_available_at > interval_start:
         return False
     if event.effective_start_at >= interval_end:
         return False
-    return not (event.effective_end_at is not None and event.effective_end_at <= interval_start)
+    effective_end = event.effective_end_at
+    return not (effective_end is not None and effective_end <= interval_start)
 
 
 def build_event_features(

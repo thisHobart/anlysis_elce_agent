@@ -461,7 +461,7 @@ class EventPriceAnalyzer:
                 if metrics is None:
                     excluded.append((event.event_id, f"{window.label} 窗口内价格区间不足"))
                     continue
-                placebos = self._placebo_deviations(prices, baseline, window, anchor)
+                placebos = self._placebo_deviations(prices, baseline, window, anchor, occupied)
                 p_value, samples, sidedness = _permutation_p_value(
                     metrics.deviation,
                     controls,
@@ -543,6 +543,7 @@ class EventPriceAnalyzer:
         baseline: _Baseline,
         window: WindowSpec,
         anchor: datetime,
+        occupied: set[datetime],
     ) -> tuple[float, ...]:
         """The same window shifted whole weeks away, where no such event happened."""
 
@@ -550,6 +551,9 @@ class EventPriceAnalyzer:
         for offset in self.method.placebo_offset_days:
             shifted = prices.clock.floor(anchor + timedelta(days=offset))
             if prices.index_of(shifted) is None:
+                continue
+            limit = prices.clock.ceil(shifted + window.duration)
+            if any(step in occupied for step in _iterate(shifted, limit, prices.clock.interval)):
                 continue
             metrics = _window_metrics(prices, baseline, window, shifted)
             if metrics is not None:
@@ -561,13 +565,30 @@ def _event_hash(events: Sequence[MergedEvent]) -> str:
     rows = sorted(
         (
             {
+                "affected_assets": event.affected_assets,
+                "affected_regions": event.affected_regions,
                 "announcement_available_at": event.announcement_available_at.isoformat(),
+                "capacity_mw": event.capacity_mw,
                 "direction": event.direction,
+                "effective_end_at": (
+                    event.effective_end_at.isoformat() if event.effective_end_at else None
+                ),
                 "effective_start_at": (
                     event.effective_start_at.isoformat() if event.effective_start_at else None
                 ),
                 "event_id": event.event_id,
                 "event_type": event.event_type,
+                "extraction_traces": [
+                    trace.model_dump(mode="json") for trace in event.extraction_traces
+                ],
+                "magnitude": (
+                    event.magnitude.model_dump(mode="json") if event.magnitude is not None else None
+                ),
+                "physical_effect": event.physical_effect,
+                "relevance": event.relevance,
+                "source_content_hashes": [ref.content_hash for ref in event.document_refs],
+                "source_event_ids": event.source_event_ids,
+                "status": event.status,
             }
             for event in events
         ),

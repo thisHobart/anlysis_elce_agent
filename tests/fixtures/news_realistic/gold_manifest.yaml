@@ -1,0 +1,121 @@
+corpus_version: "1.0.0"
+retrieved_at: "2026-08-31T09:10:00+08:00"
+purpose: >-
+  测试真实来源常见措辞、单位、时间粒度、语言和多事件结构；不用于价格效应估计。
+
+qualification_thresholds:
+  extractable_event_recall: 0.80
+  quarantine_recall: 0.80
+  irrelevant_accuracy: 0.95
+  maximum_unknown_rate: 0.20
+
+records:
+  - corpus_id: R01
+    market_timezone: Asia/Shanghai
+    expected_disposition: quarantine
+    expected_event_types: [generation_outage]
+    expected_relevance: short_term
+    expected_regions: [江苏]
+    expected_assets: [国信沙洲电厂1号机组]
+    expected_capacity_mw: null
+    expected_start_at: null
+    gold_reason: 事件真实但原文只有日期，没有可无歧义对齐到市场结算格的时刻。
+
+  - corpus_id: R02
+    market_timezone: Asia/Shanghai
+    expected_disposition: quarantine
+    expected_event_types: [transmission_constraint, generation_restore]
+    expected_relevance: short_term
+    expected_regions: [广东]
+    expected_assets: [太平岭核电厂1号机组, 太平岭核电厂2号机组]
+    expected_capacity_mw: null
+    expected_start_at: null
+    gold_reason: 标题与摘录共同包含线路故障和恢复并网两个事件，且只有日期。
+
+  - corpus_id: R03
+    market_timezone: Asia/Shanghai
+    expected_disposition: quarantine
+    expected_event_types: [demand_shock]
+    expected_relevance: short_term
+    expected_regions: [全国]
+    expected_assets: [全国用电负荷]
+    expected_capacity_mw: 150000.0
+    expected_start_at: null
+    gold_reason: 上涨量可换算为15万MW，但事件仅精确到日期且属于事后统计。
+
+  - corpus_id: R04
+    market_timezone: Asia/Shanghai
+    expected_disposition: quarantine
+    expected_event_types: [renewable_supply_change]
+    expected_relevance: short_term
+    expected_regions: [华东]
+    expected_assets: [华东新能源]
+    expected_capacity_mw: null
+    expected_start_at: null
+    gold_reason: 1.71亿千瓦是出力水平而非变化量，且没有精确发生时刻。
+
+  - corpus_id: R05
+    market_timezone: Europe/London
+    expected_disposition: event
+    expected_event_types: [policy_long_horizon]
+    expected_relevance: long_horizon
+    expected_regions: [Great Britain]
+    expected_assets: []
+    expected_capacity_mw: null
+    expected_start_at: null
+    gold_reason: 明确说明多座AGR在本十年结束运行，长期事件无需短期结算时刻。
+
+  - corpus_id: R06
+    market_timezone: Australia/Brisbane
+    expected_disposition: event
+    expected_event_types: [generation_outage]
+    expected_relevance: short_term
+    expected_regions: [QLD]
+    expected_assets: [Millmerran Power Station Unit 1, Millmerran Power Station Unit 2]
+    expected_capacity_mw: 870.0
+    expected_start_at: "2013-12-22T22:56:00Z"
+    gold_reason: 标题给出日期，正文给出时刻、双机跳闸和损失出力，来源市场时区明确。
+
+  - corpus_id: R07
+    market_timezone: Europe/London
+    expected_disposition: quarantine
+    expected_event_types: [renewable_supply_change, fuel_supply_change, demand_shock, transmission_constraint]
+    expected_relevance: short_term
+    expected_regions: [Great Britain]
+    expected_assets: []
+    expected_capacity_mw: null
+    expected_start_at: null
+    gold_reason: 同一句含低风、燃气可用性、高需求、联络线潮流和网络约束，不能压成一个事件。
+
+  - corpus_id: R08
+    market_timezone: America/Chicago
+    expected_disposition: quarantine
+    expected_event_types: [demand_shock]
+    expected_relevance: short_term
+    expected_regions: [Texas]
+    expected_assets: [ERCOT system load]
+    expected_capacity_mw: null
+    expected_start_at: null
+    gold_reason: 85464MW是需求水平而非变化量，报道只给日期且数值在最终结算前可能修订。
+
+  - corpus_id: R09
+    market_timezone: Asia/Shanghai
+    expected_disposition: quarantine
+    expected_event_types: [generation_restore]
+    expected_relevance: short_term
+    expected_regions: [广西]
+    expected_assets: [光坡核电厂1号机组]
+    expected_capacity_mw: null
+    expected_start_at: null
+    gold_reason: 恢复并网含义明确，但“本轮高温前”不是可对齐的事件时刻。
+
+  - corpus_id: R10
+    market_timezone: Asia/Shanghai
+    expected_disposition: irrelevant
+    expected_event_types: [irrelevant, unknown]
+    expected_relevance: irrelevant
+    expected_regions: []
+    expected_assets: []
+    expected_capacity_mw: null
+    expected_start_at: null
+    gold_reason: 电力企业社区服务报道，不是电力系统运行事件。

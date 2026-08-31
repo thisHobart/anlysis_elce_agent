@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import itertools
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -39,13 +41,31 @@ class PriceObservations:
             raise PriceSeriesError("价格与时间戳长度必须一致")
         if not self.timestamps:
             raise PriceSeriesError("价格序列不能为空")
-        if list(self.timestamps) != sorted(self.timestamps):
+        normalized: list[datetime] = []
+        for moment in self.timestamps:
+            if moment.tzinfo is None or moment.utcoffset() is None:
+                raise PriceSeriesError("价格时间戳必须带时区")
+            normalized.append(moment.astimezone(UTC))
+        normalized_timestamps = tuple(normalized)
+        object.__setattr__(self, "timestamps", normalized_timestamps)
+
+        if list(normalized_timestamps) != sorted(normalized_timestamps):
             raise PriceSeriesError("价格时间戳必须递增")
-        if len(set(self.timestamps)) != len(self.timestamps):
+        if len(set(normalized_timestamps)) != len(normalized_timestamps):
             raise PriceSeriesError("价格时间戳不能重复")
-        for moment in (self.timestamps[0], self.timestamps[-1]):
+        for moment in normalized_timestamps:
             if self.clock.floor(moment) != moment:
                 raise PriceSeriesError("价格时间戳必须落在结算网格上")
+        for previous, current in itertools.pairwise(normalized_timestamps):
+            if current - previous != self.clock.interval:
+                raise PriceSeriesError("价格时间戳必须按结算间隔连续，不能存在缺口")
+        for value in self.prices:
+            try:
+                finite = math.isfinite(value)
+            except TypeError as exc:
+                raise PriceSeriesError("价格必须是有限数值") from exc
+            if not finite:
+                raise PriceSeriesError("价格必须是有限数值，不能包含 NaN 或 Inf")
 
     @property
     def start_at(self) -> datetime:

@@ -20,13 +20,53 @@ NewsEventType = Literal[
     "unknown",
 ]
 EventDirection = Literal["up", "down", "mixed", "unknown"]
+EventStatus = Literal[
+    "occurred",
+    "restored",
+    "planned",
+    "forecast",
+    "corrected",
+    "cancelled",
+    "unknown",
+]
+PhysicalEffect = Literal[
+    "supply_up",
+    "supply_down",
+    "demand_up",
+    "demand_down",
+    "transfer_up",
+    "transfer_down",
+    "mixed",
+    "unknown",
+]
+EventTimePrecision = Literal["instant", "hour", "day", "month", "range", "vague", "unknown"]
+QuantityUnit = Literal["kW", "MW", "GW", "万千瓦", "亿千瓦"]
+QuantitySemantic = Literal[
+    "capacity_level",
+    "capacity_change",
+    "generation_loss",
+    "generation_restore",
+    "demand_level",
+    "demand_change",
+    "output_level",
+    "supply_change",
+    "transfer_change",
+    "unknown",
+]
+QuantityDirection = Literal["increase", "decrease", "mixed", "unknown"]
 QuarantineReason = Literal[
     "ambiguous_multi_event",
     "ambiguous_event_time",
+    "ambiguous_quantity",
+    "invalid_evidence",
+    "market_mismatch",
     "missing_effective_start",
+    "model_response_invalid",
+    "model_unavailable",
+    "uncertain_extraction",
     "event_contract_violation",
 ]
-TimeBasis = Literal["stated_absolute", "derived_from_publication"]
+TimeBasis = Literal["stated_absolute", "stated_components", "derived_from_publication"]
 ReviewStatus = Literal["unreviewed", "accepted", "corrected", "rejected"]
 
 
@@ -130,6 +170,7 @@ class EvidenceSpan(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     field_name: str = Field(min_length=1, max_length=64)
+    event_id: str | None = Field(default=None, pattern=r"^evt_[a-f0-9]{24}$")
     document_version_id: str = Field(pattern=r"^newsv_[a-f0-9]{24}$")
     text_field: Literal["title", "body"]
     start_char: int = Field(ge=0)
@@ -151,8 +192,10 @@ class TimeResolution(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     basis: TimeBasis
+    precision: EventTimePrecision = "instant"
     anchor_at: datetime | None = None
     market_timezone: str | None = None
+    stated_text: str | None = Field(default=None, min_length=1, max_length=512)
 
     @field_validator("anchor_at")
     @classmethod
@@ -169,9 +212,39 @@ class TimeResolution(BaseModel):
         if self.basis == "derived_from_publication":
             if self.anchor_at is None or self.market_timezone is None:
                 raise ValueError("a derived time must record its publication anchor and market timezone")
+        elif self.basis == "stated_components":
+            if self.market_timezone is None or self.stated_text is None:
+                raise ValueError("stated time components must record their text and market timezone")
+            if self.anchor_at is not None:
+                raise ValueError("stated time components must not claim a publication anchor")
         elif self.anchor_at is not None or self.market_timezone is not None:
             raise ValueError("a stated absolute time must not claim a derivation anchor")
         return self
+
+
+class EventMagnitude(BaseModel):
+    """A source quantity whose raw wording and analytical meaning remain distinguishable."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    raw_value: float = Field(gt=0)
+    raw_unit: QuantityUnit
+    semantic: QuantitySemantic
+    direction: QuantityDirection = "unknown"
+    normalized_mw: float = Field(gt=0)
+    raw_text: str = Field(min_length=1, max_length=256)
+
+
+class ExtractionTrace(BaseModel):
+    """Version and hashes needed to reproduce one model-assisted extraction."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    model_name: str = Field(min_length=1, max_length=256)
+    prompt_version: str = Field(min_length=1, max_length=32)
+    output_schema_version: str = Field(min_length=1, max_length=32)
+    input_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+    output_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
 class EventRecord(BaseModel):
@@ -187,13 +260,17 @@ class EventRecord(BaseModel):
     affected_regions: tuple[str, ...] = ()
     affected_assets: tuple[str, ...] = ()
     capacity_mw: float | None = Field(default=None, gt=0)
+    magnitude: EventMagnitude | None = None
     announcement_available_at: datetime
     effective_start_at: datetime | None = None
     effective_end_at: datetime | None = None
     direction: EventDirection = "unknown"
+    status: EventStatus = "unknown"
+    physical_effect: PhysicalEffect = "unknown"
     time_resolution: TimeResolution | None = None
     extractor_id: str = Field(min_length=1, max_length=128)
     extractor_version: str = Field(min_length=1, max_length=32)
+    extraction_trace: ExtractionTrace | None = None
     evidence: tuple[EvidenceSpan, ...] = ()
 
     @field_validator("announcement_available_at", "effective_start_at", "effective_end_at")
@@ -222,6 +299,20 @@ class EventRecord(BaseModel):
             raise ValueError("irrelevant event_type requires irrelevant relevance")
         if self.effective_start_at is not None and self.time_resolution is None:
             raise ValueError("an event time requires a declared time resolution")
+        if self.magnitude is not None:
+            change_semantics = {
+                "capacity_change",
+                "generation_loss",
+                "generation_restore",
+                "demand_change",
+                "supply_change",
+                "transfer_change",
+            }
+            if self.magnitude.semantic in change_semantics:
+                if self.capacity_mw != self.magnitude.normalized_mw:
+                    raise ValueError("change magnitude must equal the backward-compatible capacity_mw")
+            elif self.capacity_mw is not None:
+                raise ValueError("level or unknown quantities must not populate capacity_mw")
         return self
 
 
@@ -308,10 +399,15 @@ class MergedEvent(BaseModel):
     affected_regions: tuple[str, ...] = ()
     affected_assets: tuple[str, ...] = ()
     capacity_mw: float | None = Field(default=None, gt=0)
+    magnitude: EventMagnitude | None = None
     announcement_available_at: datetime
     effective_start_at: datetime | None = None
     effective_end_at: datetime | None = None
     direction: EventDirection = "unknown"
+    status: EventStatus = "unknown"
+    physical_effect: PhysicalEffect = "unknown"
+    extraction_traces: tuple[ExtractionTrace, ...] = ()
+    source_event_ids: tuple[str, ...] = ()
     document_refs: tuple[DocumentRef, ...] = Field(min_length=1)
     revision_count: int = Field(ge=1)
     review_status: ReviewStatus = "unreviewed"

@@ -8,19 +8,29 @@ from datetime import datetime
 from app.research.news.adapters import CollectedNewsAdapter
 from app.research.news.analysis import AnalysisMethod, AnalysisResult, EventPriceAnalyzer
 from app.research.news.clock import MarketClock, TimeAxis, lead_time_table
-from app.research.news.contracts import EventFeatureSnapshot, EvidenceSpan, NewsDocument
+from app.research.news.contracts import (
+    EventExtractionResult,
+    EventFeatureSnapshot,
+    EvidenceSpan,
+    NewsDocument,
+)
 from app.research.news.evidence import (
     PACKAGE_VERSION,
     ResearchPackage,
     build_evidence_links,
     build_quality_report,
 )
-from app.research.news.extraction import ObviousNewsEventExtractor
+from app.research.news.extraction import NewsEventExtractor, ObviousNewsEventExtractor
 from app.research.news.features import build_event_features
 from app.research.news.merging import AsOfEventAssembler, EventView
 from app.research.news.normalization import NewsNormalizer
 from app.research.news.prices import PriceObservations
+from app.research.news.quality import ResultQualityAssessment, evaluate_result_quality
 from app.research.news.versioning import NewsVersionStore
+
+
+class NewsPipelineError(ValueError):
+    """Raised when inputs disagree on a boundary that would make results misleading."""
 
 
 @dataclass(frozen=True)
@@ -35,6 +45,7 @@ class NewsPriceStudy:
     analysis: AnalysisResult
     features: EventFeatureSnapshot
     package: ResearchPackage
+    result_quality: ResultQualityAssessment
 
     @property
     def lead_times(self):
@@ -43,15 +54,21 @@ class NewsPriceStudy:
 
 def collect_evidence_spans(
     documents: tuple[NewsDocument, ...],
-    extractor: ObviousNewsEventExtractor,
+    extractor: NewsEventExtractor | None = None,
+    *,
+    extraction_results: tuple[EventExtractionResult, ...] | None = None,
 ) -> dict[str, tuple[EvidenceSpan, ...]]:
-    """Map each document version to the exact text spans its event fields rest on."""
+    """Map exact field evidence without invoking a model twice in one study."""
 
     spans: dict[str, tuple[EvidenceSpan, ...]] = {}
-    for document in documents:
-        result = extractor.extract(document)
-        for event in result.events:
-            spans[document.document_version_id] = event.evidence
+    if extraction_results is None:
+        if extractor is None:
+            raise ValueError("extractor is required when extraction_results are not provided")
+        extraction_results = tuple(extractor.extract(document) for document in documents)
+    for result in extraction_results:
+        spans[result.document_version_id] = tuple(
+            span for event in result.events for span in event.evidence
+        )
     return spans
 
 
@@ -63,7 +80,7 @@ def run_news_price_study(
     clock: MarketClock | None = None,
     axis: TimeAxis = "effective",
     method: AnalysisMethod | None = None,
-    extractor: ObviousNewsEventExtractor | None = None,
+    extractor: NewsEventExtractor | None = None,
     include_irrelevant: bool = False,
 ) -> NewsPriceStudy:
     """Collected news in, evidence package out, with every gate applied in order.
@@ -75,9 +92,34 @@ def run_news_price_study(
     """
 
     market_clock = clock or prices.clock
+    if market_clock != prices.clock:
+        raise NewsPipelineError(
+            "研究时钟必须与价格时钟完全一致："
+            f"研究={market_clock.market}/{market_clock.timezone}/{market_clock.interval_minutes}m，"
+            f"价格={prices.clock.market}/{prices.clock.timezone}/{prices.clock.interval_minutes}m"
+        )
     extractor = extractor or ObviousNewsEventExtractor(market_timezone=market_clock.timezone)
+    extractor_timezone = getattr(extractor, "market_timezone", market_clock.timezone)
+    if extractor_timezone != market_clock.timezone:
+        raise NewsPipelineError(
+            "新闻抽取器时区必须与市场时钟一致："
+            f"抽取器={extractor_timezone}，市场={market_clock.timezone}"
+        )
 
     documents = NewsNormalizer().normalize_many(adapter.load())
+    missing_market = [document.source_document_id for document in documents if not document.market_tags]
+    wrong_market = [
+        document.source_document_id
+        for document in documents
+        if document.market_tags and market_clock.market not in document.market_tags
+    ]
+    if missing_market or wrong_market:
+        details: list[str] = []
+        if missing_market:
+            details.append(f"缺少市场标签：{', '.join(missing_market)}")
+        if wrong_market:
+            details.append(f"不属于 {market_clock.market}：{', '.join(wrong_market)}")
+        raise NewsPipelineError("新闻市场与价格市场不一致；" + "；".join(details))
     store = NewsVersionStore(documents)
     assembler = AsOfEventAssembler(store, extractor=extractor)
     view = assembler.view_at(as_of)
@@ -101,14 +143,19 @@ def run_news_price_study(
         as_of=as_of,
     )
 
+    spans_by_version = collect_evidence_spans(
+        documents,
+        extraction_results=view.extraction_results,
+    )
     quality = build_quality_report(
         documents=documents,
         version_count=store.version_count,
         duplicate_version_count=store.duplicates.duplicate_count,
         quarantined=view.quarantined,
         view=view,
+        spans_by_version=spans_by_version,
     )
-    links = build_evidence_links(analysis, view.events, collect_evidence_spans(documents, extractor))
+    links = build_evidence_links(analysis, view.events, spans_by_version)
 
     package = ResearchPackage(
         package_version=PACKAGE_VERSION,
@@ -122,6 +169,7 @@ def run_news_price_study(
         events_not_analyzed=not_analyzed,
         quarantined=view.quarantined,
     )
+    result_quality = evaluate_result_quality(package=package, documents=documents, prices=prices)
     return NewsPriceStudy(
         as_of=as_of,
         clock=market_clock,
@@ -131,4 +179,5 @@ def run_news_price_study(
         analysis=analysis,
         features=features,
         package=package,
+        result_quality=result_quality,
     )

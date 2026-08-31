@@ -7,12 +7,13 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from app.research.news.contracts import (
+    EventExtractionResult,
     EventRecord,
     ExtractionQuarantine,
     MergedEvent,
     NewsDocument,
 )
-from app.research.news.extraction import ObviousNewsEventExtractor
+from app.research.news.extraction import NewsEventExtractor, ObviousNewsEventExtractor
 from app.research.news.versioning import NewsVersionStore, document_ref
 
 MERGER_VERSION = "1.0.0"
@@ -25,6 +26,7 @@ class EventView:
     as_of: datetime
     events: tuple[MergedEvent, ...] = ()
     quarantined: tuple[ExtractionQuarantine, ...] = ()
+    extraction_results: tuple[EventExtractionResult, ...] = ()
     visible_document_count: int = 0
 
     def by_id(self, event_id: str) -> MergedEvent | None:
@@ -55,17 +57,57 @@ def merge_event_records(
     else.
     """
 
-    grouped: dict[str, list[tuple[EventRecord, NewsDocument]]] = {}
+    candidates: list[tuple[EventRecord, NewsDocument]] = []
     for record, document in records:
         if record.document_version_id != document.document_version_id:
             raise ValueError("event record and document version must match")
         if document.available_at > as_of:
             continue
-        grouped.setdefault(record.event_id, []).append((record, document))
+        candidates.append((record, document))
+
+    # Event fields such as effective_start_at are correctable and therefore cannot be the
+    # only grouping key. Connect records either by their extracted identity (reposts) or by
+    # source document lineage plus event type (revisions of one source document). The
+    # earliest member's event_id remains the canonical ID so an as_of replay is stable.
+    parent = list(range(len(candidates)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    by_event_id: dict[str, int] = {}
+    by_lineage: dict[tuple[str, str, tuple[str, ...], tuple[str, ...]], int] = {}
+    for index, (record, document) in enumerate(candidates):
+        event_owner = by_event_id.setdefault(record.event_id, index)
+        lineage_key = (
+            document.document_id,
+            record.event_type,
+            record.affected_assets,
+            record.affected_regions,
+        )
+        lineage_owner = by_lineage.setdefault(lineage_key, index)
+        union(index, event_owner)
+        # One article may legitimately contain two events of the same type. The lineage
+        # fallback exists for corrections across versions, not to collapse sibling events
+        # produced from the same document version.
+        if candidates[lineage_owner][1].document_version_id != document.document_version_id:
+            union(index, lineage_owner)
+
+    grouped: dict[int, list[tuple[EventRecord, NewsDocument]]] = {}
+    for index, candidate in enumerate(candidates):
+        grouped.setdefault(find(index), []).append(candidate)
 
     merged: list[MergedEvent] = []
-    for event_id, members in grouped.items():
+    for members in grouped.values():
         ordered = sorted(members, key=lambda item: (item[1].available_at, item[1].version))
+        event_id = ordered[0][0].event_id
         earliest_document = ordered[0][1]
         primary_lineage = earliest_document.document_id
         lineage_members = [item for item in ordered if item[1].document_id == primary_lineage]
@@ -88,6 +130,11 @@ def merge_event_records(
                 key=lambda ref: (ref.available_at, ref.document_version_id),
             )
         )
+        trace_list = []
+        for record, _ in ordered:
+            if record.extraction_trace is not None and record.extraction_trace not in trace_list:
+                trace_list.append(record.extraction_trace)
+        extraction_traces = tuple(trace_list)
         effective_start_at = stated("effective_start_at")
         merged.append(
             MergedEvent(
@@ -99,10 +146,15 @@ def merge_event_records(
                 affected_regions=stated("affected_regions"),
                 affected_assets=stated("affected_assets"),
                 capacity_mw=stated("capacity_mw"),
+                magnitude=stated("magnitude"),
                 announcement_available_at=earliest_document.available_at,
                 effective_start_at=effective_start_at,
                 effective_end_at=stated("effective_end_at") if effective_start_at is not None else None,
                 direction=primary_record.direction,
+                status=primary_record.status,
+                physical_effect=primary_record.physical_effect,
+                extraction_traces=extraction_traces,
+                source_event_ids=tuple(dict.fromkeys(record.event_id for record, _ in ordered)),
                 document_refs=refs,
                 revision_count=len(refs),
             )
@@ -119,7 +171,7 @@ class AsOfEventAssembler:
         self,
         store: NewsVersionStore,
         *,
-        extractor: ObviousNewsEventExtractor | None = None,
+        extractor: NewsEventExtractor | None = None,
     ) -> None:
         self._store = store
         self._extractor = extractor or ObviousNewsEventExtractor()
@@ -128,8 +180,10 @@ class AsOfEventAssembler:
         history = self._store.history_at(as_of)
         pairs: list[tuple[EventRecord, NewsDocument]] = []
         quarantined: list[ExtractionQuarantine] = []
+        extraction_results: list[EventExtractionResult] = []
         for document in history:
             result = self._extractor.extract(document)
+            extraction_results.append(result)
             if result.quarantine is not None:
                 quarantined.append(result.quarantine)
                 continue
@@ -138,6 +192,7 @@ class AsOfEventAssembler:
             as_of=as_of,
             events=merge_event_records(pairs, as_of=as_of),
             quarantined=tuple(quarantined),
+            extraction_results=tuple(extraction_results),
             visible_document_count=len(self._store.visible_at(as_of)),
         )
 
