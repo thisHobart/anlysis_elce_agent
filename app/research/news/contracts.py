@@ -72,6 +72,14 @@ QuarantineReason = Literal[
 ]
 TimeBasis = Literal["stated_absolute", "stated_components", "derived_from_publication"]
 ReviewStatus = Literal["unreviewed", "accepted", "corrected", "rejected"]
+RevisionFieldName = Literal[
+    "affected_regions",
+    "affected_assets",
+    "capacity_mw",
+    "magnitude",
+    "effective_start_at",
+    "effective_end_at",
+]
 
 
 def _require_aware(value: datetime, *, field_name: str) -> datetime:
@@ -128,7 +136,7 @@ class NewsDocument(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     schema_version: Literal["1.0.0"] = "1.0.0"
-    normalizer_version: Literal["1.0.0"] = "1.0.0"
+    normalizer_version: Literal["1.1.0"] = "1.1.0"
     document_id: str = Field(pattern=r"^news_[a-f0-9]{24}$")
     document_version_id: str = Field(pattern=r"^newsv_[a-f0-9]{24}$")
     source_name: str = Field(min_length=1, max_length=128)
@@ -276,6 +284,9 @@ class EventRecord(BaseModel):
     extractor_version: str = Field(min_length=1, max_length=32)
     extraction_trace: ExtractionTrace | None = None
     evidence: tuple[EvidenceSpan, ...] = ()
+    # A missing field means "this version did not restate it".  A cleared field means the
+    # source explicitly withdrew the previous value, so revision merging must not resurrect it.
+    cleared_fields: tuple[RevisionFieldName, ...] = ()
 
     @field_validator("announcement_available_at", "effective_start_at", "effective_end_at")
     @classmethod
@@ -289,6 +300,12 @@ class EventRecord(BaseModel):
 
     @model_validator(mode="after")
     def validate_event_semantics(self) -> EventRecord:
+        if len(self.cleared_fields) != len(set(self.cleared_fields)):
+            raise ValueError("cleared_fields must not contain duplicates")
+        for field_name in self.cleared_fields:
+            value = getattr(self, field_name)
+            if value not in (None, ()):
+                raise ValueError(f"a cleared field must be empty: {field_name}")
         if self.effective_end_at is not None and self.effective_start_at is None:
             raise ValueError("effective_end_at requires effective_start_at")
         if (
@@ -351,13 +368,23 @@ class EventExtractionResult(BaseModel):
     document_version_id: str = Field(pattern=r"^newsv_[a-f0-9]{24}$")
     events: tuple[EventRecord, ...] = ()
     quarantine: ExtractionQuarantine | None = None
+    # Candidate-level failures let a multi-event article keep its usable events.  `quarantine`
+    # remains the document-level outcome used when no event can safely be retained.
+    candidate_quarantines: tuple[ExtractionQuarantine, ...] = ()
 
     @model_validator(mode="after")
     def validate_outcome_is_exclusive(self) -> EventExtractionResult:
-        if bool(self.events) == (self.quarantine is not None):
+        if not self.events and self.quarantine is None:
+            raise ValueError("an extraction result must carry either events or one quarantine reason")
+        if self.events and self.quarantine is not None:
             raise ValueError("an extraction result must carry either events or one quarantine reason")
         if self.quarantine is not None and self.quarantine.document_version_id != self.document_version_id:
             raise ValueError("quarantine must reference the same document version")
+        if any(
+            item.document_version_id != self.document_version_id
+            for item in self.candidate_quarantines
+        ):
+            raise ValueError("candidate quarantines must reference the same document version")
         if any(event.document_version_id != self.document_version_id for event in self.events):
             raise ValueError("events must reference the same document version")
         return self
@@ -376,7 +403,14 @@ class EventExtractionBatch(BaseModel):
 
     @property
     def quarantined(self) -> tuple[ExtractionQuarantine, ...]:
-        return tuple(result.quarantine for result in self.results if result.quarantine is not None)
+        return tuple(
+            item
+            for result in self.results
+            for item in (
+                *((result.quarantine,) if result.quarantine is not None else ()),
+                *result.candidate_quarantines,
+            )
+        )
 
 
 class DocumentRef(BaseModel):
@@ -388,6 +422,7 @@ class DocumentRef(BaseModel):
     document_version_id: str = Field(pattern=r"^newsv_[a-f0-9]{24}$")
     version: int = Field(ge=1)
     source_name: str = Field(min_length=1, max_length=128)
+    source_tier: str = Field(default="unknown", min_length=1, max_length=128)
     content_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
     available_at: datetime
 
@@ -398,6 +433,54 @@ class DocumentRef(BaseModel):
         if aware.utcoffset().total_seconds() != 0:
             raise ValueError(f"{info.field_name} must be normalized to UTC")
         return aware
+
+
+class EventStateRevision(BaseModel):
+    """One event state as it became knowable, used to build point-in-time features."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    available_at: datetime
+    relevance: NewsRelevance
+    event_type: NewsEventType
+    affected_regions: tuple[str, ...] = ()
+    affected_assets: tuple[str, ...] = ()
+    capacity_mw: float | None = Field(default=None, gt=0)
+    effective_start_at: datetime | None = None
+    effective_end_at: datetime | None = None
+    direction: EventDirection = "unknown"
+    status: EventStatus = "unknown"
+    physical_effect: PhysicalEffect = "unknown"
+
+    @property
+    def region_keys(self) -> tuple[str, ...]:
+        return split_entity_keys(self.affected_regions, self.affected_assets)[0]
+
+    @property
+    def asset_keys(self) -> tuple[str, ...]:
+        return split_entity_keys(self.affected_regions, self.affected_assets)[1]
+
+    @field_validator("available_at", "effective_start_at", "effective_end_at")
+    @classmethod
+    def validate_revision_time(cls, value: datetime | None, info) -> datetime | None:
+        if value is None:
+            return None
+        aware = _require_aware(value, field_name=info.field_name)
+        if aware.utcoffset().total_seconds() != 0:
+            raise ValueError(f"{info.field_name} must be normalized to UTC")
+        return aware
+
+    @model_validator(mode="after")
+    def validate_revision_range(self) -> EventStateRevision:
+        if self.effective_end_at is not None and self.effective_start_at is None:
+            raise ValueError("state effective_end_at requires effective_start_at")
+        if (
+            self.effective_start_at is not None
+            and self.effective_end_at is not None
+            and self.effective_end_at < self.effective_start_at
+        ):
+            raise ValueError("state effective_end_at must not be before effective_start_at")
+        return self
 
 
 class MergedEvent(BaseModel):
@@ -426,6 +509,7 @@ class MergedEvent(BaseModel):
     document_refs: tuple[DocumentRef, ...] = Field(min_length=1)
     revision_count: int = Field(ge=1)
     review_status: ReviewStatus = "unreviewed"
+    state_history: tuple[EventStateRevision, ...] = ()
 
     @field_validator("as_of", "announcement_available_at", "effective_start_at", "effective_end_at")
     @classmethod
@@ -447,6 +531,14 @@ class MergedEvent(BaseModel):
 
     @model_validator(mode="after")
     def validate_merge_is_leak_free(self) -> MergedEvent:
+        if self.effective_end_at is not None and self.effective_start_at is None:
+            raise ValueError("merged effective_end_at requires effective_start_at")
+        if (
+            self.effective_start_at is not None
+            and self.effective_end_at is not None
+            and self.effective_end_at < self.effective_start_at
+        ):
+            raise ValueError("merged effective_end_at must not be before effective_start_at")
         if self.announcement_available_at > self.as_of:
             raise ValueError("a merged event cannot be announced after the as_of it belongs to")
         if any(ref.available_at > self.as_of for ref in self.document_refs):
@@ -456,6 +548,12 @@ class MergedEvent(BaseModel):
             raise ValueError("announcement_available_at must equal the earliest contributing document")
         if self.revision_count != len(self.document_refs):
             raise ValueError("revision_count must match the number of contributing document versions")
+        if self.state_history:
+            instants = [revision.available_at for revision in self.state_history]
+            if instants != sorted(instants) or len(instants) != len(set(instants)):
+                raise ValueError("state_history must contain unique revisions in availability order")
+            if instants[0] != self.announcement_available_at or instants[-1] > self.as_of:
+                raise ValueError("state_history must start at announcement and end no later than as_of")
         return self
 
     @property
@@ -492,8 +590,8 @@ class EventFeatureRow(BaseModel):
     def validate_counts(self) -> EventFeatureRow:
         if self.active_event_count != len(self.source_event_ids):
             raise ValueError("active_event_count must match the listed source events")
-        if self.active_event_count == 0 and self.active_capacity_mw is not None:
-            raise ValueError("an interval with no active event cannot carry a capacity value")
+        if self.active_event_count == 0 and self.active_capacity_mw != 0:
+            raise ValueError("an interval with no active event has a known zero capacity impact")
         return self
 
 
@@ -527,5 +625,7 @@ class EventFeatureSnapshot(BaseModel):
             raise ValueError("feature rows must be ordered by interval_start")
         if len(set(starts)) != len(starts):
             raise ValueError("feature rows must not repeat an interval_start")
+        if any(start > self.as_of for start in starts):
+            raise ValueError("feature rows must not extend beyond as_of")
         return self
 

@@ -60,19 +60,23 @@ def test_pipeline_rejects_a_clock_that_disagrees_with_the_price_clock(prices: Pr
         )
 
 
-def test_pipeline_rejects_news_from_a_different_market(prices: PriceObservations) -> None:
+def test_pipeline_routes_news_from_a_different_market_to_quarantine(prices: PriceObservations) -> None:
     other_market_prices = PriceObservations(
         clock=MarketClock(market="OTHER_MARKET", timezone="UTC", interval_minutes=30),
         timestamps=prices.timestamps,
         prices=prices.prices,
     )
 
-    with pytest.raises(ValueError, match="market|市场"):
-        run_news_price_study(
-            adapter=JsonlCollectedNewsAdapter(NEWS),
-            prices=other_market_prices,
-            as_of=FINAL_AS_OF,
-        )
+    result = run_news_price_study(
+        adapter=JsonlCollectedNewsAdapter(NEWS),
+        prices=other_market_prices,
+        as_of=FINAL_AS_OF,
+    )
+
+    assert result.view.events == ()
+    assert result.view.quarantined
+    assert {item.reason_code for item in result.view.quarantined} == {"market_mismatch"}
+    assert not result.result_quality.passed
 
 
 def test_restoration_without_an_end_does_not_remain_active_to_the_end_of_the_dataset(study) -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 from app.research.news.adapters import CollectedNewsAdapter
@@ -12,6 +12,7 @@ from app.research.news.contracts import (
     EventExtractionResult,
     EventFeatureSnapshot,
     EvidenceSpan,
+    ExtractionQuarantine,
     NewsDocument,
 )
 from app.research.news.evidence import (
@@ -107,31 +108,57 @@ def run_news_price_study(
         )
 
     documents = NewsNormalizer().normalize_many(adapter.load())
-    missing_market = [document.source_document_id for document in documents if not document.market_tags]
-    wrong_market = [
-        document.source_document_id
-        for document in documents
-        if document.market_tags and market_clock.market not in document.market_tags
-    ]
-    if missing_market or wrong_market:
-        details: list[str] = []
-        if missing_market:
-            details.append(f"缺少市场标签：{', '.join(missing_market)}")
-        if wrong_market:
-            details.append(f"不属于 {market_clock.market}：{', '.join(wrong_market)}")
-        raise NewsPipelineError("新闻市场与价格市场不一致；" + "；".join(details))
     store = NewsVersionStore(documents)
-    assembler = AsOfEventAssembler(store, extractor=extractor)
+    matched_documents = tuple(
+        document
+        for document in documents
+        if document.market_tags and market_clock.market in document.market_tags
+    )
+    extraction_store = NewsVersionStore(matched_documents)
+    routed_out = tuple(
+        ExtractionQuarantine(
+            document_version_id=document.document_version_id,
+            reason_code="market_mismatch",
+            message=(
+                f"新闻缺少市场标签，无法确认是否属于 {market_clock.market}"
+                if not document.market_tags
+                else f"新闻市场 {', '.join(document.market_tags)} 与目标市场 {market_clock.market} 不一致"
+            ),
+            extractor_id="news-market-router",
+            extractor_version="1.0.0",
+        )
+        for document in store.visible_at(as_of)
+        if not document.market_tags or market_clock.market not in document.market_tags
+    )
+    assembler = AsOfEventAssembler(extraction_store, extractor=extractor)
     view = assembler.view_at(as_of)
+    if routed_out:
+        view = replace(
+            view,
+            quarantined=(*routed_out, *view.quarantined),
+            visible_document_count=len(store.visible_at(as_of)),
+        )
 
     skipped_types = set() if include_irrelevant else {"irrelevant", "unknown"}
-    analyzable = [event for event in view.events if event.event_type not in skipped_types]
+
+    def analysis_exclusion(event):
+        if event.event_type in skipped_types:
+            return f"事件类型为 `{event.event_type}`，按预注册规则不进入电价分析"
+        if event.relevance != "short_term":
+            return "长期事件只进入长期研究，不进入短期电价窗口"
+        if event.status == "cancelled":
+            return "事件已取消，不作为已发生的价格冲击"
+        if event.effective_start_at is None:
+            return "没有可对齐的生效时刻"
+        return None
+
+    analyzable = [event for event in view.events if analysis_exclusion(event) is None]
     # Anything dropped here must still be named in the report, or the event count silently
     # shrinks between the quality section and the results.
     not_analyzed = tuple(
-        (event.event_id, f"事件类型为 `{event.event_type}`，按预注册规则不进入电价分析")
+        (event.event_id, reason)
         for event in view.events
-        if event.event_type in skipped_types
+        if (reason := analysis_exclusion(event)) is not None
     )
     analysis = EventPriceAnalyzer(method).analyze(prices, analyzable, axis=axis)
 

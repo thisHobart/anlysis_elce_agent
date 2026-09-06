@@ -13,9 +13,14 @@ from collections.abc import Sequence
 from datetime import datetime
 
 from app.research.news.clock import MarketClock
-from app.research.news.contracts import EventFeatureRow, EventFeatureSnapshot, MergedEvent
+from app.research.news.contracts import (
+    EventFeatureRow,
+    EventFeatureSnapshot,
+    EventStateRevision,
+    MergedEvent,
+)
 
-FEATURE_VERSION = "1.0.0"
+FEATURE_VERSION = "1.1.0"
 
 FEATURE_EVENT_TYPES: tuple[str, ...] = (
     "generation_outage",
@@ -36,23 +41,90 @@ class EventFeatureError(ValueError):
     """Raised when features cannot be built without violating the availability rule."""
 
 
-def _is_active(event: MergedEvent, interval_start: datetime, interval_end: datetime) -> bool:
+def _known_state(
+    event: MergedEvent, knowledge_at: datetime
+) -> tuple[EventStateRevision, datetime] | None:
+    visible = [item for item in event.state_history if item.available_at <= knowledge_at]
+    if visible:
+        return visible[-1], visible[-1].available_at
+    if event.announcement_available_at > knowledge_at:
+        return None
+    return (
+        EventStateRevision(
+            available_at=event.announcement_available_at,
+            relevance=event.relevance,
+            event_type=event.event_type,
+            affected_regions=event.affected_regions,
+            affected_assets=event.affected_assets,
+            capacity_mw=event.capacity_mw,
+            effective_start_at=event.effective_start_at,
+            effective_end_at=event.effective_end_at,
+            direction=event.direction,
+            status=event.status,
+            physical_effect=event.physical_effect,
+        ),
+        event.announcement_available_at,
+    )
+
+
+def _restoration_end(
+    outage_asset_keys: tuple[str, ...],
+    outage_start: datetime,
+    events: Sequence[MergedEvent],
+    knowledge_at: datetime,
+) -> datetime | None:
+    """Conservatively pair a restoration with an outage only on the same named asset."""
+
+    if not outage_asset_keys:
+        return None
+    ends: list[datetime] = []
+    for candidate in events:
+        known = _known_state(candidate, knowledge_at)
+        if known is None:
+            continue
+        state, state_available_at = known
+        if (
+            state.event_type == "generation_restore"
+            and state.status != "cancelled"
+            and state.asset_keys == outage_asset_keys
+            and state.effective_start_at is not None
+            and state.effective_start_at >= outage_start
+        ):
+            ends.append(max(state.effective_start_at, state_available_at))
+    return min(ends) if ends else None
+
+
+def _is_active(
+    event: MergedEvent,
+    state: EventStateRevision,
+    state_available_at: datetime,
+    interval_start: datetime,
+    interval_end: datetime,
+    *,
+    events: Sequence[MergedEvent],
+    knowledge_at: datetime,
+) -> bool:
     """Active means the event is both already announced and currently in effect."""
 
-    if event.effective_start_at is None:
+    if state.status == "cancelled" or state.effective_start_at is None:
         return False
-    if event.event_type in POINT_EVENT_TYPES:
+    if state.event_type in POINT_EVENT_TYPES:
         # A point event contributes once, at the first decision interval where it is both
         # effective and knowable. This preserves a late-arriving restoration without
         # leaking it into the interval that began before the bulletin arrived.
-        observable_at = max(event.effective_start_at, event.announcement_available_at)
+        observable_at = max(state.effective_start_at, state_available_at)
         duration = interval_end - interval_start
         return observable_at <= interval_start < observable_at + duration
-    if event.announcement_available_at > interval_start:
+    if state.effective_start_at >= interval_end:
         return False
-    if event.effective_start_at >= interval_end:
-        return False
-    effective_end = event.effective_end_at
+    effective_end = state.effective_end_at
+    restored_at = (
+        _restoration_end(state.asset_keys, state.effective_start_at, events, knowledge_at)
+        if state.event_type == "generation_outage"
+        else None
+    )
+    if restored_at is not None and (effective_end is None or restored_at < effective_end):
+        effective_end = restored_at
     return not (effective_end is not None and effective_end <= interval_start)
 
 
@@ -74,32 +146,62 @@ def build_event_features(
             f"{len(later)} 个事件的公告时间晚于 as_of；事件视图必须先按 as_of 重建再构造特征"
         )
 
-    short_term = [event for event in usable if event.relevance == "short_term"]
+    short_term = [
+        event
+        for event in usable
+        if event.relevance == "short_term"
+        or any(revision.relevance == "short_term" for revision in event.state_history)
+    ]
+    # A historical snapshot must not contain rows whose decision timestamp is later than
+    # its information cutoff.  Otherwise the CSV export would label a future row as
+    # ``available_at == timestamp`` even though it was produced using an earlier snapshot.
+    snapshot_end_at = min(clock.floor(end_at), clock.floor(as_of))
+    if snapshot_end_at < clock.floor(start_at):
+        raise EventFeatureError("as_of 早于特征时间范围，无法构造非空的历史快照")
     rows: list[EventFeatureRow] = []
-    for interval_start in clock.grid(start_at, end_at):
+    for interval_start in clock.grid(start_at, snapshot_end_at):
         interval_end = interval_start + clock.interval
-        active = [event for event in short_term if _is_active(event, interval_start, interval_end)]
+        knowledge_at = min(interval_start, as_of)
+        active_with_state: list[tuple[MergedEvent, EventStateRevision]] = []
+        for event in short_term:
+            known = _known_state(event, knowledge_at)
+            if known is None:
+                continue
+            state, state_available_at = known
+            if state.relevance != "short_term":
+                continue
+            if _is_active(
+                event,
+                state,
+                state_available_at,
+                interval_start,
+                interval_end,
+                events=short_term,
+                knowledge_at=knowledge_at,
+            ):
+                active_with_state.append((event, state))
+        active = [event for event, _ in active_with_state]
         counts = {event_type: 0 for event_type in FEATURE_EVENT_TYPES}
-        for event in active:
-            if event.event_type in counts:
-                counts[event.event_type] += 1
+        for _, state in active_with_state:
+            if state.event_type in counts:
+                counts[state.event_type] += 1
 
-        capacities = [event.capacity_mw for event in active if event.capacity_mw is not None]
+        capacities = [state.capacity_mw for _, state in active_with_state if state.capacity_mw is not None]
         if not active:
-            # No active event is a known zero, not an unknown; the contract keeps them apart.
-            capacity: float | None = None
-        elif capacities:
+            capacity: float | None = 0.0
+        elif len(capacities) == len(active):
             capacity = round(float(sum(capacities)), 6)
         else:
-            capacity = 0.0
+            # At least one active event has unknown size, so the total is not a known number.
+            capacity = None
 
         rows.append(
             EventFeatureRow(
                 interval_start=interval_start,
                 active_event_count=len(active),
                 active_capacity_mw=capacity,
-                direction_up_count=sum(1 for event in active if event.direction == "up"),
-                direction_down_count=sum(1 for event in active if event.direction == "down"),
+                direction_up_count=sum(1 for _, state in active_with_state if state.direction == "up"),
+                direction_down_count=sum(1 for _, state in active_with_state if state.direction == "down"),
                 event_type_counts=counts,
                 source_event_ids=tuple(sorted(event.event_id for event in active)),
             )

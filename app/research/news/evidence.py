@@ -212,14 +212,24 @@ class ResearchPackage:
 def _refs_by_authority(event: MergedEvent) -> tuple[DocumentRef, ...]:
     """Order citations the way the merge decided the values, most authoritative first.
 
-    This has to mirror `merge_event_records`: the originating lineage at its newest version
-    is what set each field, so its wording is what a reviewer must see. Quoting a later
-    third-party article would be traceable but would not be the text the value came from.
+    This mirrors `merge_event_records`: the highest-authority visible lineage at its newest
+    version sets fields, while an earlier secondary report still contributes the first-known
+    time and provenance. Reviewers see the authoritative wording first.
     """
 
-    primary_lineage = min(
-        event.document_refs, key=lambda ref: (ref.available_at, ref.document_version_id)
-    ).document_id
+    def rank(ref: DocumentRef) -> tuple[int, datetime, str]:
+        tier = ref.source_tier.casefold()
+        if tier.startswith("primary_") or any(
+            word in tier for word in ("operator", "regulator", "government", "official")
+        ):
+            authority = 0
+        elif any(word in tier for word in ("secondary", "media", "repost", "aggregator")):
+            authority = 2
+        else:
+            authority = 1
+        return authority, ref.available_at, ref.document_id
+
+    primary_lineage = min(event.document_refs, key=rank).document_id
     return tuple(
         sorted(
             event.document_refs,

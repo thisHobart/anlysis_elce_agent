@@ -129,7 +129,10 @@ def test_point_event_lifecycle_and_negative_controls_do_not_pollute_features(
     assert effective_study.analysis.for_event(irrelevant.event_id) == ()
 
     long_horizon = _event_for_fixture(effective_study, "N08")
-    assert any(event_id == long_horizon.event_id for event_id, _ in effective_study.analysis.excluded_events)
+    assert any(
+        event_id == long_horizon.event_id
+        for event_id, _ in effective_study.package.events_not_analyzed
+    )
     assert _event_for_fixture(effective_study, "N10").event_id == _event_for_fixture(
         effective_study, "N01"
     ).event_id

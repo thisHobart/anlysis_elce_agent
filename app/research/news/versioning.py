@@ -8,7 +8,7 @@ from datetime import datetime
 
 from app.research.news.contracts import DocumentRef, NewsDocument
 
-VERSION_STORE_VERSION = "1.0.0"
+VERSION_STORE_VERSION = "1.1.0"
 
 
 class NewsVersionError(ValueError):
@@ -21,6 +21,7 @@ def document_ref(document: NewsDocument) -> DocumentRef:
         document_version_id=document.document_version_id,
         version=document.version,
         source_name=document.source_name,
+        source_tier=str(document.raw_metadata.get("source_tier") or "unknown"),
         content_hash=document.content_hash,
         available_at=document.available_at,
     )
@@ -61,10 +62,12 @@ class NewsVersionStore:
         versions = self._versions.setdefault(document.document_id, {})
         existing = versions.get(document.document_version_id)
         if existing is not None:
-            if existing != document:
-                raise NewsVersionError(
-                    f"{document.document_version_id} 已存在且内容不同；版本身份必须随内容变化"
-                )
+            # Re-fetching the same source version changes collection metadata, not content
+            # identity. Keep the earliest observation so point-in-time replay remains honest.
+            if existing.content_hash != document.content_hash:
+                raise NewsVersionError(f"{document.document_version_id} 的内容哈希发生冲突")
+            if document.first_seen_at < existing.first_seen_at:
+                versions[document.document_version_id] = document
             self._duplicate_version_ids.append(document.document_version_id)
             return False
 
@@ -76,11 +79,9 @@ class NewsVersionStore:
         if same_content:
             self._duplicate_content.append((document.document_version_id, same_content[0].document_version_id))
 
-        clashing = [other for other in versions.values() if other.version == document.version]
-        if clashing:
-            raise NewsVersionError(
-                f"文档 {document.document_id} 的版本 {document.version} 出现两份不同内容；来源版本号必须唯一"
-            )
+        # Some providers never increment their `version` field. A changed content hash is
+        # therefore a new internal version even when the provider's version number is reused;
+        # availability time decides which one was visible at an as_of instant.
         versions[document.document_version_id] = document
         return True
 

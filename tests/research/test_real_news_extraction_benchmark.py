@@ -69,9 +69,10 @@ def test_current_rule_baseline_is_explicitly_not_qualified_on_real_news(
     assert {check.code for check in report.failed_checks} == {
         "extractable_event_recall",
         "quarantine_recall",
-        "unknown_rate",
-        "evidence_integrity",
-    }
+            "unknown_rate",
+            "evidence_integrity",
+            "full_case_accuracy",
+        }
     assert [case.corpus_id for case in report.cases if case.passed] == ["R10"]
     assert all(case.evidence_span_count == 0 for case in report.cases)
 
@@ -96,6 +97,51 @@ def test_benchmark_accepts_a_gold_faithful_extractor(records, manifest) -> None:
         for case in report.cases
         if case.actual_disposition == "quarantine"
     )
+
+
+def test_full_field_errors_are_blocking_even_when_event_recall_is_perfect(records, manifest) -> None:
+    class WrongFields(_GoldExtractor):
+        def extract(self, document):
+            result = super().extract(document)
+            if not result.events or result.events[0].event_type in {"irrelevant", "unknown"}:
+                return result
+            event = result.events[0].model_copy(
+                update={"affected_regions": ("WRONG",), "affected_assets": ("INVENTED",)}
+            )
+            return result.model_copy(update={"events": (event,)})
+
+    gold_by_id = {record.corpus_id: record for record in manifest.records}
+    report = benchmark_real_news_extractor(
+        records,
+        manifest,
+        extractor_factory=lambda _timezone: WrongFields(gold_by_id),
+    )
+
+    assert report.extractable_event_recall == 1.0
+    assert report.full_case_accuracy < 1.0
+    assert not report.qualified
+    assert "full_case_accuracy" in {check.code for check in report.failed_checks}
+
+
+def test_missing_field_level_evidence_is_a_blocking_failure(records, manifest) -> None:
+    class MissingEvidence(_GoldExtractor):
+        def extract(self, document):
+            result = super().extract(document)
+            if not result.events or result.events[0].event_type in {"irrelevant", "unknown"}:
+                return result
+            event = result.events[0].model_copy(update={"evidence": result.events[0].evidence[:1]})
+            return result.model_copy(update={"events": (event,)})
+
+    gold_by_id = {record.corpus_id: record for record in manifest.records}
+    report = benchmark_real_news_extractor(
+        records,
+        manifest,
+        extractor_factory=lambda _timezone: MissingEvidence(gold_by_id),
+    )
+
+    assert report.full_case_accuracy == 1.0
+    assert not report.qualified
+    assert "evidence_integrity" in {check.code for check in report.failed_checks}
 
 
 class _GoldExtractor:
@@ -126,20 +172,34 @@ class _GoldExtractor:
 
         event_type = gold.expected_event_types[0]
         irrelevant = gold.expected_disposition == "irrelevant"
+        event_id = f"evt_{hashlib.sha256(gold.corpus_id.encode()).hexdigest()[:24]}"
         evidence = ()
         if not irrelevant:
-            evidence = (
+            fields = ["relevance", "event_type"]
+            if gold.expected_regions:
+                fields.append("affected_regions")
+            if gold.expected_assets:
+                fields.append("affected_assets")
+            if gold.expected_capacity_mw is not None:
+                fields.append("capacity_mw")
+            if gold.expected_start_at is not None:
+                fields.append("effective_start_at")
+            if event_type == "generation_outage":
+                fields.append("direction")
+            evidence = tuple(
                 EvidenceSpan(
-                    field_name="event_type",
+                    field_name=field_name,
+                    event_id=event_id,
                     document_version_id=document.document_version_id,
                     text_field="body",
                     start_char=0,
                     end_char=len(document.body),
                     quote=document.body,
-                ),
+                )
+                for field_name in fields
             )
         event = EventRecord(
-            event_id=f"evt_{hashlib.sha256(gold.corpus_id.encode()).hexdigest()[:24]}",
+            event_id=event_id,
             document_version_id=document.document_version_id,
             relevance=gold.expected_relevance,
             event_type=event_type,

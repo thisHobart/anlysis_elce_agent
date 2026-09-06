@@ -8,6 +8,8 @@ qualification_thresholds:
   quarantine_recall: 0.80
   irrelevant_accuracy: 0.95
   maximum_unknown_rate: 0.20
+  full_case_accuracy: 1.00
+  evidence_integrity: 1.00
 
 records:
   - corpus_id: R01

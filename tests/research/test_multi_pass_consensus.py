@@ -30,7 +30,7 @@ def _document(body: str = BODY):
         source_name="测试来源",
         source_document_id="CONSENSUS-01",
         source_ref="https://example.invalid/consensus",
-        title="用电负荷创历史新高",
+        title="社区服务活动" if body == SOCIAL_BODY else "用电负荷创历史新高",
         body=body,
         published_at=datetime(2026, 8, 6, 6, 7, tzinfo=UTC),
         collected_at=datetime(2026, 8, 6, 7, 0, tzinfo=UTC),
@@ -241,9 +241,10 @@ def test_three_passes_agreeing_on_one_of_two_events_still_go_to_review() -> None
     result, gateway = _extract(payload, passes=3, body=MULTI_BODY)
 
     assert gateway.calls == 3, "三趟都跑了，且三趟一致"
-    assert result.quarantine is not None
-    assert result.quarantine.reason_code == "ambiguous_multi_event"
-    assert "2" in result.quarantine.message
+    assert result.quarantine is None
+    assert len(result.events) == 1
+    assert result.candidate_quarantines[0].reason_code == "ambiguous_multi_event"
+    assert "2" in result.candidate_quarantines[0].message
 
 
 def test_a_unanimous_irrelevant_verdict_is_refused_when_the_text_says_otherwise() -> None:
@@ -276,11 +277,19 @@ def test_the_extractor_records_what_the_passes_cost() -> None:
     assert extractor.model_seconds >= 0.0
 
 
+ASSET_BODY = (
+    "8月3日11时06分，辽宁电网通报 AGRs (advanced gas cooled reactor stations)、"
+    "Unit A、Unit B 和 Unit C 的运行情况。"
+)
+
+
 def _payload_with_asset(asset: str) -> dict:
     payload = _event_payload()
     payload["events"][0]["affected_assets"] = [asset]
+    for span in payload["events"][0]["evidence"]:
+        span["quote"] = ASSET_BODY
     payload["events"][0]["evidence"].append(
-        {"field_name": "affected_assets", "text_field": "body", "quote": BODY}
+        {"field_name": "affected_assets", "text_field": "body", "quote": ASSET_BODY}
     )
     return payload
 
@@ -293,6 +302,7 @@ def test_the_same_asset_described_two_ways_takes_the_majority_spelling() -> None
         _payload_with_asset("advanced gas cooled reactor stations"),
         _payload_with_asset("AGRs"),
         passes=3,
+        body=ASSET_BODY,
     )
 
     assert result.quarantine is None
@@ -307,6 +317,7 @@ def test_three_different_asset_names_have_no_majority_and_go_to_review() -> None
         _payload_with_asset("Unit B"),
         _payload_with_asset("Unit C"),
         passes=3,
+        body=ASSET_BODY,
     )
 
     assert result.quarantine is not None

@@ -184,8 +184,16 @@ def test_the_source_wording_is_still_preserved_for_evidence() -> None:
     assert _extract("辽宁").affected_regions == ("辽宁",)
 
 
-def test_two_genuinely_different_grids_keep_different_identities() -> None:
-    assert _extract("辽宁").event_id != _extract("华东").event_id
+def test_a_region_absent_from_both_source_and_market_metadata_is_rejected() -> None:
+    extractor = StructuredNewsEventExtractor(
+        _OneShotGateway("华东"),
+        market_timezone="Asia/Shanghai",
+    )
+
+    result = extractor.extract(_document())
+
+    assert result.quarantine is not None
+    assert result.quarantine.reason_code == "invalid_evidence"
 
 
 class _PerDocumentGateway:

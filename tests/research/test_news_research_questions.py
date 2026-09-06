@@ -324,13 +324,14 @@ def test_question_4_features_never_count_an_event_before_it_was_announced(prices
     after_announcement = rows[_instant("2026-01-12T10:30:00+00:00")]
 
     assert before_announcement.active_event_count == 0
-    assert before_announcement.active_capacity_mw is None, "无活跃事件是未知，不是数值零"
+    assert before_announcement.active_capacity_mw == 0.0, "无活跃事件的影响量是已知零"
     assert in_effect_but_not_yet_known.active_event_count == 0, "事件已生效但尚未可用，不得计入"
-    assert in_effect_but_not_yet_known.active_capacity_mw is None
+    assert in_effect_but_not_yet_known.active_capacity_mw == 0.0
     assert after_announcement.active_event_count == 1
     assert after_announcement.active_capacity_mw == 500.0
     assert after_announcement.direction_up_count == 1
     assert after_announcement.event_type_counts["generation_outage"] == 1
+    assert max(rows) == study.clock.floor(early), "as_of 快照不得导出未来时间行"
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +377,8 @@ def test_question_5_negative_controls_never_become_an_effect(effective_study, an
     long_horizon = _event_of(effective_study, "N08")
     assert long_horizon.effective_start_at.year == 2030
     assert any(
-        event_id == long_horizon.event_id for event_id, _ in effective_study.analysis.excluded_events
+        event_id == long_horizon.event_id
+        for event_id, _ in effective_study.package.events_not_analyzed
     )
 
     # The retrospective contributes provenance to the outage; it never becomes its own event.

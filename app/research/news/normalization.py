@@ -11,7 +11,7 @@ from typing import Any
 
 from app.research.news.contracts import CollectedNewsRecord, NewsDocument
 
-NORMALIZER_VERSION = "1.0.0"
+NORMALIZER_VERSION = "1.1.0"
 
 
 def _canonical_hash(value: Any) -> str:
@@ -66,7 +66,6 @@ class NewsNormalizer:
             {
                 "content_hash": content_hash,
                 "document_id": document_id,
-                "first_seen_at": first_seen_at.isoformat(),
                 "published_at": published_at.isoformat(),
                 "updated_at": updated_at.isoformat() if updated_at is not None else None,
                 "version": record.version,

@@ -86,6 +86,10 @@ _REGION_CANONICAL: dict[str, str] = {
 }
 
 _KNOWN_REGION_CODES = frozenset(_REGION_CANONICAL.values())
+_REGION_CODE_BY_FOLDED = {
+    re.sub(r"[^\w]", "", code, flags=re.UNICODE).casefold(): code
+    for code in _KNOWN_REGION_CODES
+}
 
 # A stem shorter than this is not a region name. Without the floor, 市 would be stripped from
 # 沙市 and collapse it into 沙 — and any other single-character name that happens to end the
@@ -123,6 +127,8 @@ def canonical_region(value: str) -> str:
     folded = _fold(value)
     if not folded:
         return ""
+    if folded in _REGION_CODE_BY_FOLDED:
+        return _REGION_CODE_BY_FOLDED[folded]
     stripped = _strip_region_suffixes(folded)
     return _REGION_CANONICAL.get(stripped, stripped)
 

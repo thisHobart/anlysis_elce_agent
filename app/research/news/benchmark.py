@@ -23,7 +23,7 @@ from app.research.news.entities import split_entity_keys
 from app.research.news.extraction import NewsEventExtractor, ObviousNewsEventExtractor
 from app.research.news.normalization import NewsNormalizer
 
-REAL_NEWS_BENCHMARK_VERSION = "1.0.0"
+REAL_NEWS_BENCHMARK_VERSION = "1.1.0"
 
 ExpectedDisposition = Literal["event", "quarantine", "irrelevant"]
 ActualDisposition = Literal["event", "quarantine", "irrelevant", "invalid"]
@@ -70,6 +70,8 @@ class BenchmarkThresholds(BaseModel):
     quarantine_recall: float = Field(ge=0, le=1)
     irrelevant_accuracy: float = Field(ge=0, le=1)
     maximum_unknown_rate: float = Field(ge=0, le=1)
+    full_case_accuracy: float = Field(default=1.0, ge=0, le=1)
+    evidence_integrity: float = Field(default=1.0, ge=0, le=1)
 
 
 class RealNewsGoldManifest(BaseModel):
@@ -282,15 +284,21 @@ def benchmark_real_news_extractor(
         ),
         RealNewsBenchmarkCheck(
             code="evidence_integrity",
-            severity="warning",
-            passed=evidence_integrity == 1.0,
+            severity="blocker",
+            passed=evidence_integrity is not None and evidence_integrity >= thresholds.evidence_integrity,
             measured=evidence_integrity,
-            threshold=1.0,
+            threshold=thresholds.evidence_integrity,
             detail=(
                 "所有已抽取字段证据均精确回链原文"
                 if evidence_cases
                 else "没有抽取出带证据的真实事件，证据完整性无法评估"
             ),
+        ),
+        _minimum_check(
+            "full_case_accuracy",
+            full_accuracy,
+            thresholds.full_case_accuracy,
+            "事件处置、类型、相关性、区域、资产、容量和开始时间必须逐案完整匹配",
         ),
     )
     source_profile: dict[str, object] = {
@@ -329,21 +337,43 @@ def _score_case(
     gold: RealNewsGoldRecord,
     extraction: EventExtractionResult,
 ) -> RealNewsCaseResult:
+    semantic_quarantine_reasons = {
+        "ambiguous_multi_event",
+        "disputed_irrelevance",
+        "ambiguous_event_time",
+        "ambiguous_quantity",
+        "inconsistent_extraction",
+        "invalid_evidence",
+        "market_mismatch",
+        "missing_effective_start",
+        "uncertain_extraction",
+        "event_contract_violation",
+    }
     if extraction.quarantine is not None:
-        actual_disposition: ActualDisposition = "quarantine"
+        actual_disposition = (
+            "quarantine"
+            if extraction.quarantine.reason_code in semantic_quarantine_reasons
+            else "invalid"
+        )
         event = None
-    elif len(extraction.events) != 1:
+    elif not extraction.events:
         actual_disposition = "invalid"
         event = None
     else:
         event = extraction.events[0]
-        actual_disposition = (
-            "irrelevant"
-            if event.event_type in {"irrelevant", "unknown"}
-            else "event"
-        )
+        actual_disposition = "irrelevant" if all(
+            item.event_type in {"irrelevant", "unknown"} for item in extraction.events
+        ) else "event"
 
-    event_type_match = bool(event and event.event_type in gold.expected_event_types)
+    event_type_match = bool(
+        event
+        and (
+            extraction.events[0].event_type in gold.expected_event_types
+            if len(extraction.events) == 1
+            else Counter(item.event_type for item in extraction.events)
+            == Counter(gold.expected_event_types)
+        )
+    )
     relevance_match = bool(event and event.relevance == gold.expected_relevance)
     # Compare canonical keys, not raw wording. 辽宁 and 辽宁电网 name one grid, and a gold
     # file cannot enumerate every phrasing a source might use for the same entity. The gold
@@ -378,12 +408,12 @@ def _score_case(
 
     evidence_integrity: bool | None = None
     evidence_count = 0
-    if event is not None and event.evidence:
-        evidence_count = len(event.evidence)
+    if event is not None and actual_disposition == "event":
+        all_evidence = tuple(span for item in extraction.events for span in item.evidence)
+        evidence_count = len(all_evidence)
         evidence_integrity = all(
-            getattr(document, span.text_field)[span.start_char : span.end_char]
-            == span.quote
-            for span in event.evidence
+            _event_evidence_is_complete(document, item)
+            for item in extraction.events
         )
 
     return RealNewsCaseResult(
@@ -430,6 +460,35 @@ def _minimum_check(
         measured=measured,
         threshold=threshold,
         detail=detail,
+    )
+
+
+def _event_evidence_is_complete(document: NewsDocument, event) -> bool:
+    required = {"relevance", "event_type"}
+    if event.status != "unknown":
+        required.add("status")
+    if event.physical_effect != "unknown":
+        required.add("physical_effect")
+    if event.direction != "unknown":
+        required.add("direction")
+    if event.affected_regions:
+        required.add("affected_regions")
+    if event.affected_assets:
+        required.add("affected_assets")
+    if event.magnitude is not None:
+        required.add("magnitude")
+    if event.capacity_mw is not None:
+        required.add("capacity_mw")
+    if event.effective_start_at is not None:
+        required.add("effective_start_at")
+    if event.effective_end_at is not None:
+        required.add("effective_end_at")
+    fields = {span.field_name for span in event.evidence}
+    return bool(event.evidence) and required.issubset(fields) and all(
+        span.document_version_id == document.document_version_id
+        and (span.event_id is None or span.event_id == event.event_id)
+        and getattr(document, span.text_field)[span.start_char : span.end_char] == span.quote
+        for span in event.evidence
     )
 
 
