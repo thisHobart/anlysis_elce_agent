@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime
+
+from pydantic import BaseModel
 
 from app.research.news.analysis import AnalysisResult, EventWindowResult
 from app.research.news.contracts import (
@@ -114,7 +116,14 @@ class ResearchPackage:
         explained |= {event_id for event_id, _ in self.events_not_analyzed}
         return tuple(sorted(event.event_id for event in self.events if event.event_id not in explained))
 
-    def fingerprint(self) -> dict[str, str]:
+    def conclusion_fingerprint(self) -> dict[str, str]:
+        """What this package concluded. Re-extracting the same documents must not move these.
+
+        None of these values carry `output_hash`, and entities enter through canonical keys,
+        so two runs that reach the same conclusion in different words fingerprint identically.
+        That is the whole point: a changed value here means the conclusion changed.
+        """
+
         return {
             "analysis_hash": self.analysis.content_hash(),
             "event_hash": self.analysis.event_hash,
@@ -122,6 +131,14 @@ class ResearchPackage:
             "package_hash": self._package_hash(),
             "price_hash": self.analysis.price_hash,
         }
+
+    def provenance_fingerprint(self) -> dict[str, str]:
+        """How it was produced. This one is expected to move when the model does."""
+
+        return {"provenance_hash": self._provenance_hash()}
+
+    def fingerprint(self) -> dict[str, str]:
+        return {**self.conclusion_fingerprint(), **self.provenance_fingerprint()}
 
     def _package_hash(self) -> str:
         payload = json.dumps(
@@ -132,9 +149,10 @@ class ResearchPackage:
                     {
                         "conclusion": link.conclusion,
                         "event_id": link.event_id,
-                        "extraction_traces": [
-                            trace.model_dump(mode="json") for trace in link.extraction_traces
-                        ],
+                        # No extraction traces here: `output_hash` is not reproducible on the
+                        # configured endpoint, and a package hash that moves on every
+                        # re-extraction cannot answer "did anything about this change?".
+                        # `_provenance_hash` keeps them.
                         "quotes": [list(quote) for quote in link.quotes],
                         "window": link.window_label,
                     }
@@ -151,6 +169,35 @@ class ResearchPackage:
                     "quarantined_count": self.quality.quarantined_count,
                     "versions": self.quality.version_count,
                 },
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _provenance_hash(self) -> str:
+        """Every model trace behind this package, held apart from the conclusion hashes."""
+
+        payload = json.dumps(
+            {
+                "analysis_provenance": self.analysis.provenance_hash,
+                "evidence": sorted(
+                    (
+                        {
+                            "content_hashes": list(link.content_hashes),
+                            "document_version_ids": list(link.document_version_ids),
+                            "event_id": link.event_id,
+                            "extraction_traces": [
+                                trace.model_dump(mode="json") for trace in link.extraction_traces
+                            ],
+                            "window": link.window_label,
+                        }
+                        for link in self.evidence_links
+                    ),
+                    key=lambda row: (row["event_id"], row["window"]),
+                ),
+                "package_version": self.package_version,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -338,6 +385,7 @@ AXIS_LABELS = {"announcement": "公告可用轴", "effective": "事件生效轴"
 QUARANTINE_LABELS = {
     "ambiguous_multi_event": "同一文档命中多个事件类别",
     "ambiguous_event_time": "多个相对时间表述且无明确生效区间",
+    "disputed_irrelevance": "模型判为无关，但原文含功率量值或运行词汇",
     "missing_effective_start": "短期事件没有可解析的生效开始时间",
     "event_contract_violation": "未通过事件契约校验",
 }
@@ -511,6 +559,57 @@ def _render_event_section(
     return lines
 
 
+def _jsonable(value):
+    """Make one value JSON-safe without losing precision that a reviewer would need."""
+
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if is_dataclass(value) and not isinstance(value, type):
+        return {name: _jsonable(getattr(value, name)) for name in (f.name for f in fields(value))}
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
+def package_payload(package: ResearchPackage) -> dict:
+    """The machine-readable twin of `render_report`.
+
+    The rendered report is for a person; this is what a later run diffs against. Both
+    fingerprint groups are kept apart here for the same reason they are in the report — a
+    provenance hash that moved says the model answered differently, not that the conclusion
+    did, and a consumer that cannot tell those apart will chase noise.
+    """
+
+    return {
+        "package_version": package.package_version,
+        "generated_for_as_of": package.generated_for_as_of.isoformat(),
+        "conclusion_fingerprint": package.conclusion_fingerprint(),
+        "provenance_fingerprint": package.provenance_fingerprint(),
+        "quality": {
+            **_jsonable(package.quality),
+            "evidence_coverage": package.quality.evidence_coverage,
+        },
+        "events": [event.model_dump(mode="json") for event in package.events],
+        "analysis": {
+            **_jsonable(package.analysis),
+            "content_hash": package.analysis.content_hash(),
+        },
+        "evidence_links": [_jsonable(link) for link in package.evidence_links],
+        "features": package.features.model_dump(mode="json") if package.features else None,
+        "method_notes": list(package.method_notes),
+        "events_not_analyzed": [list(item) for item in package.events_not_analyzed],
+        "quarantined": [item.model_dump(mode="json") for item in package.quarantined],
+        # An event that produced neither a result nor a stated reason is a hole in the report,
+        # so it is named in the artifact rather than left for someone to notice.
+        "unexplained_events": list(package.unexplained_events),
+        "untraceable_links": [link.event_id for link in package.untraceable_links()],
+    }
+
+
 def render_report(package: ResearchPackage) -> str:
     """A human-readable summary; the machine-readable truth stays in the objects.
 
@@ -558,6 +657,37 @@ def render_report(package: ResearchPackage) -> str:
         ]
     )
 
-    lines.extend(["## 六、指纹", "", "| 项 | 值 |", "|---|---|"])
-    lines.extend(f"| {key} | `{value}` |" for key, value in sorted(package.fingerprint().items()) if value)
+    lines.extend(
+        [
+            "## 六、指纹",
+            "",
+            "### 结论指纹",
+            "",
+            "同一批新闻重新抽取，只要结论没变，下列值就不变；任何一项变化都代表结论本身变了。",
+            "",
+            "| 项 | 值 |",
+            "|---|---|",
+        ]
+    )
+    lines.extend(
+        f"| {key} | `{value}` |" for key, value in sorted(package.conclusion_fingerprint().items()) if value
+    )
+    lines.extend(
+        [
+            "",
+            "### 来源指纹",
+            "",
+            (
+                "记录这次结论由哪个模型、哪版 Prompt 与 schema、以及什么原始输出得出。"
+                "所配端点在 temperature=0 下也不可复现，因此重新抽取时该值可能变化；"
+                "只要结论指纹未变，这不代表结论有变。"
+            ),
+            "",
+            "| 项 | 值 |",
+            "|---|---|",
+        ]
+    )
+    lines.extend(
+        f"| {key} | `{value}` |" for key, value in sorted(package.provenance_fingerprint().items()) if value
+    )
     return "\n".join(lines)

@@ -19,6 +19,7 @@ from app.research.news.contracts import (
     NewsEventType,
     NewsRelevance,
 )
+from app.research.news.entities import split_entity_keys
 from app.research.news.extraction import NewsEventExtractor, ObviousNewsEventExtractor
 from app.research.news.normalization import NewsNormalizer
 
@@ -97,6 +98,9 @@ class RealNewsCaseResult(BaseModel):
 
     corpus_id: str
     source_ref: str
+    # Carried through so a reviewer reads the reason a case was labelled this way next to the
+    # verdict it produced. The gold labels are a human judgement and have to stay auditable.
+    gold_reason: str = ""
     expected_disposition: ExpectedDisposition
     actual_disposition: ActualDisposition
     expected_event_types: tuple[str, ...]
@@ -107,6 +111,7 @@ class RealNewsCaseResult(BaseModel):
     actual_capacity_mw: float | None = None
     actual_start_at: datetime | None = None
     quarantine_reason: str | None = None
+    quarantine_message: str | None = None
     event_type_match: bool = False
     relevance_match: bool = False
     region_match: bool = False
@@ -340,8 +345,12 @@ def _score_case(
 
     event_type_match = bool(event and event.event_type in gold.expected_event_types)
     relevance_match = bool(event and event.relevance == gold.expected_relevance)
-    region_match = bool(event and event.affected_regions == gold.expected_regions)
-    asset_match = bool(event and event.affected_assets == gold.expected_assets)
+    # Compare canonical keys, not raw wording. 辽宁 and 辽宁电网 name one grid, and a gold
+    # file cannot enumerate every phrasing a source might use for the same entity. The gold
+    # side goes through the same split, so a reviewer's region/asset placement is not a trap.
+    gold_regions, gold_assets = split_entity_keys(gold.expected_regions, gold.expected_assets)
+    region_match = bool(event and event.region_keys == gold_regions)
+    asset_match = bool(event and event.asset_keys == gold_assets)
     capacity_match = bool(
         event and _optional_float_equal(event.capacity_mw, gold.expected_capacity_mw)
     )
@@ -385,12 +394,16 @@ def _score_case(
         expected_event_types=tuple(gold.expected_event_types),
         actual_event_type=event.event_type if event is not None else None,
         actual_relevance=event.relevance if event is not None else None,
+        gold_reason=gold.gold_reason,
         actual_regions=event.affected_regions if event is not None else (),
         actual_assets=event.affected_assets if event is not None else (),
         actual_capacity_mw=event.capacity_mw if event is not None else None,
         actual_start_at=event.effective_start_at if event is not None else None,
         quarantine_reason=(
             extraction.quarantine.reason_code if extraction.quarantine is not None else None
+        ),
+        quarantine_message=(
+            extraction.quarantine.message if extraction.quarantine is not None else None
         ),
         event_type_match=event_type_match,
         relevance_match=relevance_match,

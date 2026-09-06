@@ -75,9 +75,9 @@ PySide6 Desktop
 → SQLite checkpoint / interrupt / resume
 ```
 
-主 Agent 和 Subagent 共用 `app/llm` 中唯一的模型网关；只有该基础设施层可以创建 `ChatOpenAI`。不同 Agent 的区别是职责、提示词和结构化契约，而不是各自维护模型连接。
+主 Agent 和 Subagent 共用 `app/llm` 中的 `ModelGateway`（统一模型接口）。工厂按服务商选择协议适配器：DeepSeek、Qwen 和自定义 OpenAI 兼容端点使用 `ChatOpenAI`，Gemini 使用 `ChatGoogleGenerativeAI` 直接调用 Google 原生 API。不同 Agent 只定义职责、提示词和结构化契约，不各自维护模型连接。
 
-界面上显示的“研究过程”不是模型的私有思考链。它由 `app/research/graph/narration.py` 把已经发生的、可审计的循环事件（阶段、函数、参数门禁、评估结论）翻译成中文句子；模型网关始终禁用 thinking，也不保存任何隐藏推理。
+界面上显示的“研究过程”不是模型的私有思考链。它由 `app/research/graph/narration.py` 把已经发生的、可审计的循环事件（阶段、函数、参数门禁、评估结论）翻译成中文句子；模型网关不把服务商返回的隐藏推理写入应用状态，严格策略下会拒绝含推理内容的响应。
 
 大模型每次回复都要调用一次 `declare_research_agenda` 声明本轮目标、假设和前提；它不执行任何计算，只把议程记录进方案。评估器为每个研究函数都准备了确定性验收规则：假设要么得到明确结论，要么被标记为需要补数据、需要扩大审批范围或需要改写，不会被静默忽略。关系样本不足或某个变量全程没有可用相关时，评估器在原审批范围内提出收缩 `max_lag` 或移除该变量的自动修订。
 
@@ -119,7 +119,7 @@ start_desktop.bat
 
 ## LLM 配置
 
-复制 `.env.example` 为 `.env`，填写支持原生 Function Calling 的模型端点：
+复制 `.env.example` 为 `.env`。OpenAI 兼容端点配置示例：
 
 ```dotenv
 VPP_LLM_PROVIDER=custom
@@ -132,11 +132,24 @@ VPP_LLM_REASONING_EFFORT=
 VPP_SKILL_PATHS=
 ```
 
-桌面端可以选择 `DeepSeek`、`Qwen` 或 `Custom`，以及 `Chat Completions` 或 `Responses` API；旧配置按 `custom + chat` 读取，不根据 URL 猜供应商，也不会在两种 API 间自动切换。Provider 只控制已知的附加请求参数：DeepSeek Chat 使用 `thinking.type=disabled`，Qwen Chat 使用 `enable_thinking=false`，两者的 Responses 请求使用 `reasoning.effort=none`。Custom 默认不注入推理参数；后台只有显式配置 `VPP_LLM_REASONING_EFFORT` 时才会映射为 Chat 的 `reasoning_effort` 或 Responses 的 `reasoning.effort`。桌面保存连接配置时不会覆盖该隐藏设置。
+Gemini Developer API 配置示例（`Base URL` 留空，不经过 Cherry Studio 等 OpenAI 代理）：
+
+```dotenv
+VPP_LLM_PROVIDER=gemini
+VPP_LLM_BASE_URL=
+VPP_LLM_API_KEY=your-google-api-key
+VPP_LLM_MODEL=gemini-2.5-flash
+```
+
+Vertex AI 使用应用默认凭据（ADC，即 Google SDK 读取的本机/工作负载身份），并额外设置 `VPP_LLM_GOOGLE_VERTEXAI=true`、`VPP_LLM_GOOGLE_PROJECT` 和 `VPP_LLM_GOOGLE_LOCATION`。模型名只填写 `gemini-*`，不能使用 Cherry Studio 的 `vertexai:` 前缀。
+
+桌面端可以选择 `DeepSeek`、`Qwen`、`Gemini（原生 API）` 或 `Custom`。旧配置按 `custom + chat` 读取，不根据 URL 猜供应商。Gemini 固定使用 Google 原生 `json_schema`（服务商在生成时按数据结构约束输出）；其他端点按配置使用 Chat Completions 或 Responses。
+
+如果 Gemini 只能通过 Cherry Studio API Server 调用，服务商保持 `Custom`，接口填写 Cherry 的 `/v1` 地址，并在“结构化输出”选择“Cherry 兼容 JSON（本地校验）”。该模式把 JSON Schema 放入系统消息，模型响应必须通过本地 Pydantic 校验；失败结果不会进入研究分析。它用于解决 Cherry 未转发原生 schema 的限制，不等同于服务商原生结构化输出。
 
 研究对话、函数提议和方案修订使用大模型。模型未配置、调用失败或返回无效方案时，任务会停止并提示重试，不存在本地关键词规划回退。大模型只承担受限路由和 Function Call 提议；研究阶段、函数顺序、门禁和停止条件来自本地领域协议。响应中的 `reasoning_content`、reasoning 内容块或 `<think>...</think>` 不会进入 LangGraph 状态；默认丢弃，严格策略下拒绝本次响应。
 
-消息由 Agent 内部的类型化角色统一表达，再由所选 API 适配器编码。结构化决策和研究函数选择固定使用原生 Function Calling；若端点拒绝 `tools`、`tool_choice` 或未返回函数调用，系统会报告协议不兼容，不会改用提示词 JSON。只有温度、Provider 自动添加的推理控制和并行调用开关可以在端点明确拒绝后移除。
+消息由 Agent 内部的类型化角色统一表达，再由所选服务商适配器编码。Gemini 的结构化结果使用原生 JSON Schema，研究函数选择使用 Gemini 原生 Function Calling；OpenAI 兼容端点使用其明确配置的原生结构化协议。若端点拒绝必要协议，系统会报告不兼容，不会从普通文本中猜测或补救 JSON。
 
 大模型只能从 Skill 授权的原子研究函数中选择具体调用。每个函数名唯一对应一种确定性统计过程；本地编译器再按领域协议重排并校验。执行计划保存 Skill、领域协议、函数名、函数版本、参数、输入数据指纹和代码环境，版本不匹配时拒绝执行。
 

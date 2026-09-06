@@ -463,7 +463,9 @@ def evaluate_phase2_goal_agent(
         "排除项和按规则未分析项必须完整保留且不得改写为有效应",
     )
 
-    expected_fingerprints = study.package.fingerprint()
+    # The agent reports the conclusion hashes; provenance is not its to reproduce, and the
+    # endpoint cannot reproduce it anyway.
+    expected_fingerprints = study.package.conclusion_fingerprint()
     actual_fingerprints = {
         "analysis_hash": result.analysis_hash,
         "event_hash": result.event_hash,

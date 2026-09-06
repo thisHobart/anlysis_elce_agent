@@ -6,6 +6,8 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from app.llm.gateway import ModelGatewayError, ModelResponseError
 from app.research.news import (
     AsOfEventAssembler,
@@ -19,10 +21,39 @@ from app.research.news import (
     collect_evidence_spans,
     load_real_news_gold,
 )
+from app.research.news.model_extraction import (
+    MODEL_EXTRACTION_SCHEMA_VERSION,
+    ModelNewsExtraction,
+)
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "news_realistic"
 NEWS = FIXTURES / "source_news.jsonl"
 GOLD = FIXTURES / "gold_manifest.yaml"
+
+
+def test_model_schema_version_literal_matches_the_published_schema_version():
+    result = ModelNewsExtraction.model_validate(
+        {
+            "schema_version": MODEL_EXTRACTION_SCHEMA_VERSION,
+            "disposition": "uncertain",
+            "uncertainty_reason": "test",
+        }
+    )
+
+    assert result.schema_version == "1.1.0"
+
+
+def _document_payload(messages) -> dict:
+    """Find the document payload message; a repair retry appends other messages after it."""
+
+    for message in messages:
+        try:
+            candidate = json.loads(message.content)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(candidate, dict) and "source_document_id" in candidate:
+            return candidate
+    raise AssertionError("no document payload message found")
 
 
 class ScriptedGateway:
@@ -38,7 +69,7 @@ class ScriptedGateway:
     def invoke_structured(self, *, messages, schema):
         self.calls += 1
         self.last_messages = messages
-        payload = json.loads(messages[-1].content)
+        payload = _document_payload(messages)
         return schema.model_validate(self.outputs[payload["source_document_id"]])
 
 
@@ -47,9 +78,31 @@ class FailingGateway:
 
     def __init__(self, error: Exception) -> None:
         self.error = error
+        self.calls = 0
 
     def invoke_structured(self, *, messages, schema):
+        self.calls += 1
         raise self.error
+
+
+class RepairGateway:
+    """Fail the first call with a schema error, then honor the corrected retry."""
+
+    model_name = "repair-news-model"
+
+    def __init__(self, error: Exception, good_output: dict, *, always_fail: bool = False) -> None:
+        self.error = error
+        self.good_output = good_output
+        self.always_fail = always_fail
+        self.calls = 0
+        self.received_error_feedback = False
+
+    def invoke_structured(self, *, messages, schema):
+        self.calls += 1
+        if self.calls == 1 or self.always_fail:
+            raise self.error
+        self.received_error_feedback = any("校验错误" in message.content for message in messages)
+        return schema.model_validate(self.good_output)
 
 
 def _claims(text_field: str, quote: str, *field_names: str) -> list[dict]:
@@ -100,6 +153,14 @@ def _candidate(
     if effective_end_at is not None:
         evidence.extend(_claims(text_field, quote, "effective_end_at"))
     evidence.extend(extra_evidence or [])
+    # The model wire shape carries an instant only at instant/hour precision; the local code
+    # builds the datetime. The helper keeps the old kwargs and adapts to that nested shape.
+    event_instant = (
+        {"iso": effective_start_at, "basis": time_basis} if effective_start_at is not None else None
+    )
+    event_end_instant = (
+        {"iso": effective_end_at, "basis": time_basis} if effective_end_at is not None else None
+    )
     return {
         "relevance": relevance,
         "event_type": event_type,
@@ -108,9 +169,8 @@ def _candidate(
         "affected_regions": regions or [],
         "affected_assets": assets or [],
         "quantity": quantity,
-        "effective_start_at": effective_start_at,
-        "effective_end_at": effective_end_at,
-        "time_basis": time_basis,
+        "event_instant": event_instant,
+        "event_end_instant": event_end_instant,
         "time_precision": time_precision,
         "time_text": time_text,
         "confidence": 0.99,
@@ -387,6 +447,7 @@ def test_scripted_structured_model_qualifies_on_the_real_source_development_set(
         extractor_factory=lambda timezone: StructuredNewsEventExtractor(
             gateway,
             market_timezone=timezone,
+        extraction_passes=1,
         ),
     )
 
@@ -407,7 +468,7 @@ def test_exact_event_preserves_quantity_time_evidence_and_reproducibility_trace(
     )
     document = NewsNormalizer().normalize(record)
     gateway = ScriptedGateway(_real_source_outputs())
-    extractor = StructuredNewsEventExtractor(gateway, market_timezone="Australia/Brisbane")
+    extractor = StructuredNewsEventExtractor(gateway, market_timezone="Australia/Brisbane", extraction_passes=1)
 
     result = extractor.extract(document)
     event = result.events[0]
@@ -449,6 +510,7 @@ def test_model_evidence_must_be_an_exact_source_substring() -> None:
     result = StructuredNewsEventExtractor(
         ScriptedGateway(outputs),
         market_timezone="Australia/Brisbane",
+        extraction_passes=1,
     ).extract(document)
 
     assert result.events == ()
@@ -464,11 +526,16 @@ def test_stated_time_components_must_use_the_market_offset() -> None:
     )
     document = NewsNormalizer().normalize(record)
     outputs = _real_source_outputs()
-    outputs[record.source_document_id]["events"][0]["effective_start_at"] = "2013-12-23T08:56:00Z"
+    # A stated-components time that uses UTC instead of the Brisbane offset must be caught.
+    outputs[record.source_document_id]["events"][0]["event_instant"] = {
+        "iso": "2013-12-23T08:56:00Z",
+        "basis": "stated_components",
+    }
 
     result = StructuredNewsEventExtractor(
         ScriptedGateway(outputs),
         market_timezone="Australia/Brisbane",
+        extraction_passes=1,
     ).extract(document)
 
     assert result.events == ()
@@ -509,6 +576,7 @@ def test_quantity_levels_remain_out_of_backward_compatible_capacity_feature() ->
     event = StructuredNewsEventExtractor(
         ScriptedGateway(outputs),
         market_timezone="UTC",
+        extraction_passes=1,
     ).extract(document).events[0]
 
     assert event.magnitude is not None
@@ -547,7 +615,7 @@ def test_sibling_events_are_not_merged_and_model_is_not_called_twice_for_evidenc
         }
     }
     gateway = ScriptedGateway(outputs)
-    extractor = StructuredNewsEventExtractor(gateway, market_timezone="UTC")
+    extractor = StructuredNewsEventExtractor(gateway, market_timezone="UTC", extraction_passes=1)
     store = NewsVersionStore((document,))
 
     view = AsOfEventAssembler(store, extractor=extractor).view_at(
@@ -567,19 +635,154 @@ def test_sibling_events_are_not_merged_and_model_is_not_called_twice_for_evidenc
     }
 
 
-def test_model_gateway_failures_are_quarantined_by_failure_class() -> None:
+def test_a_bad_model_response_quarantines_one_document_without_crashing_the_batch() -> None:
     document = _document(source_id="failure", title="Unit event", body="Unit event body")
 
-    invalid = StructuredNewsEventExtractor(
+    # A response the model produced but that cannot be used for THIS document is a per-document
+    # problem: quarantine it and let the batch continue, the same way the rule extractor does.
+    result = StructuredNewsEventExtractor(
         FailingGateway(ModelResponseError("bad schema")),
         market_timezone="UTC",
     ).extract(document)
-    unavailable = StructuredNewsEventExtractor(
-        FailingGateway(ModelGatewayError("offline")),
-        market_timezone="UTC",
+    assert result.events == ()
+    assert result.quarantine is not None
+    assert result.quarantine.reason_code == "model_response_invalid"
+
+    # A broken endpoint is global, not this document's fault, so it still fails closed.
+    with pytest.raises(ModelGatewayError, match="offline"):
+        StructuredNewsEventExtractor(
+            FailingGateway(ModelGatewayError("offline")),
+            market_timezone="UTC",
+        ).extract(document)
+
+
+def _good_single_event_output() -> dict:
+    return {
+        "disposition": "event",
+        "events": [
+            _candidate(
+                event_type="generation_outage",
+                relevance="short_term",
+                status="occurred",
+                physical_effect="supply_down",
+                text_field="body",
+                quote="Unit A tripped at 2026-08-30T01:00:00Z.",
+                assets=["Unit A"],
+                effective_start_at="2026-08-30T01:00:00Z",
+                time_basis="stated_absolute",
+                time_precision="instant",
+                time_text="2026-08-30T01:00:00Z",
+            )
+        ],
+    }
+
+
+def test_a_schema_failure_is_repaired_by_feeding_the_error_back() -> None:
+    document = _document(
+        source_id="repair", title="Unit event", body="Unit A tripped at 2026-08-30T01:00:00Z."
+    )
+    gateway = RepairGateway(
+        ModelResponseError("events.0.quantity.unit Input should be 'MW' [input_value='台机组']"),
+        _good_single_event_output(),
+    )
+
+    # Default max_repair_attempts=1: the first parse fails, the error is fed back, the
+    # corrected retry succeeds.
+    result = StructuredNewsEventExtractor(gateway, market_timezone="UTC", extraction_passes=1).extract(document)
+
+    assert gateway.calls == 2
+    assert gateway.received_error_feedback, "第二次调用必须带上一次的校验错误"
+    assert result.quarantine is None
+    assert len(result.events) == 1
+
+
+def test_repair_is_bounded_and_can_be_disabled() -> None:
+    document = _document(source_id="norepair", title="Unit event", body="Unit A tripped.")
+
+    # Disabled: one call, straight to quarantine.
+    off = RepairGateway(ModelResponseError("bad schema"), _good_single_event_output())
+    off_result = StructuredNewsEventExtractor(
+        off, market_timezone="UTC", max_repair_attempts=0, extraction_passes=1
+    ).extract(document)
+    assert off.calls == 1
+    assert off_result.quarantine is not None
+
+    # Persistently failing: bounded to 1 retry (two calls total), then quarantine.
+    stubborn = RepairGateway(
+        ModelResponseError("bad schema"), _good_single_event_output(), always_fail=True
+    )
+    stubborn_result = StructuredNewsEventExtractor(
+        stubborn, market_timezone="UTC", max_repair_attempts=1, extraction_passes=1
+    ).extract(document)
+    assert stubborn.calls == 2
+    assert stubborn_result.quarantine is not None
+    assert stubborn_result.quarantine.reason_code == "model_response_invalid"
+
+    with pytest.raises(ValueError, match="max_repair_attempts"):
+        StructuredNewsEventExtractor(off, market_timezone="UTC", max_repair_attempts=-1)
+
+
+def test_a_long_validation_error_is_clipped_instead_of_crashing_the_quarantine() -> None:
+    """A multi-error schema failure must not exceed the quarantine message cap and crash."""
+
+    document = _document(source_id="verbose", title="Unit event", body="Unit event body")
+    gateway = FailingGateway(ModelResponseError("字段错误 " * 4000))
+
+    result = StructuredNewsEventExtractor(
+        gateway, market_timezone="UTC", max_repair_attempts=0
     ).extract(document)
 
-    assert invalid.quarantine is not None
-    assert invalid.quarantine.reason_code == "model_response_invalid"
-    assert unavailable.quarantine is not None
-    assert unavailable.quarantine.reason_code == "model_unavailable"
+    assert result.quarantine is not None
+    assert result.quarantine.reason_code == "model_response_invalid"
+    assert len(result.quarantine.message) <= 2048
+
+
+def test_one_unusable_response_does_not_discard_the_usable_ones() -> None:
+    good = _document(source_id="good", title="Unit event", body="Unit A tripped at 2026-08-30T01:00:00Z.")
+    bad = _document(source_id="bad", title="Unit event", body="Unit event body")
+
+    class MixedGateway:
+        model_name = "mixed-news-model"
+
+        def invoke_structured(self, *, messages, schema):
+            payload = _document_payload(messages)
+            if payload["source_document_id"] == "bad":
+                raise ModelResponseError("bad schema for one document")
+            return schema.model_validate(
+                {
+                    "disposition": "event",
+                    "events": [
+                        _candidate(
+                            event_type="generation_outage",
+                            relevance="short_term",
+                            status="occurred",
+                            physical_effect="supply_down",
+                            text_field="body",
+                            quote="Unit A tripped at 2026-08-30T01:00:00Z.",
+                            assets=["Unit A"],
+                            effective_start_at="2026-08-30T01:00:00Z",
+                            time_basis="stated_absolute",
+                            time_precision="instant",
+                            time_text="2026-08-30T01:00:00Z",
+                        )
+                    ],
+                }
+            )
+
+    batch = StructuredNewsEventExtractor(MixedGateway(), market_timezone="UTC").extract_many((good, bad))
+
+    assert len(batch.results) == 2
+    assert len(batch.events) == 1
+    assert len(batch.quarantined) == 1
+    assert batch.quarantined[0].reason_code == "model_response_invalid"
+
+
+def test_unexpected_programming_error_is_not_hidden_as_quarantine() -> None:
+    document = _document(source_id="bug", title="Unit event", body="Unit event body")
+    extractor = StructuredNewsEventExtractor(
+        FailingGateway(TypeError("programming bug")),
+        market_timezone="UTC",
+    )
+
+    with pytest.raises(TypeError, match="programming bug"):
+        extractor.extract(document)

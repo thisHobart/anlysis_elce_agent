@@ -18,13 +18,29 @@ def runtime_env_file() -> Path:
 class Settings(BaseSettings):
     """Runtime configuration loaded from environment variables."""
 
-    llm_provider: Literal["deepseek", "qwen", "custom"] = "custom"
-    """Explicit request dialect; old configurations deliberately default to custom."""
+    llm_provider: Literal["deepseek", "qwen", "gemini", "custom"] = "custom"
+    """Explicit provider adapter; old configurations deliberately default to custom."""
     llm_api_style: Literal["chat", "responses"] = "chat"
     """OpenAI-compatible endpoint family used by the configured provider."""
+    llm_structured_output_method: Literal[
+        "function_calling",
+        "json_schema",
+        "json_mode",
+        "prompt_json",
+    ] = "function_calling"
+    """Native structured-output protocol used by OpenAI-compatible adapters.
+
+    ``prompt_json`` is an explicit compatibility mode for proxies such as Cherry Studio:
+    the schema is included in a system message and enforced locally after generation.
+    The native Gemini adapter always uses Gemini ``json_schema`` and ignores this switch.
+    """
     llm_base_url: str = ""
     llm_api_key: SecretStr = SecretStr("")
     llm_model: str = ""
+    llm_google_vertexai: bool = False
+    """Use Vertex AI rather than the Gemini Developer API in the native Gemini adapter."""
+    llm_google_project: str = ""
+    llm_google_location: str = ""
     llm_reasoning_effort: Literal[
         "", "none", "minimal", "low", "medium", "high", "xhigh", "max"
     ] = ""

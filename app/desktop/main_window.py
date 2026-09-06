@@ -68,13 +68,21 @@ class MainWindow(QMainWindow):
 
     def _refresh_model_status(self) -> None:
         settings = get_settings()
-        if settings.llm_base_url and settings.llm_model:
+        configured = bool(settings.llm_model) and (
+            settings.llm_provider == "gemini" or bool(settings.llm_base_url)
+        )
+        if configured:
             provider = {
                 "deepseek": "DeepSeek",
                 "qwen": "Qwen",
+                "gemini": "Gemini 原生",
                 "custom": "自定义",
             }[settings.llm_provider]
-            api_style = "Responses" if settings.llm_api_style == "responses" else "Chat"
+            api_style = (
+                "Gemini API"
+                if settings.llm_provider == "gemini"
+                else ("Responses" if settings.llm_api_style == "responses" else "Chat")
+            )
             self.model_status.setText(f"模型：{provider} · {api_style} · {settings.llm_model}")
         else:
             self.model_status.setText("模型：未配置（研究规划不可用）")

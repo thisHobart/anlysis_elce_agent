@@ -9,9 +9,11 @@ from app.llm.gateway import (
     ModelProtocolError,
     ModelResponseError,
 )
+from app.llm.gemini import GeminiModelGateway
 from app.llm.openai_compatible import ResearchModelGateway
 
 __all__ = [
+    "GeminiModelGateway",
     "ModelConfigurationError",
     "ModelGateway",
     "ModelGatewayError",

@@ -89,8 +89,8 @@ def merge_event_records(
         lineage_key = (
             document.document_id,
             record.event_type,
-            record.affected_assets,
-            record.affected_regions,
+            record.asset_keys,
+            record.region_keys,
         )
         lineage_owner = by_lineage.setdefault(lineage_key, index)
         union(index, event_owner)

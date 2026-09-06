@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.research.news.entities import split_entity_keys
+
 NewsRelevance = Literal["short_term", "long_horizon", "irrelevant"]
 NewsEventType = Literal[
     "generation_outage",
@@ -56,8 +58,10 @@ QuantitySemantic = Literal[
 QuantityDirection = Literal["increase", "decrease", "mixed", "unknown"]
 QuarantineReason = Literal[
     "ambiguous_multi_event",
+    "disputed_irrelevance",
     "ambiguous_event_time",
     "ambiguous_quantity",
+    "inconsistent_extraction",
     "invalid_evidence",
     "market_mismatch",
     "missing_effective_start",
@@ -315,6 +319,17 @@ class EventRecord(BaseModel):
                 raise ValueError("level or unknown quantities must not populate capacity_mw")
         return self
 
+    # The stored fields keep the source wording so evidence stays verbatim; these keys are
+    # what identity, merging and scoring compare, so one grid written two ways — or filed
+    # under regions on one run and assets on the next — stays one event.
+    @property
+    def region_keys(self) -> tuple[str, ...]:
+        return split_entity_keys(self.affected_regions, self.affected_assets)[0]
+
+    @property
+    def asset_keys(self) -> tuple[str, ...]:
+        return split_entity_keys(self.affected_regions, self.affected_assets)[1]
+
 
 class ExtractionQuarantine(BaseModel):
     """Why one document produced no event; it must not silently reach the event table."""
@@ -421,6 +436,14 @@ class MergedEvent(BaseModel):
         if aware.utcoffset().total_seconds() != 0:
             raise ValueError(f"{info.field_name} must be normalized to UTC")
         return aware
+
+    @property
+    def region_keys(self) -> tuple[str, ...]:
+        return split_entity_keys(self.affected_regions, self.affected_assets)[0]
+
+    @property
+    def asset_keys(self) -> tuple[str, ...]:
+        return split_entity_keys(self.affected_regions, self.affected_assets)[1]
 
     @model_validator(mode="after")
     def validate_merge_is_leak_free(self) -> MergedEvent:

@@ -25,6 +25,7 @@ from app.research.news.contracts import (
     QuarantineReason,
     TimeResolution,
 )
+from app.research.news.entities import entity_identity
 
 EXTRACTOR_ID = "obvious-news-rule-baseline"
 EXTRACTOR_VERSION = "1.1.0"
@@ -349,8 +350,7 @@ class ObviousNewsEventExtractor:
             )
 
         identity = {
-            "affected_assets": assets,
-            "affected_regions": regions,
+            **entity_identity(regions, assets),
             "effective_start_at": effective_start_at.isoformat() if effective_start_at is not None else None,
             "event_type": rule.event_type,
         }

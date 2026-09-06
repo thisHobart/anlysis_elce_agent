@@ -91,6 +91,11 @@ def test_benchmark_accepts_a_gold_faithful_extractor(records, manifest) -> None:
     assert report.unknown_rate == 0.0
     assert report.full_case_accuracy == 1.0
     assert report.failed_checks == ()
+    assert all(
+        case.quarantine_message
+        for case in report.cases
+        if case.actual_disposition == "quarantine"
+    )
 
 
 class _GoldExtractor:

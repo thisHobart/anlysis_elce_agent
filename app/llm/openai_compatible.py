@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from typing import Any
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from app.config import Settings, get_settings
 from app.llm import compat
@@ -19,122 +20,46 @@ from app.llm.gateway import (
     ModelToolCall,
     StructuredResult,
 )
+from app.llm.langchain_support import (
+    normalized_calls,
+    reject_nonempty_thinking,
+    response_metadata,
+    response_text,
+    tool_names,
+    transport_messages,
+    visible_text,
+)
 
 
-def _response_text(response: Any) -> str:
-    """Return visible text blocks without treating reasoning blocks as answers."""
+def _prompt_json_messages(
+    messages: list[ModelMessage],
+    schema: type[StructuredResult],
+) -> list[ModelMessage]:
+    """Add the exact response contract for proxies that discard API-level schemas."""
 
-    content = getattr(response, "content", response)
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            block_type = str(item.get("type", "")).casefold()
-            if block_type in {"reasoning", "thinking"}:
-                continue
-            value = item.get("text") or item.get("content")
-            if value:
-                parts.append(str(value))
-        return "".join(parts).strip()
-    return str(content).strip()
-
-
-def _reasoning_text(response: Any) -> str:
-    """Read common provider reasoning fields without retaining the raw response."""
-
-    direct = getattr(response, "reasoning_content", None)
-    if direct:
-        return str(direct).strip()
-    additional = getattr(response, "additional_kwargs", None)
-    if isinstance(additional, dict):
-        for key in ("reasoning_content", "reasoning"):
-            value = additional.get(key)
-            if value:
-                return str(value).strip()
-    content = getattr(response, "content", None)
-    if isinstance(content, list):
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            block_type = str(item.get("type", "")).casefold()
-            if block_type in {"reasoning", "thinking"}:
-                value = item.get("text") or item.get("content")
-                if value:
-                    return str(value).strip()
-    return ""
-
-
-def _reject_nonempty_thinking(response: Any) -> None:
-    """Fail closed when a provider still emits a reasoning trace."""
-
-    if _reasoning_text(response):
-        raise ModelThinkingError("模型仍返回 reasoning_content，思考模式禁用失败。")
-    if compat.thinking_fragments(_response_text(response)):
-        raise ModelThinkingError("模型仍返回非空 <think> 内容，思考模式禁用失败。")
-
-
-def _visible_text(response: Any) -> str:
-    """Return the answer with any inline reasoning trace removed."""
-
-    return compat.strip_thinking(_response_text(response))
-
-
-def _normalized_calls(raw_calls: Any) -> list[ModelToolCall]:
-    """Normalize native function calls while preserving their provider call id."""
-
-    return [
-        ModelToolCall(
-            name=str(item.get("name", "")),
-            arguments=item.get("args") or item.get("arguments") or {},
-            call_id=str(item.get("id")) if item.get("id") else None,
-        )
-        for item in (raw_calls or [])
-        if isinstance(item, dict)
-    ]
-
-
-def _tool_names(tools: list[dict[str, Any]]) -> set[str]:
-    names: set[str] = set()
-    for tool in tools:
-        function = tool.get("function", tool)
-        if isinstance(function, dict) and function.get("name"):
-            names.add(str(function["name"]))
-    return names
-
-
-def _transport_messages(messages: list[ModelMessage]) -> list[Any]:
-    """Convert the Agent's canonical roles to LangChain's typed messages.
-
-    ChatOpenAI owns the final Chat Completions or Responses wire encoding. Tuples
-    and provider-shaped dictionaries are rejected here so API dialect details do
-    not leak back into the research Agent.
-    """
-
-    try:
-        from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-    except ImportError as exc:  # pragma: no cover - installed with langchain-openai
-        raise ModelConfigurationError("langchain-core 尚未安装。") from exc
-
-    converted: list[Any] = []
-    for message in messages:
-        if not isinstance(message, ModelMessage):
-            raise ModelConfigurationError("研究 Agent 消息必须使用 ModelMessage 协议。")
+    schema_json = json.dumps(
+        schema.model_json_schema(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    instruction = (
+        "\n\n[结构化输出兼容协议]\n"
+        "上游代理不会传递原生 response schema。你必须只返回一个符合下列 JSON Schema 的"
+        "JSON 对象，不要返回 Markdown、代码围栏、解释或额外字段。字段名、嵌套层级、枚举值和"
+        "必填项必须完全一致；无法确定业务事实时使用 schema 允许的 uncertain 形式，不得编造。\n"
+        f"JSON Schema：{schema_json}"
+    )
+    prepared = list(messages)
+    for index, message in enumerate(prepared):
         if message.role == "system":
-            converted.append(SystemMessage(content=message.content))
-        elif message.role == "user":
-            converted.append(HumanMessage(content=message.content))
-        elif message.role == "assistant":
-            converted.append(AIMessage(content=message.content))
-        else:
-            converted.append(
-                ToolMessage(content=message.content, tool_call_id=message.tool_call_id or "")
+            prepared[index] = message.model_copy(
+                update={"content": f"{message.content}{instruction}"}
             )
-    return converted
+            break
+    else:
+        prepared.insert(0, ModelMessage(role="system", content=instruction.lstrip()))
+    return prepared
 
 
 class ResearchModelGateway:
@@ -146,11 +71,49 @@ class ResearchModelGateway:
     an endpoint explicitly rejects them.
     """
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        structured_output_observer: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         self.settings = settings or get_settings()
         self._model: Any | None = None
         self._http_client: Any | None = None
         self._disabled: set[str] = set()
+        self._structured_output_observer = structured_output_observer
+
+    def _observe_structured_output(
+        self,
+        raw: Any,
+        parsed: object,
+        parsing_error: object,
+    ) -> None:
+        """Expose function arguments only when a caller explicitly requests diagnostics."""
+
+        if self._structured_output_observer is None:
+            return
+        calls = normalized_calls(getattr(raw, "tool_calls", None))
+        self._structured_output_observer(
+            {
+                "provider": self.settings.llm_provider,
+                "transport": "openai_compatible",
+                "model": self.model_name,
+                "structured_output_method": self.settings.llm_structured_output_method,
+                "schema_enforcement": (
+                    "local" if self.settings.llm_structured_output_method == "prompt_json" else "provider"
+                ),
+                "raw_content": response_text(raw),
+                "tool_calls": [call.model_dump(mode="json") for call in calls],
+                "parsed": (
+                    parsed.model_dump(mode="json")
+                    if isinstance(parsed, BaseModel)
+                    else parsed
+                ),
+                "parsing_error": str(parsing_error) if parsing_error is not None else None,
+                "response_metadata": response_metadata(raw),
+            }
+        )
 
     @property
     def enabled(self) -> bool:
@@ -264,7 +227,8 @@ class ResearchModelGateway:
         )
         return ModelProtocolError(
             f"当前模型端点不支持研究 Agent 必需的原生{capability}协议（{profile}）：{detail}。"
-            "请确认 API 形式和模型能力；系统不会用提示词 JSON 模拟该协议。"
+            "请确认 API 形式和模型能力；只有显式配置 prompt_json 时才允许使用"
+            "提示词约束 JSON，并继续执行本地严格校验。"
         )
 
     def invoke_structured(
@@ -273,13 +237,19 @@ class ResearchModelGateway:
         messages: list[ModelMessage],
         schema: type[StructuredResult],
     ) -> StructuredResult:
-        """Request one schema-validated native function call; never parse prose as JSON."""
+        """Request structured output and validate every result against the local schema."""
 
-        prepared = _transport_messages(messages)
+        method = self.settings.llm_structured_output_method
+        compatibility_mode = method == "prompt_json"
+        request_messages = (
+            _prompt_json_messages(messages, schema) if compatibility_mode else messages
+        )
+        prepared = transport_messages(request_messages)
+        wire_method = "json_mode" if compatibility_mode else method
         try:
             result = self._degrade(
                 lambda: self._get_model()
-                .with_structured_output(schema, method="function_calling", include_raw=True)
+                .with_structured_output(schema, method=wire_method, include_raw=True)
                 .invoke(prepared),
                 allowed=self._degradable_client_features(),
             )
@@ -290,12 +260,38 @@ class ResearchModelGateway:
                 raise ModelResponseError("大模型结构化输出缺少 raw，无法验证协议。")
             self._guard_thinking(raw)
             parsed = result.get("parsed")
+            parsing_error = result.get("parsing_error")
+            if parsing_error is not None:
+                calls = normalized_calls(getattr(raw, "tool_calls", None))
+                print("[结构化模型] Schema 解析失败，模型原始输出：")
+                if calls:
+                    print(
+                        json.dumps(
+                            [call.model_dump(mode="json") for call in calls],
+                            ensure_ascii=False,
+                            indent=2,
+                            default=str,
+                        )
+                    )
+                else:
+                    print(response_text(raw) or "<empty>")
+                print("[结构化模型] Schema 校验错误：")
+                print(str(parsing_error))
+            self._observe_structured_output(raw, parsed, parsing_error)
             if parsed is not None:
                 return parsed if isinstance(parsed, schema) else schema.model_validate(parsed)
-            parsing_error = result.get("parsing_error")
             if getattr(raw, "tool_calls", None):
                 raise ModelResponseError(f"大模型函数参数不符合结构化 schema：{parsing_error}")
-            raise self._protocol_error("结构化输出/Function Calling", parsing_error or "未返回函数调用")
+            if compatibility_mode:
+                raise ModelResponseError(
+                    f"Cherry 兼容 JSON 未通过本地结构化 schema：{parsing_error or 'parsed 为空'}"
+                )
+            raise self._protocol_error(
+                f"结构化输出（method={method}）",
+                parsing_error
+                or f"未返回可解析的结构化结果；该端点可能不支持 {method}，可用 "
+                "scripts/probe_structured_output.py 探测其支持的原生方法",
+            )
         except (ModelConfigurationError, ModelThinkingError, ModelResponseError):
             raise
         except (ValidationError, ValueError, TypeError, AttributeError) as exc:
@@ -306,14 +302,14 @@ class ResearchModelGateway:
             raise ModelGatewayError(f"大模型调用失败：{type(exc).__name__}: {exc}") from exc
 
     def invoke_text(self, *, messages: list[ModelMessage]) -> str:
-        prepared = _transport_messages(messages)
+        prepared = transport_messages(messages)
         try:
             response = self._degrade(
                 lambda: self._get_model().invoke(prepared),
                 allowed=self._degradable_client_features(),
             )
             self._guard_thinking(response)
-            answer = _visible_text(response)
+            answer = visible_text(response)
         except ModelGatewayError:
             raise
         except Exception as exc:
@@ -332,10 +328,10 @@ class ResearchModelGateway:
 
         if not tools:
             raise ModelConfigurationError("没有可提供给大模型的研究函数。")
-        allowed_names = _tool_names(tools)
+        allowed_names = tool_names(tools)
         if not allowed_names:
             raise ModelConfigurationError("研究函数定义缺少 name。")
-        prepared = _transport_messages(messages)
+        prepared = transport_messages(messages)
         try:
             response = self._degrade(
                 lambda: self._bound_tools(tools).invoke(prepared),
@@ -345,7 +341,7 @@ class ResearchModelGateway:
                 ),
             )
             self._guard_thinking(response)
-            calls = _normalized_calls(getattr(response, "tool_calls", None))
+            calls = normalized_calls(getattr(response, "tool_calls", None))
         except (ModelConfigurationError, ModelThinkingError):
             raise
         except ValidationError as exc:
@@ -371,4 +367,4 @@ class ResearchModelGateway:
         """Apply the configured reasoning policy; ``strip`` simply discards the trace."""
 
         if self.settings.llm_thinking_policy == "reject":
-            _reject_nonempty_thinking(response)
+            reject_nonempty_thinking(response)

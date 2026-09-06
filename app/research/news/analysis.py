@@ -138,6 +138,9 @@ class AnalysisResult:
     excluded_events: tuple[tuple[str, str], ...] = ()
     price_hash: str = ""
     event_hash: str = ""
+    # Kept out of `content_hash()` on purpose: this one is allowed to change when the
+    # conclusion did not. See `_provenance_hash`.
+    provenance_hash: str = ""
     notes: tuple[str, ...] = field(default_factory=tuple)
 
     def for_event(self, event_id: str) -> tuple[EventWindowResult, ...]:
@@ -529,6 +532,7 @@ class EventPriceAnalyzer:
             excluded_events=tuple(excluded),
             price_hash=prices.content_hash(),
             event_hash=_event_hash(events),
+            provenance_hash=_provenance_hash(events),
             notes=(
                 f"零点时间轴：{axis}；窗口在事件零点之后前视，绝不回看。",
                 "价格可能为零或负，因此只使用绝对差值，不使用对数收益或 MAPE。",
@@ -561,13 +565,28 @@ class EventPriceAnalyzer:
         return tuple(deviations)
 
 
+def _digest(rows: list[dict[str, object]]) -> str:
+    payload = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _event_hash(events: Sequence[MergedEvent]) -> str:
+    """What was concluded, in a form that survives re-extraction of the same documents.
+
+    Two things are deliberately kept out. `extraction_traces`, because `output_hash` digests
+    the model's raw structured output and the configured endpoint is not reproducible even at
+    temperature 0 — 9 of 10 holdout documents hashed differently on every run. Folding that in
+    made this value change on every re-extraction of a byte-identical conclusion, defeating the
+    one question it exists to answer. And the raw entity wording, because the same grid arrives
+    as 辽宁 on one run and 辽宁电网 on the next; canonical keys say what the identity layer
+    already says. Provenance is not discarded — it moves to `_provenance_hash`.
+    """
+
     rows = sorted(
         (
             {
-                "affected_assets": event.affected_assets,
-                "affected_regions": event.affected_regions,
                 "announcement_available_at": event.announcement_available_at.isoformat(),
+                "asset_keys": list(event.asset_keys),
                 "capacity_mw": event.capacity_mw,
                 "direction": event.direction,
                 "effective_end_at": (
@@ -578,21 +597,41 @@ def _event_hash(events: Sequence[MergedEvent]) -> str:
                 ),
                 "event_id": event.event_id,
                 "event_type": event.event_type,
-                "extraction_traces": [
-                    trace.model_dump(mode="json") for trace in event.extraction_traces
-                ],
                 "magnitude": (
                     event.magnitude.model_dump(mode="json") if event.magnitude is not None else None
                 ),
                 "physical_effect": event.physical_effect,
+                "region_keys": list(event.region_keys),
                 "relevance": event.relevance,
                 "source_content_hashes": [ref.content_hash for ref in event.document_refs],
-                "source_event_ids": event.source_event_ids,
+                "source_event_ids": list(event.source_event_ids),
                 "status": event.status,
             }
             for event in events
         ),
         key=lambda item: item["event_id"],
     )
-    payload = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    return _digest(rows)
+
+
+def _provenance_hash(events: Sequence[MergedEvent]) -> str:
+    """How the conclusion was produced: model, prompt and schema versions, and raw output.
+
+    This value is *expected* to move whenever the model does, including between two runs that
+    concluded exactly the same thing. Keeping it separate is what lets `_event_hash` hold still.
+    """
+
+    rows = sorted(
+        (
+            {
+                "event_id": event.event_id,
+                "extraction_traces": [
+                    trace.model_dump(mode="json") for trace in event.extraction_traces
+                ],
+                "source_content_hashes": [ref.content_hash for ref in event.document_refs],
+            }
+            for event in events
+        ),
+        key=lambda item: item["event_id"],
+    )
+    return _digest(rows)

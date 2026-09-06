@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 
 import pytest
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel
 
 from app.config import Settings
@@ -120,6 +120,102 @@ def test_structured_output_uses_native_function_calling_and_typed_messages():
     assert model.method == "function_calling"
     assert model.include_raw is True
     assert isinstance(model.last_messages[0], HumanMessage)
+
+
+def test_structured_output_method_follows_the_configured_native_protocol():
+    """A Gemini/Claude endpoint reached via an OpenAI-compatible proxy can select json_schema."""
+
+    gateway = ResearchModelGateway(_settings(llm_structured_output_method="json_schema"))
+    model = RecordingModel()
+    gateway._model = model
+
+    result = gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
+
+    assert result.value == "ok"
+    assert model.method == "json_schema"
+
+
+def test_structured_output_observer_receives_function_arguments_without_reasoning():
+    observed = []
+    gateway = ResearchModelGateway(
+        _settings(),
+        structured_output_observer=observed.append,
+    )
+    model = RecordingModel(reasoning_content="private reasoning")
+    gateway._model = model
+
+    result = gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
+
+    assert result.value == "ok"
+    assert observed == [
+        {
+            "provider": "custom",
+            "transport": "openai_compatible",
+            "model": "test-model",
+            "structured_output_method": "function_calling",
+            "schema_enforcement": "provider",
+            "raw_content": "",
+            "tool_calls": [
+                {
+                    "name": "price_descriptive_distribution",
+                    "arguments": {},
+                    "call_id": "call-1",
+                }
+            ],
+            "parsed": {"value": "ok"},
+            "parsing_error": None,
+            "response_metadata": {},
+        }
+    ]
+    assert "private reasoning" not in str(observed)
+
+
+def test_prompt_json_injects_schema_and_uses_json_mode_for_cherry_compatibility():
+    gateway = ResearchModelGateway(
+        _settings(llm_structured_output_method="prompt_json")
+    )
+    model = RecordingModel()
+    gateway._model = model
+
+    result = gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
+
+    assert result.value == "ok"
+    assert model.method == "json_mode"
+    assert isinstance(model.last_messages[0], SystemMessage)
+    assert '"value"' in model.last_messages[0].content
+    assert "不要返回 Markdown" in model.last_messages[0].content
+    assert isinstance(model.last_messages[-1], HumanMessage)
+
+
+def test_prompt_json_schema_failure_is_repairable_response_error_not_protocol_error():
+    class InvalidJsonShapeModel(RecordingModel):
+        def with_structured_output(self, schema, *, method, include_raw):
+            self.method = method
+
+            class Bound:
+                def invoke(_self, messages):
+                    self.last_messages = messages
+                    return {
+                        "raw": SimpleNamespace(
+                            content='{"invented":"field"}',
+                            additional_kwargs={},
+                            tool_calls=[],
+                        ),
+                        "parsed": None,
+                        "parsing_error": "value is required",
+                    }
+
+            return Bound()
+
+    gateway = ResearchModelGateway(
+        _settings(llm_structured_output_method="prompt_json")
+    )
+    model = InvalidJsonShapeModel()
+    gateway._model = model
+
+    with pytest.raises(ModelResponseError, match="Cherry 兼容 JSON"):
+        gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
+    assert model.method == "json_mode"
 
 
 def test_research_function_calls_are_proposed_without_execution():
@@ -255,7 +351,7 @@ def test_structured_output_never_recovers_json_from_prose():
     gateway = ResearchModelGateway(_settings())
     gateway._model = ProseModel()
 
-    with pytest.raises(ModelProtocolError, match="不会用提示词 JSON"):
+    with pytest.raises(ModelProtocolError, match="只有显式配置 prompt_json"):
         gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
 
 

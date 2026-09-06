@@ -25,12 +25,20 @@ from app.config import get_settings, runtime_env_file
 MODEL_PRESETS: tuple[tuple[str, str, str, str], ...] = (
     ("deepseek", "DeepSeek", "https://api.deepseek.com/v1", "deepseek-chat"),
     ("qwen", "Qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
+    ("gemini", "Gemini（原生 API）", "", "gemini-2.5-flash"),
     ("custom", "自定义接口", "", ""),
 )
 
 API_STYLE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("chat", "Chat Completions"),
     ("responses", "Responses"),
+)
+
+STRUCTURED_OUTPUT_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("function_calling", "Function Calling（原生）"),
+    ("json_schema", "JSON Schema（原生）"),
+    ("json_mode", "JSON Object（仅格式）"),
+    ("prompt_json", "Cherry 兼容 JSON（本地校验）"),
 )
 
 
@@ -99,6 +107,19 @@ class ModelConfigDialog(QDialog):
         self.api_style.setCurrentIndex(_option_index(API_STYLE_OPTIONS, settings.llm_api_style))
         self.api_style.setToolTip("必须与服务端实际支持的消息协议一致，不会自动切换。")
 
+        self.structured_method = QComboBox()
+        for method, label in STRUCTURED_OUTPUT_OPTIONS:
+            self.structured_method.addItem(label, method)
+        self.structured_method.setCurrentIndex(
+            _option_index(
+                STRUCTURED_OUTPUT_OPTIONS,
+                settings.llm_structured_output_method,
+            )
+        )
+        self.structured_method.setToolTip(
+            "Cherry 转发 Gemini 时请选择兼容 JSON；结果仍由本地 schema 严格校验。"
+        )
+
         self.base_url = QLineEdit(settings.llm_base_url)
         self.base_url.setClearButtonEnabled(True)
         self.base_url.setPlaceholderText("https://api.example.com/v1")
@@ -120,13 +141,14 @@ class ModelConfigDialog(QDialog):
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         form.addRow("服务商", self.provider)
         form.addRow("API 形式", self.api_style)
+        form.addRow("结构化输出", self.structured_method)
         form.addRow("接口地址", self.base_url)
         form.addRow("API 密钥", api_key_row)
         form.addRow("模型", self.model)
 
         protocol_notice = QLabel(
-            "研究 Agent 要求模型原生支持 Function Calling 和结构化参数。"
-            "接口不兼容时会明确报错，不会用提示词 JSON 代替。"
+            "原生协议优先。Cherry 未转发 Gemini schema 时，可显式选择兼容 JSON；"
+            "程序会把 schema 随提示发送，并在本地严格校验，失败结果不会进入分析。"
         )
         protocol_notice.setObjectName("modelProtocolNotice")
         protocol_notice.setWordWrap(True)
@@ -141,6 +163,7 @@ class ModelConfigDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(protocol_notice)
         layout.addWidget(buttons)
+        self._sync_provider_fields()
 
     @staticmethod
     def _display_api_key(value: str) -> str:
@@ -154,19 +177,45 @@ class ModelConfigDialog(QDialog):
     def _apply_provider_preset(self, index: int) -> None:
         if index < 0 or index >= len(MODEL_PRESETS):
             return
-        _provider, _label, base_url, model = MODEL_PRESETS[index]
-        if not base_url and not model:
-            return
-        self.base_url.setText(base_url)
-        self.model.setText(model)
+        provider, _label, base_url, model = MODEL_PRESETS[index]
+        if provider == "gemini":
+            self.base_url.clear()
+            self.model.setText(model)
+            self.structured_method.setCurrentIndex(
+                self.structured_method.findData("json_schema")
+            )
+        elif provider in {"deepseek", "qwen"}:
+            self.base_url.setText(base_url)
+            self.model.setText(model)
+            self.structured_method.setCurrentIndex(
+                self.structured_method.findData("function_calling")
+            )
+        elif base_url or model:
+            self.base_url.setText(base_url)
+            self.model.setText(model)
+        self._sync_provider_fields()
+
+    def _sync_provider_fields(self) -> None:
+        native_gemini = self.provider.currentData() == "gemini"
+        self.api_style.setEnabled(not native_gemini)
+        self.base_url.setEnabled(not native_gemini)
+        self.structured_method.setEnabled(not native_gemini)
+        self.base_url.setPlaceholderText(
+            "Gemini 原生适配器不经过 OpenAI 代理"
+            if native_gemini
+            else "https://api.example.com/v1"
+        )
 
     def _validate(self) -> str | None:
         base_url = self.base_url.text().strip()
         model = self.model.text().strip()
-        if not base_url:
+        native_gemini = self.provider.currentData() == "gemini"
+        if not native_gemini and not base_url:
             return "必须填写接口地址。"
-        parsed = urlparse(base_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        parsed = urlparse(base_url) if base_url else None
+        if parsed is not None and (
+            parsed.scheme not in {"http", "https"} or not parsed.netloc
+        ):
             return "接口地址必须是完整的 http:// 或 https:// 地址。"
         if not model:
             return "必须填写模型名称。"
@@ -177,11 +226,23 @@ class ModelConfigDialog(QDialog):
         if error:
             QMessageBox.warning(self, "配置不完整", error)
             return
+        provider = self.provider.currentData()
+        if provider == "gemini":
+            structured_output_method = "json_schema"
+        elif provider in {"deepseek", "qwen"}:
+            structured_output_method = "function_calling"
+        else:
+            structured_output_method = self.structured_method.currentData()
         values = {
             "VPP_LLM_ENABLED": "true",
-            "VPP_LLM_PROVIDER": self.provider.currentData(),
-            "VPP_LLM_API_STYLE": self.api_style.currentData(),
-            "VPP_LLM_BASE_URL": self.base_url.text().strip(),
+            "VPP_LLM_PROVIDER": provider,
+            "VPP_LLM_API_STYLE": (
+                "chat" if provider == "gemini" else self.api_style.currentData()
+            ),
+            "VPP_LLM_STRUCTURED_OUTPUT_METHOD": structured_output_method,
+            "VPP_LLM_BASE_URL": (
+                "" if provider == "gemini" else self.base_url.text().strip()
+            ),
             "VPP_LLM_API_KEY": self.api_key.text(),
             "VPP_LLM_MODEL": self.model.text().strip(),
         }

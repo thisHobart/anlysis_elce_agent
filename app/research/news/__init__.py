@@ -67,6 +67,13 @@ from app.research.news.contracts import (
     ReviewStatus,
     TimeResolution,
 )
+from app.research.news.entities import (
+    ENTITY_NORMALIZER_VERSION,
+    canonical_assets,
+    canonical_regions,
+    is_region_mention,
+    split_entity_keys,
+)
 from app.research.news.evidence import (
     DataQualityReport,
     EvidenceChainError,
@@ -113,6 +120,7 @@ from app.research.news.versioning import NewsVersionError, NewsVersionStore, doc
 
 __all__ = [
     "DEFAULT_FOCUS_WINDOW",
+    "ENTITY_NORMALIZER_VERSION",
     "MODEL_EXTRACTION_PROMPT_VERSION",
     "MODEL_EXTRACTION_SCHEMA_VERSION",
     "MODEL_EXTRACTOR_VERSION",
@@ -193,10 +201,13 @@ __all__ = [
     "build_model_news_extraction_messages",
     "build_phase2_goal_input",
     "build_quality_report",
+    "canonical_assets",
+    "canonical_regions",
     "collect_evidence_spans",
     "document_ref",
     "evaluate_phase2_goal_agent",
     "evaluate_result_quality",
+    "is_region_mention",
     "is_usable_at",
     "lead_time_table",
     "load_price_csv",
@@ -207,5 +218,6 @@ __all__ = [
     "run_news_price_study",
     "run_phase2_goal_agent",
     "snapshot_to_csv_rows",
+    "split_entity_keys",
     "zero_point",
 ]

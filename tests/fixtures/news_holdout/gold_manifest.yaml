@@ -1,0 +1,123 @@
+corpus_version: "holdout-2026-09-04"
+retrieved_at: "2026-09-04T09:00:00+08:00"
+purpose: >-
+  盲测集：2026 年 8—9 月新抓取的真实电力新闻，未参与任何 Prompt、schema 或阈值调整。
+  与 news_realistic 开发集互不重叠，用于检验结构化模型抽取器在没见过的措辞上的表现。
+  正文为来源原句的短摘录，仅补回被网页抽取吞掉的句末句号，其余逐字保留（含来源自身的错别字，如"万干瓦"）。
+
+qualification_thresholds:
+  extractable_event_recall: 0.80
+  quarantine_recall: 0.80
+  irrelevant_accuracy: 0.95
+  maximum_unknown_rate: 0.20
+
+records:
+  - corpus_id: R01
+    market_timezone: Asia/Shanghai
+    expected_disposition: event
+    expected_event_types: [demand_shock]
+    expected_relevance: short_term
+    expected_regions: [辽宁]
+    expected_assets: [辽宁电网]
+    expected_capacity_mw: null
+    expected_start_at: "2026-08-03T11:06:00+08:00"
+    gold_reason: 原文自带完整年月日和分钟级时刻，负荷为需求水平值，因此不写入 capacity_mw。
+
+  - corpus_id: R02
+    market_timezone: Asia/Shanghai
+    expected_disposition: event
+    expected_event_types: [demand_shock]
+    expected_relevance: short_term
+    expected_regions: [山东]
+    expected_assets: [山东电网]
+    expected_capacity_mw: null
+    expected_start_at: "2026-08-03T11:19:00+08:00"
+    gold_reason: 正文缺年份但发布时间使 2026 年唯一确定；考察能否只补年份而不伪造时刻。
+
+  - corpus_id: R03
+    market_timezone: Asia/Shanghai
+    expected_disposition: event
+    expected_event_types: [demand_shock]
+    expected_relevance: short_term
+    expected_regions: [天津]
+    expected_assets: [天津电网]
+    expected_capacity_mw: null
+    expected_start_at: "2026-08-03T13:32:00+08:00"
+    gold_reason: 同 R02 的年份补全场景，另用带小数的万千瓦数值考察单位换算不外包给模型。
+
+  - corpus_id: R04
+    market_timezone: Asia/Shanghai
+    expected_disposition: quarantine
+    expected_event_types: [demand_shock]
+    expected_relevance: short_term
+    expected_regions: [江苏]
+    expected_assets: [江苏电网]
+    expected_capacity_mw: null
+    expected_start_at: null
+    gold_reason: 同一篇报道里只有这条缺时刻，只给到日期，不能对齐结算格。
+
+  - corpus_id: R05
+    market_timezone: Asia/Shanghai
+    expected_disposition: quarantine
+    expected_event_types: [demand_shock]
+    expected_relevance: short_term
+    expected_regions: [安徽]
+    expected_assets: []
+    expected_capacity_mw: null
+    expected_start_at: null
+    gold_reason: 一句话含两次破纪录，前一次只有日期后一次有时刻，不能压成一个事件。
+
+  - corpus_id: R06
+    market_timezone: Asia/Shanghai
+    expected_disposition: quarantine
+    expected_event_types: [generation_outage]
+    expected_relevance: short_term
+    expected_regions: [江苏]
+    expected_assets: [国电投常熟电厂6号机组]
+    expected_capacity_mw: null
+    expected_start_at: null
+    gold_reason: 跳闸事实明确但只有日期；同时考察"6号机组"是否被误当成数量 6。
+
+  - corpus_id: R07
+    market_timezone: Asia/Shanghai
+    expected_disposition: quarantine
+    expected_event_types: [generation_outage]
+    expected_relevance: short_term
+    expected_regions: [江苏]
+    expected_assets: [中核田湾核电1号机组]
+    expected_capacity_mw: null
+    expected_start_at: null
+    gold_reason: 与 R06 同结构的第二条，检验同类措辞处理是否一致。
+
+  - corpus_id: R08
+    market_timezone: Asia/Shanghai
+    expected_disposition: quarantine
+    expected_event_types: [generation_outage, unknown]
+    expected_relevance: short_term
+    expected_regions: [江苏]
+    expected_assets: []
+    expected_capacity_mw: null
+    expected_start_at: null
+    gold_reason: 区间累计统计而非单个事件；"100MW及以上"是门槛条件，不是事件量值。
+
+  - corpus_id: R09
+    market_timezone: Asia/Shanghai
+    expected_disposition: quarantine
+    expected_event_types: [demand_shock]
+    expected_relevance: short_term
+    expected_regions: [全国]
+    expected_assets: []
+    expected_capacity_mw: null
+    expected_start_at: null
+    gold_reason: 带条件的前瞻预测，没有发生时刻，不能作为已发生事件进入价格分析。
+
+  - corpus_id: R10
+    market_timezone: Asia/Shanghai
+    expected_disposition: irrelevant
+    expected_event_types: [irrelevant, unknown]
+    expected_relevance: irrelevant
+    expected_regions: []
+    expected_assets: []
+    expected_capacity_mw: null
+    expected_start_at: null
+    gold_reason: 行政许可办件统计，不是电力系统运行事件。

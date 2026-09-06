@@ -16,10 +16,12 @@ import pytest
 import yaml
 
 from app.research.news import (
+    CollectedNewsRecord,
     JsonlCollectedNewsAdapter,
     MarketClock,
     NewsNormalizer,
     ObviousNewsEventExtractor,
+    StructuredNewsEventExtractor,
     is_usable_at,
     lead_time_table,
     load_price_csv,
@@ -501,13 +503,17 @@ def test_question_6_the_package_carries_method_version_and_input_output_hashes(e
     package = effective_study.package
     fingerprint = package.fingerprint()
 
-    assert set(fingerprint) == {
+    # Two separate questions, so two separate fingerprints: "did the conclusion change?"
+    # and "was it produced the same way?". Only the second may move on a re-extraction.
+    assert set(package.conclusion_fingerprint()) == {
         "analysis_hash",
         "event_hash",
         "feature_hash",
         "package_hash",
         "price_hash",
     }
+    assert set(package.provenance_fingerprint()) == {"provenance_hash"}
+    assert set(fingerprint) == set(package.conclusion_fingerprint()) | {"provenance_hash"}
     assert all(len(value) == 64 for value in fingerprint.values())
 
     method = package.analysis.method
@@ -595,3 +601,131 @@ def test_question_6_the_report_names_every_event_and_every_quarantined_document(
     # The quarantined document contributed no event, and the fingerprint reflects its presence.
     assert len(with_quarantine.view.events) == len(effective_study.view.events)
     assert with_quarantine.package.fingerprint() != package.fingerprint()
+
+
+# ---------------------------------------------------------------------------
+# 研究问题 6（续）：端点不可复现时，结论指纹还能不能回答“结论变了吗”？
+# ---------------------------------------------------------------------------
+
+DRIFT_BODY = (
+    "区域 TEST_NORTH 电力供需紧张，2026-01-12T10:00:00Z 全网用电负荷创历史新高。"
+)
+DRIFT_EVIDENCE_FIELDS = (
+    "relevance",
+    "event_type",
+    "status",
+    "physical_effect",
+    "affected_regions",
+    "effective_start_at",
+)
+
+
+def _drift_payload(region: str) -> dict:
+    """One event, told twice in different words. Only `region` changes."""
+
+    return {
+        "disposition": "event",
+        "events": [
+            {
+                "relevance": "short_term",
+                "event_type": "demand_shock",
+                "status": "occurred",
+                "physical_effect": "demand_up",
+                "affected_regions": [region],
+                "affected_assets": [],
+                "quantity": None,
+                "time_precision": "instant",
+                "time_text": "2026-01-12T10:00:00Z",
+                "event_instant": {"iso": "2026-01-12T10:00:00+00:00", "basis": "stated_absolute"},
+                "event_end_instant": None,
+                "confidence": 0.95,
+                "evidence": [
+                    {"field_name": name, "text_field": "body", "quote": DRIFT_BODY}
+                    for name in DRIFT_EVIDENCE_FIELDS
+                ],
+            }
+        ],
+    }
+
+
+class _RewordingGateway:
+    """Stands in for the real endpoint, which answers differently on every call."""
+
+    model_name = "drift-model"
+
+    def __init__(self, region: str) -> None:
+        self.region = region
+
+    def invoke_structured(self, *, messages, schema):
+        return schema.model_validate(_drift_payload(self.region))
+
+
+class _SingleRecordAdapter:
+    def __init__(self, record) -> None:
+        self._record = record
+
+    def load(self):
+        return (self._record,)
+
+
+def _drift_study(prices, region: str):
+    record = CollectedNewsRecord(
+        source_name="测试来源",
+        source_document_id="DRIFT-01",
+        source_ref="fixture://news/DRIFT-01",
+        title="用电负荷创历史新高",
+        body=DRIFT_BODY,
+        published_at="2026-01-12T09:00:00+00:00",
+        collected_at="2026-01-12T09:30:00+00:00",
+        language="zh-CN",
+        market_tags=("TEST_MARKET",),
+    )
+    return run_news_price_study(
+        adapter=_SingleRecordAdapter(record),
+        prices=prices,
+        as_of=FINAL_AS_OF,
+        axis="effective",
+        extractor=StructuredNewsEventExtractor(_RewordingGateway(region), market_timezone="UTC"),
+    )
+
+
+def test_question_6_a_reworded_re_extraction_keeps_the_same_conclusion_fingerprint(prices) -> None:
+    """The endpoint is not reproducible: 9 of 10 holdout documents hashed differently每次.
+
+    A conclusion fingerprint that moved with the model's raw output could never answer the
+    only question it is asked — did anything about this conclusion change?
+    """
+
+    plain = _drift_study(prices, "TEST_NORTH")
+    with_grid_suffix = _drift_study(prices, "TEST_NORTH电网")
+
+    plain_traces = [trace.output_hash for event in plain.view.events for trace in event.extraction_traces]
+    reworded_traces = [
+        trace.output_hash for event in with_grid_suffix.view.events for trace in event.extraction_traces
+    ]
+    assert plain_traces and plain_traces != reworded_traces, (
+        "前提不成立：两次抽取的模型原始输出必须不同，否则这个测试什么也没证明"
+    )
+    assert plain.view.events[0].affected_regions != with_grid_suffix.view.events[0].affected_regions
+    assert plain.view.events[0].region_keys == with_grid_suffix.view.events[0].region_keys
+
+    assert plain.package.conclusion_fingerprint() == with_grid_suffix.package.conclusion_fingerprint()
+
+
+def test_question_6_provenance_still_moves_when_the_model_output_does(prices) -> None:
+    """Provenance is not discarded, only held apart; it must still register the difference."""
+
+    plain = _drift_study(prices, "TEST_NORTH")
+    with_grid_suffix = _drift_study(prices, "TEST_NORTH电网")
+
+    assert plain.package.provenance_fingerprint() != with_grid_suffix.package.provenance_fingerprint()
+    assert plain.package.fingerprint() != with_grid_suffix.package.fingerprint()
+
+
+def test_question_6_a_changed_conclusion_still_moves_the_conclusion_fingerprint(prices) -> None:
+    """The stability must come from ignoring noise, not from ignoring everything."""
+
+    baseline = _drift_study(prices, "TEST_NORTH")
+    other_region = _drift_study(prices, "TEST_SOUTH")
+
+    assert baseline.package.conclusion_fingerprint() != other_region.package.conclusion_fingerprint()
