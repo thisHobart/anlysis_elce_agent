@@ -1,8 +1,10 @@
 corpus_version: "holdout-2026-09-04"
+evaluation_role: regression
+independently_reviewed: false
 retrieved_at: "2026-09-04T09:00:00+08:00"
 purpose: >-
-  盲测集：2026 年 8—9 月新抓取的真实电力新闻，未参与任何 Prompt、schema 或阈值调整。
-  与 news_realistic 开发集互不重叠，用于检验结构化模型抽取器在没见过的措辞上的表现。
+  历史保留集，现归为回归集：其失败案例已经用于修改整条处理流水线，不再视为独立验收证据。
+  与 news_realistic 开发集互不重叠，用于防止已发现的真实新闻边界再次退化。
   正文为来源原句的短摘录，仅补回被网页抽取吞掉的句末句号，其余逐字保留（含来源自身的错别字，如"万干瓦"）。
 
 qualification_thresholds:

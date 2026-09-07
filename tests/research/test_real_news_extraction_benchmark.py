@@ -220,6 +220,26 @@ class _GoldExtractor:
             extractor_version=self.extractor_version,
             evidence=evidence,
         )
+        if gold.expected_market_keys is not None:
+            # This test double emits the new provenance contract for upgraded gold cases.
+            from app.research.news.entity_resolution import resolve_entities
+
+            entity_evidence = [
+                EvidenceSpan(field_name=field_name, document_version_id=document.document_version_id,
+                             text_field=text_field, start_char=0, end_char=len(getattr(document, text_field)),
+                             quote=getattr(document, text_field), event_id=event_id)
+                for field_name in ("affected_regions", "affected_assets", "asset_groups")
+                for text_field in ("title", "body")
+            ]
+            resolution = resolve_entities(
+                document, gold.expected_regions, gold.expected_assets,
+                ("AGRs",) if gold.expected_group_keys == ("AGR",) else (), entity_evidence,
+            )
+            event = event.model_copy(update={
+                "affected_regions": tuple(item.value for item in resolution.mentioned_regions),
+                "affected_assets": tuple(item.value for item in resolution.affected_assets),
+                "entity_resolution": resolution, "evidence": (*evidence, *entity_evidence),
+            })
         return EventExtractionResult(
             document_version_id=document.document_version_id,
             events=(event,),

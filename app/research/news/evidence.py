@@ -19,10 +19,11 @@ from app.research.news.contracts import (
     ExtractionTrace,
     MergedEvent,
     NewsDocument,
+    NewsInputIssue,
 )
 from app.research.news.merging import EventView
 
-PACKAGE_VERSION = "1.0.0"
+PACKAGE_VERSION = "1.1.0"
 
 
 class EvidenceChainError(ValueError):
@@ -106,6 +107,7 @@ class ResearchPackage:
     method_notes: tuple[str, ...] = ()
     events_not_analyzed: tuple[tuple[str, str], ...] = ()
     quarantined: tuple[ExtractionQuarantine, ...] = ()
+    input_issues: tuple[NewsInputIssue, ...] = ()
 
     @property
     def unexplained_events(self) -> tuple[str, ...]:
@@ -159,6 +161,7 @@ class ResearchPackage:
                     for link in self.evidence_links
                 ],
                 "package_version": self.package_version,
+                "input_issues": [item.model_dump(mode="json") for item in self.input_issues],
                 "quality": {
                     "documents": self.quality.document_count,
                     # The quarantine list joins the fingerprint: a run that silently starts
@@ -322,7 +325,13 @@ def build_quality_report(
     reasons: dict[str, int] = {}
     for item in quarantined:
         reasons[item.reason_code] = reasons.get(item.reason_code, 0) + 1
-    full_evidence = sum(1 for event in view.events if _has_required_evidence(event, spans_by_version))
+    from app.research.news.entity_resolution import entity_sources_are_valid
+
+    documents_by_version = {document.document_version_id: document for document in documents}
+    full_evidence = sum(
+        1 for event in view.events if _has_required_evidence(event, spans_by_version)
+        and (event.entity_resolution is None or entity_sources_are_valid(event.entity_resolution, documents_by_version))
+    )
     after_the_fact = sum(
         1
         for event in view.events
@@ -351,6 +360,8 @@ def _has_required_evidence(
         required.add("affected_regions")
     if event.affected_assets:
         required.add("affected_assets")
+    if event.asset_groups:
+        required.add("asset_groups")
     if event.capacity_mw is not None:
         required.add("capacity_mw")
     if event.effective_start_at is not None:
@@ -613,6 +624,7 @@ def package_payload(package: ResearchPackage) -> dict:
         "method_notes": list(package.method_notes),
         "events_not_analyzed": [list(item) for item in package.events_not_analyzed],
         "quarantined": [item.model_dump(mode="json") for item in package.quarantined],
+        "input_issues": [item.model_dump(mode="json") for item in package.input_issues],
         # An event that produced neither a result nor a stated reason is a hole in the report,
         # so it is named in the artifact rather than left for someone to notice.
         "unexplained_events": list(package.unexplained_events),
@@ -634,6 +646,9 @@ def render_report(package: ResearchPackage) -> str:
 
     lines = _render_header(package)
     lines.extend(_render_quality(package))
+    if package.input_issues:
+        lines.extend(["", f"输入中有 {len(package.input_issues)} 条坏记录，已隔离，其余记录继续处理。", ""])
+        lines.extend(f"- 第 {item.line_number} 行：{item.reason.splitlines()[0]}" for item in package.input_issues)
     lines.extend(_render_summary(package))
     lines.extend(["## 三、逐事件证据", ""])
     for index, (event_id, links) in enumerate(grouped.items(), start=1):
@@ -661,7 +676,7 @@ def render_report(package: ResearchPackage) -> str:
             "",
             (
                 f"- 预注册窗口：{windows}；安慰剂偏移：{placebos}；"
-                f"置换抽样 {method.permutation_samples} 次，随机种子 {method.seed}。"
+                f"采用 {method.control_matching} 匹配的完整非重叠对照，使用全部合格对照计算经验尾部比例。"
             ),
             "",
         ]

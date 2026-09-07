@@ -1,5 +1,7 @@
 # 电价研究 Agent
 
+P2 新增本地新闻工作台入口，支持批量导入、事件复核、持久化缓存和结果导出，运行方式见 [P2 工作台说明](docs/p2-workbench.md)。分析器已改用完整、匹配且不重叠的对照窗口；旧合成数据的显著性结论不应沿用。
+
 面向电价预测的研究工作台。最终目标是电价预测；当前阶段先把**外生变量与新闻研究**这一前置研发环节做扎实：确定性算法是计算核心，Agent 是研究闭环的控制器。
 
 用户在一个连续会话里提出电价研究问题，Agent 结合可用数据给出可调整的分析方案，确定性统计函数负责计算，评估器检查证据，最后生成一份可分享、可复现的研究报告。
@@ -197,5 +199,6 @@ $env:QT_QPA_PLATFORM="offscreen"
 完整文档入口见 [docs/README.md](docs/README.md)。当前实现说明见
 [docs/phase1-price-exogenous-eda.md](docs/phase1-price-exogenous-eda.md)，循环设计见
 [docs/research-loop.md](docs/research-loop.md)，验收状态见
-[docs/phase1-acceptance.md](docs/phase1-acceptance.md)。P2 的测试先行候选方案见
-[docs/phase2-news-price-analysis-proposal.md](docs/phase2-news-price-analysis-proposal.md)；模拟新闻规范化和明显事件抽取已有独立测试原型，尚未接入桌面流程或生产新闻接口。
+[docs/phase1-acceptance.md](docs/phase1-acceptance.md)。P2 当前状态见
+[docs/phase2-status.md](docs/phase2-status.md)，目标与门禁见
+[docs/phase2-news-price-analysis-proposal.md](docs/phase2-news-price-analysis-proposal.md)；新闻研究链路已有独立实现和真实来源语料，但尚未通过真实模型生产准入，也未接入桌面流程或生产新闻接口。

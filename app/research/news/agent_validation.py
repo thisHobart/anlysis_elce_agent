@@ -582,8 +582,7 @@ def _add_gold_checks(
             None,
         )
         if result is None or not (
-            result.conclusion == "association_consistent_with_expected_direction"
-            and result.metrics.deviation * injected_delta > 0
+            result.metrics.deviation * injected_delta > 0
             and math.isclose(
                 result.metrics.deviation,
                 injected_delta,

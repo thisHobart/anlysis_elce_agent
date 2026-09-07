@@ -66,6 +66,10 @@ class NewsVersionStore:
             # identity. Keep the earliest observation so point-in-time replay remains honest.
             if existing.content_hash != document.content_hash:
                 raise NewsVersionError(f"{document.document_version_id} 的内容哈希发生冲突")
+            if existing.market_tags != document.market_tags:
+                raise NewsVersionError(
+                    f"{document.document_version_id} 的市场标签来源发生冲突；标签更正必须记录为新的来源版本"
+                )
             if document.first_seen_at < existing.first_seen_at:
                 versions[document.document_version_id] = document
             self._duplicate_version_ids.append(document.document_version_id)
@@ -118,7 +122,7 @@ class NewsVersionStore:
                 document for document in self.versions_of(document_id) if document.available_at <= as_of
             ]
             if candidates:
-                visible.append(max(candidates, key=lambda document: (document.version, document.available_at)))
+                visible.append(max(candidates, key=lambda document: (document.available_at, document.version)))
         return tuple(sorted(visible, key=lambda document: (document.available_at, document.document_version_id)))
 
     def history_at(self, as_of: datetime) -> tuple[NewsDocument, ...]:

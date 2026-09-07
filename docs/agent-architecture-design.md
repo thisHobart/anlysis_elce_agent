@@ -6,7 +6,7 @@
 | 系统名称 | 电价研究 Agent（Price Research Agent） |
 | 版本 | v1.3 |
 | 更新日期 | 2026-08-28 |
-| 架构状态 | P1 当前产品架构；P2 有独立测试原型和待评审草案，P3 仅登记未来约束和待研究风险 |
+| 架构状态 | P1 当前产品架构；P2 有独立研究实现但尚未通过生产准入或接入产品，P3 仅登记未来约束和待研究风险 |
 | 实现基线 | 2026-08-28 的 P1 当前工作树；精确版本以 Git 与研究包 manifest 为准 |
 | 结构参考 | [arc42 docToolchain 示例](https://examples.arc42.org/systems/doctoolchain-v4/?utm_source=chatgpt.com) |
 | 配套文档 | [项目文档导航](./README.md)、[Agent 技术方案](./agent-technical-proposal.md)、[技术实现与决策说明](./technical-approach.md)、[P2 方案草案](./phase2-news-price-analysis-proposal.md)、[持久化研究循环](./research-loop.md) |
@@ -77,9 +77,9 @@ P1 需要形成以下闭环：
 
 P1 目前包含 30 个原子研究函数，覆盖数据质量、电价结构、外生变量质量、关系证据和可预测性准备度。
 
-#### P2：新闻与电价结合（方案草案待评审）
+#### P2：新闻与电价结合（独立研究实现，尚未产品化）
 
-P2 已形成 [新闻事件与电价分析技术方案草案](./phase2-news-price-analysis-proposal.md)：新闻采集由外部 API 负责，当前 `app/research/news/` 已用冻结合成新闻跑通从规范化到事件—电价证据包的完整链路（版本历史与 `as_of` 回放、事件合并、市场时钟、窗口统计、证据链）。该原型拥有独立契约，import-boundary 测试双向禁止 P1/P2 互相依赖；事件特征以版本化数值表交接，其可获得性门禁在 P2 导出前完成。它尚未接入当前 Graph 或桌面流程。
+P2 已形成 [新闻事件与电价分析技术方案草案](./phase2-news-price-analysis-proposal.md)：新闻采集由外部 API 负责，当前 `app/research/news/` 已用冻结合成新闻跑通从规范化到事件—电价证据包的完整链路，并建立真实来源开发集、保留集和结构化模型抽取边界。该模块拥有独立契约，import-boundary 测试双向禁止 P1/P2 互相依赖；事件特征以版本化数值表交接，其可获得性门禁在 P2 导出前完成。它尚未通过真实模型生产准入，也未接入当前 Graph 或桌面流程；最新结论见 [P2 进展状态](./phase2-status.md)。
 
 #### P3：预测实验（未来研究主题）
 

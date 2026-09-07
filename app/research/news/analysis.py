@@ -22,7 +22,7 @@ from app.research.news.clock import MarketClock, TimeAxis, zero_point
 from app.research.news.contracts import MergedEvent
 from app.research.news.prices import PriceObservations
 
-ANALYSIS_VERSION = "1.0.0"
+ANALYSIS_VERSION = "2.0.0"
 
 Conclusion = Literal[
     "association_consistent_with_expected_direction",
@@ -97,6 +97,8 @@ class EventWindowResult:
     test_sidedness: Literal["one_sided", "two_sided"]
     conclusion: Conclusion
     conclusion_reason: str
+    control_start_times: tuple[datetime, ...] = ()
+    confounding_event_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -112,6 +114,16 @@ class AnalysisMethod:
     correction: Literal["holm"] = "holm"
     baseline: Literal["same_hour_of_week_event_free"] = "same_hour_of_week_event_free"
     spike_quantile: float = 0.95
+    control_matching: Literal["same_clock_day_type", "same_clock_weekday"] = "same_clock_day_type"
+    overlap_policy: Literal["flag"] = "flag"
+
+    def __post_init__(self) -> None:
+        if not self.window_hours or len(set(self.window_hours)) != len(self.window_hours):
+            raise EventAnalysisError("窗口不能为空或重复")
+        if not 0 < self.significance < 1 or not 0 < self.spike_quantile < 1:
+            raise EventAnalysisError("概率阈值必须介于 0 和 1 之间")
+        if self.control_matching not in {"same_clock_day_type", "same_clock_weekday"} or self.overlap_policy != "flag":
+            raise EventAnalysisError("不支持的对照或并发事件策略")
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -124,6 +136,10 @@ class AnalysisMethod:
             "significance": self.significance,
             "spike_quantile": self.spike_quantile,
             "window_hours": list(self.window_hours),
+            "control_matching": self.control_matching,
+            "overlap_policy": self.overlap_policy,
+            "test_method": "empirical_control_tail",
+            "complete_windows_only": True,
         }
 
 
@@ -161,6 +177,8 @@ class AnalysisResult:
                         "event_id": result.event_id,
                         "permutation_p_value": round(result.permutation_p_value, 6),
                         "window": result.metrics.window_label,
+                        "controls": [t.isoformat() for t in result.control_start_times],
+                        "confounding_event_ids": result.confounding_event_ids,
                     }
                     for result in self.results
                 ],
@@ -252,7 +270,8 @@ def _window_metrics(
 ) -> WindowMetrics | None:
     end_at = start_at + window.duration
     moments, values = prices.slice_window(start_at, end_at)
-    if len(values) < MINIMUM_WINDOW_INTERVALS:
+    required, remainder = divmod(window.duration, prices.clock.interval)
+    if remainder or len(values) != required or len(values) < MINIMUM_WINDOW_INTERVALS:
         return None
     mean_price = float(statistics.fmean(values))
     expected = baseline.expected(prices.clock, moments)
@@ -276,21 +295,41 @@ def _control_deviations(
     baseline: _Baseline,
     window: WindowSpec,
     occupied: set[datetime],
+    *,
+    anchor: datetime | None = None,
+    matching: str = "same_clock_day_type",
 ) -> tuple[float, ...]:
-    """Same clock position on every event-free day: what "no event" normally looks like."""
+    return tuple(item.deviation for item in _control_windows(
+        prices, baseline, window, occupied, anchor=anchor, matching=matching
+    ))
+
+
+def _control_windows(prices, baseline, window, occupied, *, anchor=None, matching="same_clock_day_type"):
+    """Complete, non-overlapping controls matched before observing their price values."""
 
     clock = prices.clock
-    deviations: list[float] = []
+    controls: list[WindowMetrics] = []
+    next_start = prices.start_at
+    target = clock.local(anchor) if anchor is not None else None
     for index in baseline.free_indices:
         start_at = prices.timestamps[index]
+        local = clock.local(start_at)
+        if start_at < next_start:
+            continue
+        if target is not None:
+            same_day = ((local.weekday() >= 5) == (target.weekday() >= 5)
+                        if matching == "same_clock_day_type" else local.weekday() == target.weekday())
+            if (local.hour, local.minute) != (target.hour, target.minute) or not same_day:
+                continue
         end_at = start_at + window.duration
         moment, limit = start_at, clock.ceil(end_at)
         if any(step in occupied for step in _iterate(moment, limit, clock.interval)):
             continue
         metrics = _window_metrics(prices, baseline, window, start_at)
         if metrics is not None:
-            deviations.append(metrics.deviation)
-    return tuple(deviations)
+            controls.append(metrics)
+            next_start = end_at
+    return tuple(controls)
 
 
 def _iterate(start: datetime, end: datetime, step: timedelta):
@@ -314,13 +353,10 @@ def _permutation_p_value(
 
     if not null_deviations:
         return 1.0, 0, "two_sided"
-    # Python's builtin hash() is salted per process, so a stable digest is required for the
-    # result fingerprint to survive a restart.
-    digest = hashlib.sha256(f"{seed}:{event_id}:{window_label}".encode()).digest()
-    rng = np.random.default_rng(int.from_bytes(digest[:4], "big"))
-    pool = np.asarray(null_deviations, dtype=float)
-    draw_count = min(samples, pool.size)
-    draws = rng.choice(pool, size=draw_count, replace=pool.size < samples)
+    # Use every eligible control exactly once. Re-sampling a small pool cannot create
+    # additional independent evidence or justify a smaller tail probability.
+    draws = np.asarray(null_deviations, dtype=float)
+    draw_count = draws.size
 
     if expected_direction == "up":
         extreme = int(np.sum(draws >= observed))
@@ -403,6 +439,8 @@ def _classify(
             ),
         )
     if matches_direction:
+        if not placebo_deviations:
+            return "insufficient_sample", "没有可用的安慰剂窗口，不能判定关联稳定。"
         return (
             "association_consistent_with_expected_direction",
             (
@@ -434,8 +472,19 @@ class EventPriceAnalyzer:
     ) -> AnalysisResult:
         method = self.method
         windows = tuple(WindowSpec(hours) for hours in method.window_hours)
+        if any(window.duration % prices.clock.interval for window in windows):
+            raise EventAnalysisError("窗口长度必须是结算间隔的整数倍")
         max_window = max(window.duration for window in windows)
-        occupied = _event_occupied_intervals(prices, events, axis, max_window)
+        occupied_by_event = {event.event_id: _event_occupied_intervals(prices, [event], axis, max_window)
+                             for event in events}
+        occupied = set().union(*occupied_by_event.values())
+        if all(moment in occupied for moment in prices.timestamps):
+            return AnalysisResult(
+                axis=axis, method=method, clock=prices.clock, results=(),
+                excluded_events=tuple((event.event_id, "没有无事件价格区间，无法建立对照基线") for event in events),
+                price_hash=prices.content_hash(), event_hash=_event_hash(events), provenance_hash=_provenance_hash(events),
+                notes=("事件台账与特征保留；没有可用对照基线，未计算价格关联。",),
+            )
         baseline = _build_baseline(prices, occupied, method)
 
         raw: list[tuple[EventWindowResult, float]] = []
@@ -443,9 +492,7 @@ class EventPriceAnalyzer:
 
         # The control pool depends only on the window and the event-free mask, so it is
         # built once per window instead of once per (event, window) pair.
-        controls_by_window = {
-            window.label: _control_deviations(prices, baseline, window, occupied) for window in windows
-        }
+        controls_by_window = {}
 
         for event in sorted(events, key=lambda item: (item.announcement_available_at, item.event_id)):
             anchor = zero_point(event, axis)
@@ -457,13 +504,27 @@ class EventPriceAnalyzer:
                 continue
 
             for window in windows:
-                controls = controls_by_window[window.label]
+                start = prices.clock.ceil(anchor)
+                local = prices.clock.local(start)
+                day_key = local.weekday() >= 5 if method.control_matching == "same_clock_day_type" else local.weekday()
+                key = (window.label, local.hour, local.minute, day_key)
+                if key not in controls_by_window:
+                    controls_by_window[key] = _control_windows(
+                        prices, baseline, window, occupied, anchor=start, matching=method.control_matching
+                    )
+                control_windows = controls_by_window[key]
+                controls = tuple(item.deviation for item in control_windows)
                 # Ceil, never floor: a window that began before the announcement would be
                 # reading prices the news could not yet have influenced.
                 metrics = _window_metrics(prices, baseline, window, prices.clock.ceil(anchor))
                 if metrics is None:
-                    excluded.append((event.event_id, f"{window.label} 窗口内价格区间不足"))
+                    excluded.append((event.event_id, f"{window.label} 价格窗口不完整或区间不足，未计算统计量"))
                     continue
+                confounders = tuple(sorted(
+                    other.event_id for other in events if other.event_id != event.event_id
+                    and any(t in occupied_by_event[other.event_id]
+                            for t in _iterate(metrics.start_at, metrics.end_at, prices.clock.interval))
+                ))
                 placebos = self._placebo_deviations(prices, baseline, window, anchor, occupied)
                 p_value, samples, sidedness = _permutation_p_value(
                     metrics.deviation,
@@ -497,6 +558,8 @@ class EventPriceAnalyzer:
                             test_sidedness=sidedness,
                             conclusion="not_supported_by_current_data",
                             conclusion_reason="",
+                            control_start_times=tuple(item.start_at for item in control_windows),
+                            confounding_event_ids=confounders,
                         ),
                         p_value,
                     )
@@ -513,6 +576,9 @@ class EventPriceAnalyzer:
                 placebo_deviations=result.placebo_deviations,
                 method=method,
             )
+            if result.confounding_event_ids:
+                conclusion = "not_supported_by_current_data"
+                reason = "事件窗存在并发事件，不作单事件归因：" + ", ".join(result.confounding_event_ids)
             finalized.append(
                 EventWindowResult(
                     **{
@@ -537,6 +603,9 @@ class EventPriceAnalyzer:
                 f"零点时间轴：{axis}；窗口在事件零点之后前视，绝不回看。",
                 "价格可能为零或负，因此只使用绝对差值，不使用对数收益或 MAPE。",
                 f"多重比较采用 {method.correction}，同时报告原始与校正后 p 值。",
+                "原始 p 为完整、同刻且日历匹配的非重叠对照窗口经验尾部比例，不是随机重排置换检验。",
+                "基线与对照使用所提供价格范围，属于事后关联研究，不代表当时可用的预测结果。",
+                "并发事件策略：保留描述统计，限制单事件结论；样本少时不降低验收阈值。",
                 "“未提供支持”不等于“证明没有影响”，事件关联也不等于因果效应。",
             ),
         )
@@ -553,7 +622,7 @@ class EventPriceAnalyzer:
 
         deviations: list[float] = []
         for offset in self.method.placebo_offset_days:
-            shifted = prices.clock.floor(anchor + timedelta(days=offset))
+            shifted = prices.clock.ceil(anchor + timedelta(days=offset))
             if prices.index_of(shifted) is None:
                 continue
             limit = prices.clock.ceil(shifted + window.duration)
@@ -587,6 +656,8 @@ def _event_hash(events: Sequence[MergedEvent]) -> str:
             {
                 "announcement_available_at": event.announcement_available_at.isoformat(),
                 "asset_keys": list(event.asset_keys),
+                **({"entity_keys": event.entity_resolution.semantic_keys()}
+                   if event.entity_resolution is not None else {}),
                 "capacity_mw": event.capacity_mw,
                 "direction": event.direction,
                 "effective_end_at": (
@@ -606,6 +677,7 @@ def _event_hash(events: Sequence[MergedEvent]) -> str:
                 "source_content_hashes": [ref.content_hash for ref in event.document_refs],
                 "source_event_ids": list(event.source_event_ids),
                 "status": event.status,
+                "review_status": event.review_status,
             }
             for event in events
         ),
@@ -628,6 +700,8 @@ def _provenance_hash(events: Sequence[MergedEvent]) -> str:
                 "extraction_traces": [
                     trace.model_dump(mode="json") for trace in event.extraction_traces
                 ],
+                **({"entity_resolution": event.entity_resolution.model_dump(mode="json")}
+                   if event.entity_resolution is not None else {}),
                 "source_content_hashes": [ref.content_hash for ref in event.document_refs],
             }
             for event in events

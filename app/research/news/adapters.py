@@ -10,7 +10,13 @@ from typing import Protocol
 
 from pydantic import ValidationError
 
-from app.research.news.contracts import CollectedNewsRecord
+from app.research.news.contracts import CollectedNewsRecord, NewsInputIssue
+
+
+@dataclass(frozen=True)
+class NewsInputBatch:
+    records: tuple[CollectedNewsRecord, ...]
+    issues: tuple[NewsInputIssue, ...] = ()
 
 
 class CollectedNewsAdapterError(RuntimeError):
@@ -46,11 +52,20 @@ class JsonlCollectedNewsAdapter:
     path: Path
 
     def load(self) -> Sequence[CollectedNewsRecord]:
+        """Strict loading for benchmarks whose frozen input must be wholly valid."""
+        batch = self.load_batch()
+        if batch.issues:
+            issue = batch.issues[0]
+            raise CollectedNewsAdapterError(f"新闻快照第 {issue.line_number} 行无效：{issue.reason}")
+        return batch.records
+
+    def load_batch(self) -> NewsInputBatch:
         resolved = self.path.resolve()
         if not resolved.is_file():
             raise CollectedNewsAdapterError(f"新闻快照不存在：{resolved}")
 
         records: list[CollectedNewsRecord] = []
+        issues: list[NewsInputIssue] = []
         with resolved.open("r", encoding="utf-8") as stream:
             for line_number, line in enumerate(stream, start=1):
                 if not line.strip():
@@ -61,6 +76,7 @@ class JsonlCollectedNewsAdapter:
                         raise TypeError("JSONL 行必须是对象")
                     records.append(CollectedNewsRecord.model_validate(payload))
                 except (json.JSONDecodeError, TypeError, ValidationError) as exc:
-                    raise CollectedNewsAdapterError(f"新闻快照第 {line_number} 行无效：{exc}") from exc
-        return tuple(records)
+                    issues.append(NewsInputIssue(line_number=line_number, source_path=str(resolved),
+                                                 reason=str(exc), raw_line=line.rstrip("\r\n")))
+        return NewsInputBatch(tuple(records), tuple(issues))
 

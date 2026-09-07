@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime
 
-from app.research.news.adapters import CollectedNewsAdapter
+from app.research.news.adapters import CollectedNewsAdapter, NewsInputBatch
 from app.research.news.analysis import AnalysisMethod, AnalysisResult, EventPriceAnalyzer
 from app.research.news.clock import MarketClock, TimeAxis, lead_time_table
 from app.research.news.contracts import (
@@ -107,7 +107,9 @@ def run_news_price_study(
             f"抽取器={extractor_timezone}，市场={market_clock.timezone}"
         )
 
-    documents = NewsNormalizer().normalize_many(adapter.load())
+    load_batch = getattr(adapter, "load_batch", None)
+    batch = load_batch() if load_batch is not None else NewsInputBatch(tuple(adapter.load()))
+    documents = NewsNormalizer().normalize_many(batch.records)
     store = NewsVersionStore(documents)
     matched_documents = tuple(
         document
@@ -142,6 +144,10 @@ def run_news_price_study(
     skipped_types = set() if include_irrelevant else {"irrelevant", "unknown"}
 
     def analysis_exclusion(event):
+        if event.review_status == "rejected":
+            return "人工复核拒绝，不进入价格分析"
+        if event.entity_resolution is not None and not event.entity_resolution.matches_market(market_clock.market):
+            return "事件区域与市场标签冲突、市场范围不明确或跨市场总量无法分配，不进入该市场电价分析"
         if event.event_type in skipped_types:
             return f"事件类型为 `{event.event_type}`，按预注册规则不进入电价分析"
         if event.relevance != "short_term":
@@ -195,6 +201,7 @@ def run_news_price_study(
         method_notes=analysis.notes,
         events_not_analyzed=not_analyzed,
         quarantined=view.quarantined,
+        input_issues=batch.issues,
     )
     result_quality = evaluate_result_quality(package=package, documents=documents, prices=prices)
     return NewsPriceStudy(

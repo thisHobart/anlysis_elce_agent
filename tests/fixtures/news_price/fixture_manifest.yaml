@@ -60,14 +60,16 @@ negative_controls:
   - fixture_id: N10
     reason: 次日发布的回顾报道，尖峰时点尚不可用，不得进入当时的特征或解释
 
-# What each fixture is expected to demonstrate on which time axis.
+# Analysis 2.0 uses complete, matched, non-overlapping control windows. Eight weeks
+# cannot establish multiplicity-adjusted significance; effect direction and magnitude
+# remain independently checked against the injected deltas above.
 expected_outcomes:
   announcement_axis:
-    N01: association_consistent_with_expected_direction
-    N05: association_consistent_with_expected_direction
+    N01: not_supported_by_current_data
+    N05: not_supported_by_current_data
     N06: not_supported_by_current_data   # announced a day early; the effect is not in this window
   effective_axis:
-    N01: association_consistent_with_expected_direction
-    N05: association_consistent_with_expected_direction
-    N06: association_consistent_with_expected_direction
-    N07: association_consistent_with_expected_direction
+    N01: not_supported_by_current_data
+    N05: not_supported_by_current_data
+    N06: not_supported_by_current_data
+    N07: not_supported_by_current_data

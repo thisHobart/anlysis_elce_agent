@@ -1,5 +1,11 @@
 # 持久化研究循环
 
+| 字段 | 内容 |
+|---|---|
+| 文档类型 | 当前运行时语义说明 |
+| 适用范围 | P1 Graph 的会话、迭代、审批、终止和恢复 |
+| 配套文档 | [项目文档导航](README.md)、[架构设计](agent-architecture-design.md) |
+
 桌面会话只维护一个持久化 `ResearchLoopGraph`，但不再把整个 `session_id/thread_id` 当作一次有限循环。循环状态明确分为四层：
 
 ```text

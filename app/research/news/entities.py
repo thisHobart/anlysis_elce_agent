@@ -159,6 +159,14 @@ def is_region_mention(value: str) -> bool:
     return canonical_region(value) in _KNOWN_REGION_CODES
 
 
+def region_source_aliases(value: str) -> tuple[str, ...]:
+    """Source spellings for the controlled keys; no substring-derived geography."""
+    spaced = {"greatbritain": "Great Britain", "unitedkingdom": "United Kingdom"}
+    key = canonical_region(value)
+    return tuple(sorted((spaced.get(alias, alias) for alias in _REGION_CANONICAL
+                         if canonical_region(alias) == key), key=len, reverse=True))
+
+
 def split_entity_keys(
     regions: Iterable[str],
     assets: Iterable[str],

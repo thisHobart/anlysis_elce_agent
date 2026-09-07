@@ -14,10 +14,11 @@ from app.research.news.contracts import (
     MergedEvent,
     NewsDocument,
 )
+from app.research.news.entity_resolution import EntityResolution
 from app.research.news.extraction import NewsEventExtractor, ObviousNewsEventExtractor
 from app.research.news.versioning import NewsVersionStore, document_ref
 
-MERGER_VERSION = "1.1.0"
+MERGER_VERSION = "1.3.0"
 
 
 def _source_authority(document: NewsDocument) -> int:
@@ -101,7 +102,8 @@ def merge_event_records(
     sibling_groups: dict[tuple[str, str, tuple[str, ...], tuple[str, ...]], list[int]] = {}
     for index, (record, document) in enumerate(candidates):
         sibling_groups.setdefault(
-            (document.document_version_id, record.event_type, record.asset_keys, record.region_keys),
+            (document.document_version_id, record.event_type, record.asset_keys,
+             (record.region_keys, record.group_keys, record.market_keys)),
             [],
         ).append(index)
     sibling_ordinal: dict[int, int] = {}
@@ -126,7 +128,7 @@ def merge_event_records(
             document.document_id,
             record.event_type,
             record.asset_keys,
-            record.region_keys,
+            (record.region_keys, record.group_keys, record.market_keys),
             sibling_ordinal[index],
         )
         lineage_owner = by_lineage.setdefault(lineage_key, index)
@@ -136,6 +138,23 @@ def merge_event_records(
         # produced from the same document version.
         if candidates[lineage_owner][1].document_version_id != document.document_version_id:
             union(index, lineage_owner)
+
+    # Clearing a group changes its identity key. Link that explicit withdrawal only
+    # when each earlier source version has one unambiguous matching event.
+    for index, (record, document) in enumerate(candidates):
+        if "asset_groups" not in record.cleared_fields:
+            continue
+        prior_versions: dict[str, list[int]] = {}
+        for prior_index, (prior, prior_document) in enumerate(candidates):
+            if (prior_document.document_id == document.document_id
+                    and prior_document.document_version_id != document.document_version_id
+                    and prior_document.available_at < document.available_at
+                    and prior.event_type == record.event_type and prior.asset_keys == record.asset_keys
+                    and prior.region_keys == record.region_keys and prior.market_keys == record.market_keys):
+                prior_versions.setdefault(prior_document.document_version_id, []).append(prior_index)
+        for matches in prior_versions.values():
+            if len(matches) == 1:
+                union(index, matches[0])
 
     grouped: dict[int, list[tuple[EventRecord, NewsDocument]]] = {}
     for index, candidate in enumerate(candidates):
@@ -195,13 +214,15 @@ def merge_event_records(
                     return value
                 for candidate in fallbacks:
                     if field_name in candidate.cleared_fields:
-                        continue
+                        # Withdrawal is a persistent tombstone, not an omitted value.
+                        # A later omission must never resurrect the pre-withdrawal state.
+                        return getattr(candidate, field_name)
                     other = getattr(candidate, field_name)
                     if other not in (None, ()):
                         return other
                 return value
 
-            return visible_primary, {
+            fields = {
                 field_name: stated(field_name)
                 for field_name in (
                     "affected_regions",
@@ -212,6 +233,36 @@ def merge_event_records(
                     "effective_end_at",
                 )
             }
+            # Resolve each entity family from the same donor as its raw field; retain
+            # donor mentions together with keys, including at historical cutoffs.
+            resolution = visible_primary.entity_resolution
+            if resolution is not None:
+                parts = {}
+                mentions = {}
+                for part, raw_field in (("mentioned_regions", "affected_regions"),
+                                        ("affected_assets", "affected_assets"),
+                                        ("asset_groups", "asset_groups")):
+                    selected = ()
+                    for donor in (visible_primary, *fallbacks):
+                        if raw_field in donor.cleared_fields:
+                            break
+                        if donor.entity_resolution is None:
+                            continue
+                        selected = getattr(donor.entity_resolution, part)
+                        if selected:
+                            ids = {mid for item in selected for mid in item.mention_ids}
+                            mentions.update({m.mention_id: m for m in donor.raw_entity_mentions
+                                             if m.mention_id in ids})
+                            break
+                    parts[part] = selected
+                fields["entity_resolution"] = EntityResolution(
+                    market_scope=resolution.market_scope,
+                    raw_entity_mentions=tuple(mentions[k] for k in sorted(mentions)), **parts)
+                fields["affected_regions"] = tuple(item.value for item in parts["mentioned_regions"])
+                fields["affected_assets"] = tuple(item.value for item in parts["affected_assets"])
+            else:
+                fields["entity_resolution"] = None
+            return visible_primary, fields
 
         primary_record, fields = selected_fields(ordered)
 
@@ -240,6 +291,7 @@ def merge_event_records(
                     event_type=state_record.event_type,
                     affected_regions=state_fields["affected_regions"],
                     affected_assets=state_fields["affected_assets"],
+                    entity_resolution=state_fields["entity_resolution"],
                     capacity_mw=state_fields["capacity_mw"],
                     effective_start_at=state_start,
                     effective_end_at=(
@@ -248,6 +300,7 @@ def merge_event_records(
                     direction=state_record.direction,
                     status=state_record.status,
                     physical_effect=state_record.physical_effect,
+                    review_status=state_record.review_status,
                 )
             )
         merged.append(
@@ -259,6 +312,7 @@ def merge_event_records(
                 event_type=primary_record.event_type,
                 affected_regions=fields["affected_regions"],
                 affected_assets=fields["affected_assets"],
+                entity_resolution=fields["entity_resolution"],
                 capacity_mw=fields["capacity_mw"],
                 magnitude=fields["magnitude"],
                 announcement_available_at=earliest_document.available_at,
@@ -267,6 +321,9 @@ def merge_event_records(
                 direction=primary_record.direction,
                 status=primary_record.status,
                 physical_effect=primary_record.physical_effect,
+                confidence=primary_record.confidence,
+                time_resolution=primary_record.time_resolution,
+                review_status=primary_record.review_status,
                 extraction_traces=extraction_traces,
                 source_event_ids=tuple(dict.fromkeys(record.event_id for record, _ in ordered)),
                 document_refs=refs,
@@ -305,6 +362,10 @@ class AsOfEventAssembler:
                 continue
             quarantined.extend(result.candidate_quarantines)
             pairs.extend((event, document) for event in result.events)
+        resolutions = {result.supersedes_document_version_id: result.review_status for result in extraction_results
+                       if result.supersedes_document_version_id and result.review_status != "unreviewed"}
+        quarantined = [item.model_copy(update={"review_status": resolutions[item.document_version_id]})
+                       if item.document_version_id in resolutions else item for item in quarantined]
         return EventView(
             as_of=as_of,
             events=merge_event_records(pairs, as_of=as_of),

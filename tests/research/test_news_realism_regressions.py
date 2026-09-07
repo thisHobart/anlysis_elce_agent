@@ -18,9 +18,9 @@ from app.research.news import (
     build_event_features,
     merge_event_records,
 )
+from app.research.news.entity_resolution import _asset_source, resolve_entities
 from app.research.news.model_extraction import (
     _asset_signature,
-    _entity_supported,
     _event_signature,
 )
 
@@ -168,17 +168,20 @@ def test_values_that_are_not_supported_by_the_source_are_rejected(changes, reaso
 def test_compact_chinese_asset_mentions_do_not_authorize_an_invented_plant_name() -> None:
     quote = "太平岭核电厂1、2号机组因500kV输电线路故障进入厂用电运行工况。"
 
-    assert _entity_supported("太平岭核电厂1号机组", quote)
-    assert _entity_supported("太平岭核电厂2号机组", quote)
-    assert not _entity_supported("太平峪核电厂1号机组", quote)
+    assert _asset_source("太平岭核电厂1号机组", quote)
+    assert _asset_source("太平岭核电厂2号机组", quote)
+    assert not _asset_source("太平峪核电厂1号机组", quote)
 
 
 def test_coded_region_may_add_a_chinese_grid_suffix_without_changing_identity() -> None:
-    assert _entity_supported(
-        "TEST_NORTH电网",
-        "区域 TEST_NORTH 电力供需紧张",
-        allow_coded_region_suffix=True,
-    )
+    from app.research.news.contracts import EvidenceSpan
+
+    doc = _document(body="区域 TEST_NORTH 电力供需紧张")
+    span = EvidenceSpan(field_name="affected_regions", document_version_id=doc.document_version_id,
+                        text_field="body", start_char=0, end_char=len(doc.body), quote=doc.body)
+    resolution = resolve_entities(doc, ("TEST_NORTH电网",), (), (), [span])
+    assert resolution.region_keys == ("test_north",)
+    assert resolution.mentioned_regions[0].value == "TEST_NORTH"
 
 
 def test_one_bad_candidate_does_not_discard_a_valid_sibling() -> None:
@@ -186,14 +189,14 @@ def test_one_bad_candidate_does_not_discard_a_valid_sibling() -> None:
         affected_assets=["Plant B"],
         quantity=None,
         time_precision="day",
-        time_text="2026-09-01",
+        time_text="2026-09-02",  # Fabricated evidence, not merely an imprecise real date.
         event_instant=None,
     )
     result = _extract(_candidate(), vague)
 
     assert result.quarantine is None
     assert len(result.events) == 1
-    assert result.candidate_quarantines[0].reason_code == "missing_effective_start"
+    assert result.candidate_quarantines[0].reason_code == "invalid_evidence"
 
 
 def test_identical_recollection_is_a_duplicate_even_when_collected_later() -> None:

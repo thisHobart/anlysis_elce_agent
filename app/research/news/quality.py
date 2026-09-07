@@ -95,7 +95,7 @@ def evaluate_result_quality(
     unknown_feature_events = 0
     if features is not None:
         for row in features.rows:
-            for event_id in row.source_event_ids:
+            for event_id in (*row.source_event_ids, *row.upcoming_event_ids, *row.new_announcement_event_ids):
                 event = events_by_id.get(event_id)
                 if event is None:
                     unknown_feature_events += 1
@@ -106,6 +106,8 @@ def evaluate_result_quality(
     fingerprints_ok = bool(fingerprints) and all(_SHA256.fullmatch(value) for value in fingerprints.values())
 
     checks = (
+        ResultQualityCheck(code="input_records_valid", passed=not package.input_issues,
+                           detail=f"输入坏记录 {len(package.input_issues)} 条；详见导入隔离清单"),
         ResultQualityCheck(
             code="single_market_clock",
             passed=clock_ok and analysis_clock == prices.clock,
@@ -162,6 +164,8 @@ def evaluate_result_quality(
     )
     return ResultQualityAssessment(
         assessment_version=QUALITY_ASSESSMENT_VERSION,
-        scope="synthetic_p2_internal_validity",
+        scope=("synthetic_p2_internal_validity" if documents and all(
+            item.raw_metadata.get("fixture_id") for item in documents
+        ) else "p2_internal_validity"),
         checks=checks,
     )

@@ -20,10 +20,11 @@ from app.research.news.contracts import (
     NewsRelevance,
 )
 from app.research.news.entities import split_entity_keys
+from app.research.news.entity_resolution import entity_sources_are_valid
 from app.research.news.extraction import NewsEventExtractor, ObviousNewsEventExtractor
 from app.research.news.normalization import NewsNormalizer
 
-REAL_NEWS_BENCHMARK_VERSION = "1.1.0"
+REAL_NEWS_BENCHMARK_VERSION = "1.2.0"
 
 ExpectedDisposition = Literal["event", "quarantine", "irrelevant"]
 ActualDisposition = Literal["event", "quarantine", "irrelevant", "invalid"]
@@ -41,6 +42,11 @@ class RealNewsGoldRecord(BaseModel):
     expected_relevance: NewsRelevance
     expected_regions: tuple[str, ...] = ()
     expected_assets: tuple[str, ...] = ()
+    # Explicit keys are human-labelled expectations, never run through the resolver.
+    expected_region_keys: tuple[str, ...] | None = None
+    expected_asset_keys: tuple[str, ...] | None = None
+    expected_market_keys: tuple[str, ...] | None = None
+    expected_group_keys: tuple[str, ...] | None = None
     expected_capacity_mw: float | None = Field(default=None, gt=0)
     expected_start_at: datetime | None = None
     gold_reason: str = Field(min_length=1)
@@ -84,6 +90,8 @@ class RealNewsGoldManifest(BaseModel):
     purpose: str = Field(min_length=1)
     qualification_thresholds: BenchmarkThresholds
     records: tuple[RealNewsGoldRecord, ...] = Field(min_length=1)
+    evaluation_role: Literal["development", "regression", "independent_holdout"] = "development"
+    independently_reviewed: bool = False
 
     @model_validator(mode="after")
     def validate_unique_ids(self) -> RealNewsGoldManifest:
@@ -110,6 +118,11 @@ class RealNewsCaseResult(BaseModel):
     actual_relevance: str | None = None
     actual_regions: tuple[str, ...] = ()
     actual_assets: tuple[str, ...] = ()
+    actual_region_keys: tuple[str, ...] = ()
+    actual_asset_keys: tuple[str, ...] = ()
+    actual_market_keys: tuple[str, ...] = ()
+    actual_group_keys: tuple[str, ...] = ()
+    actual_event_ids: tuple[str, ...] = ()
     actual_capacity_mw: float | None = None
     actual_start_at: datetime | None = None
     quarantine_reason: str | None = None
@@ -118,6 +131,8 @@ class RealNewsCaseResult(BaseModel):
     relevance_match: bool = False
     region_match: bool = False
     asset_match: bool = False
+    market_match: bool = True
+    group_match: bool = True
     capacity_match: bool = False
     start_match: bool = False
     evidence_span_count: int = Field(ge=0)
@@ -364,6 +379,10 @@ def _score_case(
         actual_disposition = "irrelevant" if all(
             item.event_type in {"irrelevant", "unknown"} for item in extraction.events
         ) else "event"
+        if all(item.analysis_eligibility == "needs_time_review" for item in extraction.events):
+            # The old corpus disposition describes admission to precise price analysis.
+            # Facts now survive in the ledger, while the time gate remains closed.
+            actual_disposition = "quarantine"
 
     event_type_match = bool(
         event
@@ -379,8 +398,14 @@ def _score_case(
     # file cannot enumerate every phrasing a source might use for the same entity. The gold
     # side goes through the same split, so a reviewer's region/asset placement is not a trap.
     gold_regions, gold_assets = split_entity_keys(gold.expected_regions, gold.expected_assets)
-    region_match = bool(event and event.region_keys == gold_regions)
-    asset_match = bool(event and event.asset_keys == gold_assets)
+    if gold.expected_region_keys is not None:
+        gold_regions = gold.expected_region_keys
+    if gold.expected_asset_keys is not None:
+        gold_assets = gold.expected_asset_keys
+    region_match = bool(event and event.entity_fields_are_consistent() and event.region_keys == gold_regions)
+    asset_match = bool(event and event.entity_fields_are_consistent() and event.asset_keys == gold_assets)
+    market_match = gold.expected_market_keys is None or bool(event and event.market_keys == gold.expected_market_keys)
+    group_match = gold.expected_group_keys is None or bool(event and event.group_keys == gold.expected_group_keys)
     capacity_match = bool(
         event and _optional_float_equal(event.capacity_mw, gold.expected_capacity_mw)
     )
@@ -394,6 +419,8 @@ def _score_case(
             and relevance_match
             and region_match
             and asset_match
+            and market_match
+            and group_match
             and capacity_match
             and start_match
         )
@@ -427,6 +454,13 @@ def _score_case(
         gold_reason=gold.gold_reason,
         actual_regions=event.affected_regions if event is not None else (),
         actual_assets=event.affected_assets if event is not None else (),
+        actual_region_keys=event.region_keys if event is not None else (),
+        actual_asset_keys=event.asset_keys if event is not None else (),
+        actual_market_keys=event.market_keys if event is not None else (),
+        actual_group_keys=event.group_keys if event is not None else (),
+        actual_event_ids=tuple(sorted(item.event_id for item in extraction.events)),
+        market_match=market_match,
+        group_match=group_match,
         actual_capacity_mw=event.capacity_mw if event is not None else None,
         actual_start_at=event.effective_start_at if event is not None else None,
         quarantine_reason=(
@@ -464,6 +498,10 @@ def _minimum_check(
 
 
 def _event_evidence_is_complete(document: NewsDocument, event) -> bool:
+    if event.entity_resolution is not None and not entity_sources_are_valid(
+        event.entity_resolution, {document.document_version_id: document}
+    ):
+        return False
     required = {"relevance", "event_type"}
     if event.status != "unknown":
         required.add("status")
@@ -475,6 +513,8 @@ def _event_evidence_is_complete(document: NewsDocument, event) -> bool:
         required.add("affected_regions")
     if event.affected_assets:
         required.add("affected_assets")
+    if event.asset_groups:
+        required.add("asset_groups")
     if event.magnitude is not None:
         required.add("magnitude")
     if event.capacity_mw is not None:

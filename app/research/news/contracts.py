@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.research.news.entities import split_entity_keys
+from app.research.news.entities import canonical_assets, canonical_regions, split_entity_keys
+from app.research.news.entity_resolution import EntityResolution, RawEntityMention
 
 NewsRelevance = Literal["short_term", "long_horizon", "irrelevant"]
 NewsEventType = Literal[
@@ -75,6 +77,7 @@ ReviewStatus = Literal["unreviewed", "accepted", "corrected", "rejected"]
 RevisionFieldName = Literal[
     "affected_regions",
     "affected_assets",
+    "asset_groups",
     "capacity_mw",
     "magnitude",
     "effective_start_at",
@@ -259,7 +262,60 @@ class ExtractionTrace(BaseModel):
     output_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
-class EventRecord(BaseModel):
+class NewsInputIssue(BaseModel):
+    """One rejected input line, kept independently from document extraction failures."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    line_number: int = Field(ge=1)
+    source_path: str
+    reason: str
+    raw_line: str
+
+
+class EntityFields(BaseModel):
+    """Optional versioned resolution; absent on legacy records, whose keys stay unchanged."""
+
+    entity_resolution: EntityResolution | None = None
+
+    def entity_fields_are_consistent(self) -> bool:
+        return self.entity_resolution is None or (
+            canonical_regions(self.affected_regions) == self.entity_resolution.region_keys
+            and canonical_assets(self.affected_assets) == self.entity_resolution.asset_keys
+        )
+
+    @model_validator(mode="after")
+    def validate_entity_fields(self):
+        if not self.entity_fields_are_consistent():
+            raise ValueError("entity fields disagree with their persisted resolution")
+        return self
+
+
+    @property
+    def market_scope(self):
+        return self.entity_resolution.market_scope if self.entity_resolution else ()
+
+    @property
+    def mentioned_regions(self):
+        return self.entity_resolution.mentioned_regions if self.entity_resolution else ()
+
+    @property
+    def asset_groups(self):
+        return self.entity_resolution.asset_groups if self.entity_resolution else ()
+
+    @property
+    def raw_entity_mentions(self):
+        return self.entity_resolution.raw_entity_mentions if self.entity_resolution else ()
+
+    @property
+    def market_keys(self):
+        return self.entity_resolution.market_keys if self.entity_resolution else ()
+
+    @property
+    def group_keys(self):
+        return self.entity_resolution.group_keys if self.entity_resolution else ()
+
+
+class EventRecord(EntityFields):
     """One structured event candidate extracted from one normalized news version."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -283,6 +339,9 @@ class EventRecord(BaseModel):
     extractor_id: str = Field(min_length=1, max_length=128)
     extractor_version: str = Field(min_length=1, max_length=32)
     extraction_trace: ExtractionTrace | None = None
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    analysis_eligibility: Literal["eligible", "needs_time_review"] = "eligible"
+    review_status: ReviewStatus = "unreviewed"
     evidence: tuple[EvidenceSpan, ...] = ()
     # A missing field means "this version did not restate it".  A cleared field means the
     # source explicitly withdrew the previous value, so revision merging must not resurrect it.
@@ -314,7 +373,8 @@ class EventRecord(BaseModel):
             and self.effective_end_at < self.effective_start_at
         ):
             raise ValueError("effective_end_at must not be before effective_start_at")
-        if self.relevance == "short_term" and self.effective_start_at is None:
+        if (self.relevance == "short_term" and self.effective_start_at is None
+                and self.analysis_eligibility != "needs_time_review"):
             raise ValueError("short_term events require effective_start_at")
         if self.event_type == "irrelevant" and self.relevance != "irrelevant":
             raise ValueError("irrelevant event_type requires irrelevant relevance")
@@ -341,10 +401,14 @@ class EventRecord(BaseModel):
     # under regions on one run and assets on the next — stays one event.
     @property
     def region_keys(self) -> tuple[str, ...]:
+        if self.entity_resolution is not None:
+            return self.entity_resolution.region_keys
         return split_entity_keys(self.affected_regions, self.affected_assets)[0]
 
     @property
     def asset_keys(self) -> tuple[str, ...]:
+        if self.entity_resolution is not None:
+            return self.entity_resolution.asset_keys
         return split_entity_keys(self.affected_regions, self.affected_assets)[1]
 
 
@@ -352,6 +416,11 @@ class ExtractionQuarantine(BaseModel):
     """Why one document produced no event; it must not silently reach the event table."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+    raw_entity_mentions: tuple[RawEntityMention, ...] = ()
+    candidate_payload: dict[str, Any] | None = None
+    extraction_trace: ExtractionTrace | None = None
+    review_status: ReviewStatus = "unreviewed"
 
     document_version_id: str = Field(pattern=r"^newsv_[a-f0-9]{24}$")
     reason_code: QuarantineReason
@@ -371,6 +440,9 @@ class EventExtractionResult(BaseModel):
     # Candidate-level failures let a multi-event article keep its usable events.  `quarantine`
     # remains the document-level outcome used when no event can safely be retained.
     candidate_quarantines: tuple[ExtractionQuarantine, ...] = ()
+    pass_results: tuple[dict[str, Any], ...] = ()
+    review_status: ReviewStatus = "unreviewed"
+    supersedes_document_version_id: str | None = Field(default=None, pattern=r"^newsv_[a-f0-9]{24}$")
 
     @model_validator(mode="after")
     def validate_outcome_is_exclusive(self) -> EventExtractionResult:
@@ -435,7 +507,7 @@ class DocumentRef(BaseModel):
         return aware
 
 
-class EventStateRevision(BaseModel):
+class EventStateRevision(EntityFields):
     """One event state as it became knowable, used to build point-in-time features."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -451,13 +523,18 @@ class EventStateRevision(BaseModel):
     direction: EventDirection = "unknown"
     status: EventStatus = "unknown"
     physical_effect: PhysicalEffect = "unknown"
+    review_status: ReviewStatus = "unreviewed"
 
     @property
     def region_keys(self) -> tuple[str, ...]:
+        if self.entity_resolution is not None:
+            return self.entity_resolution.region_keys
         return split_entity_keys(self.affected_regions, self.affected_assets)[0]
 
     @property
     def asset_keys(self) -> tuple[str, ...]:
+        if self.entity_resolution is not None:
+            return self.entity_resolution.asset_keys
         return split_entity_keys(self.affected_regions, self.affected_assets)[1]
 
     @field_validator("available_at", "effective_start_at", "effective_end_at")
@@ -483,7 +560,7 @@ class EventStateRevision(BaseModel):
         return self
 
 
-class MergedEvent(BaseModel):
+class MergedEvent(EntityFields):
     """One real-world event assembled from every version and repost visible at `as_of`."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -509,6 +586,8 @@ class MergedEvent(BaseModel):
     document_refs: tuple[DocumentRef, ...] = Field(min_length=1)
     revision_count: int = Field(ge=1)
     review_status: ReviewStatus = "unreviewed"
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    time_resolution: TimeResolution | None = None
     state_history: tuple[EventStateRevision, ...] = ()
 
     @field_validator("as_of", "announcement_available_at", "effective_start_at", "effective_end_at")
@@ -523,10 +602,14 @@ class MergedEvent(BaseModel):
 
     @property
     def region_keys(self) -> tuple[str, ...]:
+        if self.entity_resolution is not None:
+            return self.entity_resolution.region_keys
         return split_entity_keys(self.affected_regions, self.affected_assets)[0]
 
     @property
     def asset_keys(self) -> tuple[str, ...]:
+        if self.entity_resolution is not None:
+            return self.entity_resolution.asset_keys
         return split_entity_keys(self.affected_regions, self.affected_assets)[1]
 
     @model_validator(mode="after")
@@ -577,6 +660,12 @@ class EventFeatureRow(BaseModel):
     direction_down_count: int = Field(ge=0)
     event_type_counts: dict[str, int] = Field(default_factory=dict)
     source_event_ids: tuple[str, ...] = ()
+    new_announcement_count: int = Field(default=0, ge=0)
+    new_announcement_event_ids: tuple[str, ...] = ()
+    upcoming_event_count: int = Field(default=0, ge=0)
+    upcoming_event_ids: tuple[str, ...] = ()
+    next_effective_in_hours: float | None = Field(default=None, ge=0)
+    capacity_by_effect_mw: dict[str, float | None] = Field(default_factory=dict)
 
     @field_validator("interval_start")
     @classmethod
@@ -588,6 +677,13 @@ class EventFeatureRow(BaseModel):
 
     @model_validator(mode="after")
     def validate_counts(self) -> EventFeatureRow:
+        if self.new_announcement_count != len(self.new_announcement_event_ids):
+            raise ValueError("new announcement count must match its source events")
+        if self.upcoming_event_count != len(self.upcoming_event_ids):
+            raise ValueError("upcoming count must match its source events")
+        if any(value is not None and (value < 0 or not math.isfinite(value))
+               for value in self.capacity_by_effect_mw.values()):
+            raise ValueError("capacity by effect must be finite and non-negative or unknown")
         if self.active_event_count != len(self.source_event_ids):
             raise ValueError("active_event_count must match the listed source events")
         if self.active_event_count == 0 and self.active_capacity_mw != 0:

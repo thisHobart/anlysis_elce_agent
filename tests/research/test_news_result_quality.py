@@ -61,6 +61,7 @@ def test_completed_study_passes_every_internal_quality_gate(effective_study: New
     assert assessment.passed
     assert assessment.failed_checks == ()
     assert {check.code for check in assessment.checks} == {
+        "input_records_valid",
         "single_market_clock",
         "document_market_coverage",
         "price_grid_and_values",

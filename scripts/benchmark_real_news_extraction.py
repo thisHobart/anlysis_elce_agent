@@ -61,6 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Return a non-zero exit code when the extractor misses a qualification threshold.",
     )
+    parser.add_argument("--require-independent-holdout", action="store_true",
+                        help="Require a corpus declared independent and reviewed by a second annotator.")
     parser.add_argument(
         "--verbose",
         action="store_true",
@@ -147,7 +149,7 @@ def _print_human_report(
     titles: dict[str, str],
     model_debug: dict[str, list[dict]],
 ) -> None:
-    status_label = "通过" if report.qualified else "未通过"
+    status_label = "通过" if payload["status"] == "qualified" else "未通过"
     print("\nP2 真实新闻抽取资格报告")
     print("=" * 72)
     print(f"总体结果：{status_label}（{payload['status']}）")
@@ -254,6 +256,11 @@ _STABILITY_FIELDS = (
     "actual_event_type",
     "actual_regions",
     "actual_assets",
+    "actual_region_keys",
+    "actual_asset_keys",
+    "actual_market_keys",
+    "actual_group_keys",
+    "actual_event_ids",
     "actual_start_at",
     "quarantine_reason",
     "passed",
@@ -298,6 +305,10 @@ def _stability_summary(runs: list) -> dict:
         "unstable_verdicts": verdict_unstable,
         "cases": cases,
     }
+
+
+def repeated_runs_qualified(runs) -> bool:
+    return bool(runs) and all(run.qualified for run in runs) and not _stability_summary(runs)["unstable_cases"]
 
 
 def main() -> int:
@@ -354,6 +365,9 @@ def main() -> int:
             }
         )
     report = runs[-1]
+    stability = _stability_summary(runs)
+    independent_corpus = manifest.evaluation_role == "independent_holdout" and manifest.independently_reviewed
+    qualified = repeated_runs_qualified(runs) and (not args.require_independent_holdout or independent_corpus)
     documents = NewsNormalizer().normalize_many(records)
     titles = {
         str(document.raw_metadata["corpus_id"]): document.title
@@ -361,7 +375,13 @@ def main() -> int:
     }
     generated_at = datetime.now(UTC)
     payload = {
-        "status": "qualified" if report.qualified else "not_qualified",
+        "status": "qualified" if qualified else "not_qualified",
+        "qualification_scope": "all_runs_and_case_stability",
+        "corpus_role": manifest.evaluation_role,
+        "independent_holdout_passed": independent_corpus,
+        "qualification_failures": (["corpus_not_independent"]
+                                   if args.require_independent_holdout and not independent_corpus else []),
+        "runs": [run.model_dump(mode="json") for run in runs],
         "generated_at": generated_at.isoformat(),
         "news_path": str(args.news.resolve()),
         "gold_path": str(args.gold.resolve()),
@@ -380,7 +400,7 @@ def main() -> int:
         },
     }
     if repeats > 1:
-        payload["stability"] = _stability_summary(runs)
+        payload["stability"] = stability
     if model_debug:
         payload["model_debug"] = model_debug
     args.output.mkdir(parents=True, exist_ok=True)
@@ -416,7 +436,7 @@ def main() -> int:
         )
     else:
         print(json.dumps(printable, ensure_ascii=False, indent=2))
-    return 1 if args.require_qualified and not report.qualified else 0
+    return 1 if (args.require_qualified or args.require_independent_holdout) and not qualified else 0
 
 
 if __name__ == "__main__":

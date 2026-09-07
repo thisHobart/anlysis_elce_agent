@@ -63,6 +63,10 @@ records:
     expected_relevance: long_horizon
     expected_regions: [Great Britain]
     expected_assets: []
+    expected_region_keys: [GB]
+    expected_asset_keys: []
+    expected_market_keys: [GB]
+    expected_group_keys: [AGR]
     expected_capacity_mw: null
     expected_start_at: null
     gold_reason: 明确说明多座AGR在本十年结束运行，长期事件无需短期结算时刻。
@@ -72,8 +76,12 @@ records:
     expected_disposition: event
     expected_event_types: [generation_outage]
     expected_relevance: short_term
-    expected_regions: [QLD]
+    expected_regions: []
     expected_assets: [Millmerran Power Station Unit 1, Millmerran Power Station Unit 2]
+    expected_region_keys: []
+    expected_asset_keys: [millmerranpowerstationunit1, millmerranpowerstationunit2]
+    expected_market_keys: [NEM-QLD]
+    expected_group_keys: []
     expected_capacity_mw: 870.0
     expected_start_at: "2013-12-22T22:56:00Z"
     gold_reason: 标题给出日期，正文给出时刻、双机跳闸和损失出力，来源市场时区明确。

@@ -1,5 +1,7 @@
 # P2 目标模式 Agent Evaluation 与 Validation
 
+> 文档定位：2026-08-31 的合成数据验证记录。模型、测试数量和结论只适用于表中版本，不代表当前真实新闻准入状态；最新状态见 [P2 进展状态](phase2-status.md)。
+
 | 字段 | 内容 |
 |---|---|
 | 测试日期 | 2026-08-31 |
@@ -93,8 +95,10 @@ Agent 可见输入只包含事件结果、统计量、证据和指纹，不包�
 
 验收制品：
 
-- [Run 1](../artifacts/acceptance/phase2-agent-goal-f66db7c4074c.json)
-- [Run 2](../artifacts/acceptance/phase2-agent-goal-dec8ae6f372c.json)
+- Run 1：`artifacts/acceptance/phase2-agent-goal-f66db7c4074c.json`
+- Run 2：`artifacts/acceptance/phase2-agent-goal-dec8ae6f372c.json`
+
+这些是当时生成的本地制品路径，不随仓库提交；本文保留运行摘要作为历史记录。
 
 ## 6. 复现
 

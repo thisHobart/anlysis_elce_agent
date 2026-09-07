@@ -40,7 +40,7 @@ def test_model_schema_version_literal_matches_the_published_schema_version():
         }
     )
 
-    assert result.schema_version == "1.2.0"
+    assert result.schema_version == "1.3.0"
 
 
 def _document_payload(messages) -> dict:
@@ -299,6 +299,7 @@ def _real_source_outputs() -> dict[str, dict]:
                     text_field="body",
                     quote=r05,
                     regions=["Great Britain"],
+                    assets=["AGRs"],
                     time_precision="vague",
                     time_text="this decade",
                 )

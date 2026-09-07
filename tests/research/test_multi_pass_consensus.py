@@ -176,11 +176,13 @@ def test_unanimous_irrelevant_is_still_accepted() -> None:
     assert result.events[0].event_type == "irrelevant"
 
 
-def test_unanimous_quarantine_keeps_the_real_reason_instead_of_an_inconsistency_label() -> None:
+def test_unanimous_date_only_facts_survive_without_admission_to_price_analysis() -> None:
     result, _ = _extract(_event_payload(precision="day"), passes=3)
 
-    assert result.quarantine is not None
-    assert result.quarantine.reason_code == "missing_effective_start"
+    assert result.quarantine is None
+    assert result.events[0].analysis_eligibility == "needs_time_review"
+    assert result.events[0].effective_start_at is None
+    assert len(result.pass_results) == 3
 
 
 def test_events_that_disagree_on_content_go_to_review() -> None:
@@ -294,8 +296,8 @@ def _payload_with_asset(asset: str) -> dict:
     return payload
 
 
-def test_the_same_asset_described_two_ways_takes_the_majority_spelling() -> None:
-    """Two passes wrote AGRs where a third spelled the reactors out; that is one asset."""
+def test_group_aliases_agree_after_classification_without_voting() -> None:
+    """A controlled group alias is equivalent; it must never become a named asset."""
 
     result, _ = _extract(
         _payload_with_asset("AGRs"),
@@ -306,7 +308,17 @@ def test_the_same_asset_described_two_ways_takes_the_majority_spelling() -> None
     )
 
     assert result.quarantine is None
-    assert result.events[0].affected_assets == ("AGRs",)
+    assert result.events[0].affected_assets == ()
+    assert result.events[0].group_keys == ("AGR",)
+
+
+def test_two_votes_for_one_plant_do_not_override_a_different_plant() -> None:
+    result, _ = _extract(
+        _payload_with_asset("Unit A"), _payload_with_asset("Unit A"),
+        _payload_with_asset("Unit B"), passes=3, body=ASSET_BODY,
+    )
+    assert result.quarantine is not None
+    assert result.quarantine.reason_code == "inconsistent_extraction"
 
 
 def test_three_different_asset_names_have_no_majority_and_go_to_review() -> None:

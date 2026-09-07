@@ -20,7 +20,9 @@ from app.research.news.contracts import (
     MergedEvent,
 )
 
-FEATURE_VERSION = "1.1.0"
+FEATURE_VERSION = "1.2.0"
+CAPACITY_EFFECTS = ("supply_up", "supply_down", "demand_up", "demand_down", "transfer_up", "transfer_down",
+                    "mixed", "unknown")
 
 FEATURE_EVENT_TYPES: tuple[str, ...] = (
     "generation_outage",
@@ -56,12 +58,14 @@ def _known_state(
             event_type=event.event_type,
             affected_regions=event.affected_regions,
             affected_assets=event.affected_assets,
+            entity_resolution=event.entity_resolution,
             capacity_mw=event.capacity_mw,
             effective_start_at=event.effective_start_at,
             effective_end_at=event.effective_end_at,
             direction=event.direction,
             status=event.status,
             physical_effect=event.physical_effect,
+            review_status=event.review_status,
         ),
         event.announcement_available_at,
     )
@@ -72,6 +76,7 @@ def _restoration_end(
     outage_start: datetime,
     events: Sequence[MergedEvent],
     knowledge_at: datetime,
+    market_keys: tuple[str, ...] = (),
 ) -> datetime | None:
     """Conservatively pair a restoration with an outage only on the same named asset."""
 
@@ -86,7 +91,9 @@ def _restoration_end(
         if (
             state.event_type == "generation_restore"
             and state.status != "cancelled"
+            and state.review_status != "rejected"
             and state.asset_keys == outage_asset_keys
+            and (not market_keys or state.market_keys == market_keys)
             and state.effective_start_at is not None
             and state.effective_start_at >= outage_start
         ):
@@ -119,7 +126,7 @@ def _is_active(
         return False
     effective_end = state.effective_end_at
     restored_at = (
-        _restoration_end(state.asset_keys, state.effective_start_at, events, knowledge_at)
+        _restoration_end(state.asset_keys, state.effective_start_at, events, knowledge_at, state.market_keys)
         if state.event_type == "generation_outage"
         else None
     )
@@ -163,6 +170,8 @@ def build_event_features(
         interval_end = interval_start + clock.interval
         knowledge_at = min(interval_start, as_of)
         active_with_state: list[tuple[MergedEvent, EventStateRevision]] = []
+        upcoming: list[tuple[MergedEvent, EventStateRevision]] = []
+        announced: list[str] = []
         for event in short_term:
             known = _known_state(event, knowledge_at)
             if known is None:
@@ -170,6 +179,14 @@ def build_event_features(
             state, state_available_at = known
             if state.relevance != "short_term":
                 continue
+            if state.entity_resolution is not None and not state.entity_resolution.matches_market(clock.market):
+                continue
+            if state.status == "cancelled" or state.review_status == "rejected":
+                continue
+            if interval_start - clock.interval < event.announcement_available_at <= knowledge_at:
+                announced.append(event.event_id)
+            if state.effective_start_at is not None and state.effective_start_at > interval_start:
+                upcoming.append((event, state))
             if _is_active(
                 event,
                 state,
@@ -195,6 +212,11 @@ def build_event_features(
             # At least one active event has unknown size, so the total is not a known number.
             capacity = None
 
+        by_effect = {}
+        for effect in CAPACITY_EFFECTS:
+            values = [state.capacity_mw for _, state in active_with_state if state.physical_effect == effect]
+            by_effect[effect] = None if any(value is None for value in values) else round(sum(values), 6)
+
         rows.append(
             EventFeatureRow(
                 interval_start=interval_start,
@@ -204,6 +226,15 @@ def build_event_features(
                 direction_down_count=sum(1 for _, state in active_with_state if state.direction == "down"),
                 event_type_counts=counts,
                 source_event_ids=tuple(sorted(event.event_id for event in active)),
+                new_announcement_count=len(announced),
+                new_announcement_event_ids=tuple(sorted(announced)),
+                upcoming_event_count=len(upcoming),
+                upcoming_event_ids=tuple(sorted(event.event_id for event, _ in upcoming)),
+                next_effective_in_hours=min(
+                    ((state.effective_start_at - interval_start).total_seconds() / 3600 for _, state in upcoming),
+                    default=None,
+                ),
+                capacity_by_effect_mw=by_effect,
             )
         )
 
@@ -229,18 +260,7 @@ def _snapshot_hash(
             "feature_version": feature_version,
             "interval_minutes": clock.interval_minutes,
             "market": clock.market,
-            "rows": [
-                {
-                    "active_capacity_mw": row.active_capacity_mw,
-                    "active_event_count": row.active_event_count,
-                    "direction_down_count": row.direction_down_count,
-                    "direction_up_count": row.direction_up_count,
-                    "event_type_counts": row.event_type_counts,
-                    "interval_start": row.interval_start.isoformat(),
-                    "source_event_ids": list(row.source_event_ids),
-                }
-                for row in rows
-            ],
+            "rows": [row.model_dump(mode="json") for row in rows],
             "timezone": clock.timezone,
         },
         ensure_ascii=False,
@@ -265,6 +285,8 @@ def snapshot_to_csv_rows(snapshot: EventFeatureSnapshot) -> tuple[tuple[str, ...
         "direction_up_count",
         "direction_down_count",
         *(f"count_{event_type}" for event_type in FEATURE_EVENT_TYPES),
+        "new_announcement_count", "upcoming_event_count", "next_effective_in_hours",
+        *(f"capacity_{effect}_mw" for effect in CAPACITY_EFFECTS),
     )
     body = tuple(
         (
@@ -275,6 +297,10 @@ def snapshot_to_csv_rows(snapshot: EventFeatureSnapshot) -> tuple[tuple[str, ...
             str(row.direction_up_count),
             str(row.direction_down_count),
             *(str(row.event_type_counts.get(event_type, 0)) for event_type in FEATURE_EVENT_TYPES),
+            str(row.new_announcement_count), str(row.upcoming_event_count),
+            "" if row.next_effective_in_hours is None else f"{row.next_effective_in_hours:g}",
+            *("" if row.capacity_by_effect_mw.get(effect) is None else f"{row.capacity_by_effect_mw[effect]:g}"
+              for effect in CAPACITY_EFFECTS),
         )
         for row in snapshot.rows
     )
