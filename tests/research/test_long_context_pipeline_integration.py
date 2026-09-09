@@ -56,7 +56,9 @@ def _study(case_id: str):
         FunctionalLongContextGateway(),
         market_timezone=prices.clock.timezone,
         context_window_tokens=30_000,
-        unit_tokens=40,
+        # Keep one complete event/cancellation sentence in a unit here; boundary
+        # fragmentation is measured separately by the functional benchmark.
+        unit_tokens=100,
     )
     return run_news_price_study(
         adapter=_Adapter(_record(case)),
