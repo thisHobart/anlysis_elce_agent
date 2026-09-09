@@ -11,6 +11,7 @@ from app.llm import compat
 from app.llm.gateway import (
     ModelConfigurationError,
     ModelMessage,
+    ModelOutputTruncatedError,
     ModelProtocolError,
     ModelResponseError,
 )
@@ -85,6 +86,7 @@ class RecordingModel:
                     "id": "call-1",
                 }
             ],
+            response_metadata={},
         )
 
     def with_structured_output(self, schema, *, method, include_raw):
@@ -120,6 +122,16 @@ def test_structured_output_uses_native_function_calling_and_typed_messages():
     assert model.method == "function_calling"
     assert model.include_raw is True
     assert isinstance(model.last_messages[0], HumanMessage)
+
+
+def test_parseable_structured_output_is_rejected_when_provider_reports_truncation():
+    gateway = ResearchModelGateway(_settings())
+    model = RecordingModel()
+    model.response.response_metadata = {"finish_reason": "length"}
+    gateway._model = model
+
+    with pytest.raises(ModelOutputTruncatedError, match="响应不完整"):
+        gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
 
 
 def test_structured_output_method_follows_the_configured_native_protocol():

@@ -9,6 +9,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.config import Settings, get_settings
 from app.llm import compat
+from app.llm.context_safety import ensure_complete_response
 from app.llm.gateway import (
     ModelConfigurationError,
     ModelGatewayError,
@@ -68,6 +69,7 @@ class GeminiModelGateway:
             "max_retries": self.settings.llm_max_retries,
             "timeout": self.settings.llm_timeout_seconds,
             "include_thoughts": False,
+            "max_output_tokens": self.settings.llm_max_output_tokens,
             "vertexai": self.settings.llm_google_vertexai,
         }
         if self.settings.llm_google_vertexai:
@@ -148,6 +150,7 @@ class GeminiModelGateway:
             if raw is None:
                 raise ModelResponseError("Gemini 结构化输出缺少 raw，无法核对模型原文。")
             self._guard_thinking(raw)
+            ensure_complete_response(raw)
             parsed = result.get("parsed")
             parsing_error = result.get("parsing_error")
             self._observe_structured_output(raw, parsed, parsing_error)

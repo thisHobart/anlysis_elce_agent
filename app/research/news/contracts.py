@@ -68,6 +68,8 @@ QuarantineReason = Literal[
     "market_mismatch",
     "missing_effective_start",
     "model_response_invalid",
+    "context_limit_exceeded",
+    "model_output_truncated",
     "model_unavailable",
     "uncertain_extraction",
     "event_contract_violation",

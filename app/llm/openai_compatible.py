@@ -10,6 +10,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.config import Settings, get_settings
 from app.llm import compat
+from app.llm.context_safety import ensure_complete_response
 from app.llm.gateway import (
     ModelConfigurationError,
     ModelGatewayError,
@@ -169,6 +170,7 @@ class ResearchModelGateway:
             "timeout": self.settings.llm_timeout_seconds,
             "max_retries": self.settings.llm_max_retries,
             "use_responses_api": self.settings.llm_api_style == "responses",
+            "max_tokens": self.settings.llm_max_output_tokens,
         }
         if "temperature" not in self._disabled:
             options["temperature"] = 0
@@ -259,6 +261,7 @@ class ResearchModelGateway:
             if raw is None:
                 raise ModelResponseError("大模型结构化输出缺少 raw，无法验证协议。")
             self._guard_thinking(raw)
+            ensure_complete_response(raw)
             parsed = result.get("parsed")
             parsing_error = result.get("parsing_error")
             if parsing_error is not None:

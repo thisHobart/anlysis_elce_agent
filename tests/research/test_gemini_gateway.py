@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from app.config import Settings
 from app.llm.factory import build_model_gateway
-from app.llm.gateway import ModelConfigurationError, ModelMessage
+from app.llm.gateway import ModelConfigurationError, ModelMessage, ModelOutputTruncatedError
 from app.llm.gemini import GeminiModelGateway
 from app.llm.openai_compatible import ResearchModelGateway
 
@@ -28,10 +28,11 @@ def _settings(**overrides) -> Settings:
 
 
 class RecordingGeminiModel:
-    def __init__(self) -> None:
+    def __init__(self, *, finish_reason: str = "STOP") -> None:
         self.method = None
         self.include_raw = None
         self.last_messages = None
+        self.finish_reason = finish_reason
 
     def with_structured_output(self, schema, *, method, include_raw):
         self.method = method
@@ -45,7 +46,7 @@ class RecordingGeminiModel:
                         content='{"value":"ok"}',
                         additional_kwargs={},
                         tool_calls=[],
-                        response_metadata={"finish_reason": "STOP", "secret": "discard"},
+                        response_metadata={"finish_reason": self.finish_reason, "secret": "discard"},
                     ),
                     "parsed": schema(value="ok"),
                     "parsing_error": None,
@@ -103,6 +104,17 @@ def test_gemini_structured_output_always_uses_native_json_schema_and_exposes_raw
             "response_metadata": {"finish_reason": "STOP"},
         }
     ]
+
+
+def test_gemini_rejects_parseable_output_when_finish_reason_is_max_tokens():
+    gateway = GeminiModelGateway(_settings())
+    gateway._model = RecordingGeminiModel(finish_reason="MAX_TOKENS")
+
+    with pytest.raises(ModelOutputTruncatedError, match="响应不完整"):
+        gateway.invoke_structured(
+            messages=[ModelMessage(role="user", content="test")],
+            schema=StructuredAnswer,
+        )
 
 
 def test_gemini_rejects_cherry_model_prefix_with_actionable_error():
