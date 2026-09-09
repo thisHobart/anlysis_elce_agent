@@ -83,3 +83,12 @@ def test_incomplete_long_context_processing_never_reaches_price_windows():
     assert not any(event.analysis_eligibility == "eligible" for event in study.view.events)
     assert study.view.quarantined or study.package.events_not_analyzed
 
+
+def test_withdrawn_event_stays_auditable_but_is_excluded_from_price_windows():
+    study = _study("LC07")
+
+    assert len(study.view.events) == 1
+    event = study.view.events[0]
+    assert event.status == "cancelled"
+    assert not study.analysis.results
+    assert any(item[0] == event.event_id for item in study.package.events_not_analyzed)

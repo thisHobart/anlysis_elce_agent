@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
+import time
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
+from statistics import mean
 from typing import Any
 
 import yaml
@@ -18,11 +21,21 @@ if str(ROOT) not in sys.path:
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-from app.llm.gateway import ModelMessage, ModelResponseError
+from app.llm.context_safety import structured_request_budget
+from app.llm.gateway import (
+    ModelContextLimitError,
+    ModelMessage,
+    ModelOutputTruncatedError,
+    ModelResponseError,
+)
 from app.research.news import CollectedNewsRecord, NewsNormalizer
 from app.research.news.long_context import (
     LONG_CONTEXT_STRATEGY,
     build_long_context_extractor,
+)
+from app.research.news.model_extraction import (
+    ModelNewsExtraction,
+    build_model_news_extraction_messages,
 )
 
 DEFAULT_CASES = ROOT / "tests" / "fixtures" / "news_long_context" / "gold_cases.yaml"
@@ -33,6 +46,12 @@ TAIL = "大唐尾部电厂2号机组于2026-05-24T04:00:00+08:00发生跳闸。"
 RESTORE = "国电恢复电厂5号机组于2026-05-24T05:00:00+08:00恢复并网。"
 CROSS_ASSET = "华能跨段电厂3号机组发生紧急停机。"
 CROSS_DETAIL = "本次事件影响出力20万千瓦，发生于2026-05-24T06:00:00+08:00。"
+RETRACTION = (
+    "撤回：有关华能测试电厂1号机组于2026-05-24T02:30:00+08:00紧急停机的消息不实，"
+    "该机组正常运行。"
+)
+BOUNDARY = "华能边界电厂6号机组于2026-05-24T06:30:00+08:00紧急停机，影响出力10万千瓦。"
+TRUNCATE_OUTPUT = "TRUNCATE_OUTPUT"
 
 
 def _claims(
@@ -173,6 +192,31 @@ def _cross() -> dict[str, Any]:
     return candidate
 
 
+def _cancelled_outage() -> dict[str, Any]:
+    return _candidate(
+        event_type="generation_outage",
+        status="cancelled",
+        physical_effect="unknown",
+        fact_quote=RETRACTION,
+        status_quote=RETRACTION,
+        asset="华能测试电厂1号机组",
+        instant="2026-05-24T02:30:00+08:00",
+    )
+
+
+def _boundary() -> dict[str, Any]:
+    return _candidate(
+        event_type="generation_outage",
+        status="occurred",
+        physical_effect="supply_down",
+        fact_quote=BOUNDARY,
+        asset="华能边界电厂6号机组",
+        instant="2026-05-24T06:30:00+08:00",
+        quantity_value=10,
+        quantity_quote="10万千瓦",
+    )
+
+
 class FunctionalLongContextGateway:
     """A deterministic model substitute; it sees only the text each strategy sends."""
 
@@ -199,8 +243,12 @@ class FunctionalLongContextGateway:
     def _document_or_chunk(self, text: str, schema):
         if "FAIL_STEP" in text:
             raise ModelResponseError("injected functional failure")
+        if TRUNCATE_OUTPUT in text:
+            raise ModelOutputTruncatedError("injected maximum output token failure")
         candidates: list[dict[str, Any]] = []
-        if CORRECTION in text and OUTAGE in text:
+        if RETRACTION in text:
+            candidates.append(_cancelled_outage())
+        elif CORRECTION in text and OUTAGE in text:
             candidates.append(_outage(30, corrected=True))
         elif OUTAGE in text:
             candidates.append(_outage())
@@ -212,6 +260,8 @@ class FunctionalLongContextGateway:
             candidates.append(_restore())
         if CROSS_ASSET in text and CROSS_DETAIL in text:
             candidates.append(_cross())
+        if BOUNDARY in text:
+            candidates.append(_boundary())
         if candidates:
             return schema.model_validate({"disposition": "event", "events": candidates})
         quote = text[: min(30, len(text))]
@@ -229,6 +279,8 @@ class FunctionalLongContextGateway:
         state = payload["validated_state"]
         if "FAIL_STEP" in text:
             raise ModelResponseError("injected functional failure")
+        if TRUNCATE_OUTPUT in text:
+            raise ModelOutputTruncatedError("injected maximum output token failure")
         operations: list[dict[str, Any]] = []
         if OUTAGE in text:
             operations.append({"action": "upsert", "candidate": _outage()})
@@ -240,6 +292,12 @@ class FunctionalLongContextGateway:
             operations.append({"action": "upsert", "candidate": _tail()})
         if RESTORE in text:
             operations.append({"action": "upsert", "candidate": _restore()})
+        if RETRACTION in text:
+            if not state and OUTAGE not in text:
+                return schema.model_validate({"uncertainty_reason": "撤回前没有已验证状态"})
+            operations.append({"action": "withdraw", "candidate": _cancelled_outage()})
+        if BOUNDARY in text:
+            operations.append({"action": "upsert", "candidate": _boundary()})
         if operations:
             return schema.model_validate({"operations": operations})
         quote = text[: min(30, len(text))]
@@ -275,6 +333,8 @@ class FaultInjectingGateway:
         text = payload["segment"]["text"] if "segment" in payload else payload["body"]
         if "FAIL_STEP" in text:
             raise ModelResponseError("injected live functional failure")
+        if TRUNCATE_OUTPUT in text:
+            raise ModelOutputTruncatedError("injected live maximum output token failure")
         return self.delegate.invoke_structured(messages=messages, schema=schema)
 
 
@@ -306,6 +366,69 @@ def _document(case: dict[str, Any]):
     )
 
 
+def _price_admissible(event) -> bool:
+    return (
+        event.analysis_eligibility == "eligible"
+        and event.status != "cancelled"
+        and event.relevance == "short_term"
+        and event.event_type not in {"irrelevant", "unknown"}
+        and event.effective_start_at is not None
+    )
+
+
+def _percentile_95(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
+
+
+def run_context_boundary_checks() -> dict[str, Any]:
+    """Exercise below/equal/above-limit behavior for one complete structured request."""
+
+    document = _document(load_cases()[0])
+    messages = build_model_news_extraction_messages(document, market_timezone="Asia/Shanghai")
+    measured = structured_request_budget(
+        messages,
+        ModelNewsExtraction,
+        context_window_tokens=10**12,
+        reserved_output_tokens=100,
+        safety_tokens=50,
+    )
+    required = measured.required_tokens
+    profiles = (
+        ("request_below_limit", required + 1, True),
+        ("request_equal_limit", required, True),
+        ("request_above_limit", required - 1, False),
+    )
+    outcomes = []
+    for name, limit, expected_acceptance in profiles:
+        try:
+            structured_request_budget(
+                messages,
+                ModelNewsExtraction,
+                context_window_tokens=limit,
+                reserved_output_tokens=100,
+                safety_tokens=50,
+            )
+            accepted = True
+        except ModelContextLimitError:
+            accepted = False
+        outcomes.append(
+            {
+                "profile": name,
+                "required_tokens": required,
+                "context_window_tokens": limit,
+                "accepted": accepted,
+                "passed": accepted == expected_acceptance,
+            }
+        )
+    return {
+        "passed": all(item["passed"] for item in outcomes),
+        "profiles": outcomes,
+    }
+
+
 def run_benchmark(
     path: Path = DEFAULT_CASES,
     *,
@@ -316,25 +439,31 @@ def run_benchmark(
     gold_total = actual_total = true_positive = 0
     evidence_valid = evidence_total = unsafe_price_admissions = 0
     total_calls = total_tokens = 0
+    latencies: list[float] = []
     for case in load_cases(path):
         gateway = gateway_factory()
         extractor = build_long_context_extractor(
             gateway,
             market_timezone="Asia/Shanghai",
-            context_window_tokens=30_000,
+            context_window_tokens=case.get("context_window_tokens", 30_000),
             unit_tokens=unit_tokens,
         )
         document = _document(case)
+        case_started = time.perf_counter()
         result = extractor.extract(document)
+        latency = time.perf_counter() - case_started
+        latencies.append(latency)
         events = [event for event in result.events if event.event_type != "irrelevant"]
         actual_types = Counter(event.event_type for event in events)
         expected_types = Counter(case["expected_event_types"])
+        actual_statuses = Counter(event.status for event in events)
+        expected_statuses = Counter(case["expected_statuses"])
         matched = sum((actual_types & expected_types).values())
         if case["expectation"] == "complete":
             gold_total += sum(expected_types.values())
             actual_total += sum(actual_types.values())
             true_positive += matched
-        elif any(event.analysis_eligibility == "eligible" for event in events):
+        elif any(_price_admissible(event) for event in events):
             unsafe_price_admissions += 1
         for event in events:
             for span in event.evidence:
@@ -346,28 +475,35 @@ def run_benchmark(
             total_calls += coverage.model_calls
             total_tokens += coverage.estimated_input_tokens
         capacities = sorted(event.capacity_mw for event in events if event.capacity_mw is not None)
+        price_admissions = sum(_price_admissible(event) for event in events)
         outcomes.append(
             {
                 "case_id": case["case_id"],
                 "expectation": case["expectation"],
                 "expected_event_types": list(expected_types.elements()),
                 "actual_event_types": list(actual_types.elements()),
+                "expected_statuses": list(expected_statuses.elements()),
+                "actual_statuses": list(actual_statuses.elements()),
                 "expected_capacities_mw": sorted(case["expected_capacities_mw"]),
                 "actual_capacities_mw": capacities,
                 "coverage_complete": bool(coverage and coverage.complete),
-                "price_eligible_events": sum(event.analysis_eligibility == "eligible" for event in events),
+                "price_eligible_events": price_admissions,
+                "latency_seconds": round(latency, 4),
                 "passed": (
                     actual_types == expected_types
+                    and actual_statuses == expected_statuses
                     and capacities == sorted(case["expected_capacities_mw"])
                     and bool(coverage and coverage.complete)
+                    and price_admissions == case["expected_price_admissions"]
                     if case["expectation"] == "complete"
-                    else not any(event.analysis_eligibility == "eligible" for event in events)
+                    else price_admissions == 0
                 ),
             }
         )
     precision = true_positive / actual_total if actual_total else 0.0
     recall = true_positive / gold_total if gold_total else 0.0
     return {
+        "scorer_version": "strict-v2",
         "strategy": LONG_CONTEXT_STRATEGY,
         "corpus": str(path),
         "case_count": len(outcomes),
@@ -378,6 +514,11 @@ def run_benchmark(
         "unsafe_price_admissions": unsafe_price_admissions,
         "model_calls": total_calls,
         "estimated_input_tokens": total_tokens,
+        "average_latency_seconds": round(mean(latencies), 4) if latencies else 0.0,
+        "p95_latency_seconds": round(_percentile_95(latencies), 4),
+        "output_tokens_available": False,
+        "estimated_cost_available": False,
+        "context_boundary_checks": run_context_boundary_checks(),
         "cases": outcomes,
     }
 
@@ -407,6 +548,7 @@ def main() -> int:
             [
                 (
                     tuple(case["actual_event_types"]),
+                    tuple(case["actual_statuses"]),
                     tuple(case["actual_capacities_mw"]),
                     case["coverage_complete"],
                     case["price_eligible_events"],
@@ -421,6 +563,7 @@ def main() -> int:
         )
         report = {
             "mode": "live",
+            "scorer_version": "strict-v2",
             "strategy": LONG_CONTEXT_STRATEGY,
             "repeats": args.repeats,
             "stable_case_rate": round(stable / len(signatures[0]), 4),
@@ -433,6 +576,18 @@ def main() -> int:
             "average_estimated_input_tokens": round(
                 sum(run["estimated_input_tokens"] for run in runs) / len(runs), 4
             ),
+            "average_latency_seconds": round(
+                mean(case["latency_seconds"] for run in runs for case in run["cases"]), 4
+            ),
+            "p95_latency_seconds": round(
+                _percentile_95(
+                    [case["latency_seconds"] for run in runs for case in run["cases"]]
+                ),
+                4,
+            ),
+            "output_tokens_available": False,
+            "estimated_cost_available": False,
+            "context_boundary_checks": runs[0]["context_boundary_checks"],
             "runs": runs,
         }
     else:

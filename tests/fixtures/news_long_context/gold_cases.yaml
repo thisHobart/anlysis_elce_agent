@@ -6,7 +6,9 @@ cases:
       - text: "华能测试电厂1号机组于2026-05-24T02:30:00+08:00紧急停机，影响出力约60万千瓦。"
         repeat: 1
     expected_event_types: [generation_outage]
+    expected_statuses: [occurred]
     expected_capacities_mw: [600.0]
+    expected_price_admissions: 1
     expectation: complete
 
   - case_id: LC02
@@ -17,7 +19,9 @@ cases:
       - text: "大唐尾部电厂2号机组于2026-05-24T04:00:00+08:00发生跳闸。"
         repeat: 1
     expected_event_types: [generation_outage]
+    expected_statuses: [occurred]
     expected_capacities_mw: []
+    expected_price_admissions: 1
     expectation: complete
 
   - case_id: LC03
@@ -28,7 +32,9 @@ cases:
       - text: "国电恢复电厂5号机组于2026-05-24T05:00:00+08:00恢复并网。"
         repeat: 1
     expected_event_types: [generation_outage, generation_restore]
+    expected_statuses: [occurred, restored]
     expected_capacities_mw: [600.0]
+    expected_price_admissions: 2
     expectation: complete
 
   - case_id: LC04
@@ -41,7 +47,9 @@ cases:
       - text: "更正：上述华能测试电厂1号机组影响出力应为30万千瓦，事件时间仍为2026-05-24T02:30:00+08:00。"
         repeat: 1
     expected_event_types: [generation_outage]
+    expected_statuses: [corrected]
     expected_capacities_mw: [300.0]
+    expected_price_admissions: 1
     expectation: complete
 
   - case_id: LC05
@@ -54,7 +62,9 @@ cases:
       - text: "国电恢复电厂5号机组于2026-05-24T05:00:00+08:00恢复并网。"
         repeat: 1
     expected_event_types: [generation_outage, generation_restore]
+    expected_statuses: [occurred, restored]
     expected_capacities_mw: [600.0]
+    expected_price_admissions: 0
     expectation: safe_failure
 
   - case_id: LC06
@@ -65,5 +75,60 @@ cases:
       - text: "本次事件影响出力20万千瓦，发生于2026-05-24T06:00:00+08:00。"
         repeat: 1
     expected_event_types: [generation_outage]
+    expected_statuses: [occurred]
     expected_capacities_mw: [200.0]
+    expected_price_admissions: 1
     expectation: complete
+
+  - case_id: LC07
+    description: 后文撤回前文停运事件
+    body_parts:
+      - text: "华能测试电厂1号机组于2026-05-24T02:30:00+08:00紧急停机，影响出力约60万千瓦。"
+        repeat: 1
+      - text: "普通背景材料。"
+        repeat: 40
+      - text: "撤回：有关华能测试电厂1号机组于2026-05-24T02:30:00+08:00紧急停机的消息不实，该机组正常运行。"
+        repeat: 1
+    expected_event_types: [generation_outage]
+    expected_statuses: [cancelled]
+    expected_capacities_mw: []
+    expected_price_admissions: 0
+    expectation: complete
+
+  - case_id: LC08
+    description: 中文词语、句子和时间表达靠近切分边界
+    body_parts:
+      - text: "边界测试包含中文词语人工智能、英文AI、数字12345及特殊符号%/+，下一句用于靠近切分位置。"
+        repeat: 24
+      - text: "华能边界电厂6号机组于2026-05-24T06:30:00+08:00紧急停机，影响出力10万千瓦。"
+        repeat: 1
+    expected_event_types: [generation_outage]
+    expected_statuses: [occurred]
+    expected_capacities_mw: [100.0]
+    expected_price_admissions: 1
+    expectation: complete
+
+  - case_id: LC09
+    description: 模型输出达到最大 Token 限制
+    body_parts:
+      - text: "华能测试电厂1号机组于2026-05-24T02:30:00+08:00紧急停机，影响出力约60万千瓦。"
+        repeat: 1
+      - text: "TRUNCATE_OUTPUT：模拟服务商以最大输出 Token 原因终止响应。"
+        repeat: 1
+    expected_event_types: [generation_outage]
+    expected_statuses: [occurred]
+    expected_capacities_mw: [600.0]
+    expected_price_admissions: 0
+    expectation: safe_failure
+
+  - case_id: LC10
+    description: 完整请求超过可用上下文限制
+    context_window_tokens: 1
+    body_parts:
+      - text: "华能测试电厂1号机组于2026-05-24T02:30:00+08:00紧急停机，影响出力约60万千瓦。"
+        repeat: 1
+    expected_event_types: [generation_outage]
+    expected_statuses: [occurred]
+    expected_capacities_mw: [600.0]
+    expected_price_admissions: 0
+    expectation: safe_failure
