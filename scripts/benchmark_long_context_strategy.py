@@ -355,7 +355,9 @@ def _document(case: dict[str, Any]):
             source_name="long-context-functional-corpus",
             source_document_id=case["case_id"],
             source_ref=f"fixture://long-context/{case['case_id']}",
-            title=case["description"],
+            # Gold descriptions explain the expected failure shape and must never leak
+            # into model-visible input.
+            title=f"长文本功能样本 {case['case_id']}",
             body=case["body"],
             published_at=datetime(2026, 5, 24, 7, tzinfo=UTC),
             collected_at=datetime(2026, 5, 24, 7, 1, tzinfo=UTC),

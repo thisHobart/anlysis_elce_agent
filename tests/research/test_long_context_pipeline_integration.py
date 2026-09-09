@@ -28,7 +28,7 @@ def _record(case):
         source_name="long-context-integration",
         source_document_id=case["case_id"],
         source_ref=f"fixture://long-context-integration/{case['case_id']}",
-        title=case["description"],
+        title=f"长文本功能样本 {case['case_id']}",
         body=case["body"],
         published_at=datetime(2026, 5, 24, 7, tzinfo=UTC),
         collected_at=datetime(2026, 5, 24, 7, 1, tzinfo=UTC),

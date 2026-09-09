@@ -1,4 +1,5 @@
 from scripts.benchmark_long_context_strategy import (
+    _document,
     load_cases,
     run_benchmark,
     run_context_boundary_checks,
@@ -34,3 +35,9 @@ def test_complete_request_budget_accepts_below_and_equal_but_rejects_above_limit
 
     assert report["passed"]
     assert [item["accepted"] for item in report["profiles"]] == [True, True, False]
+
+
+def test_gold_descriptions_do_not_leak_into_model_visible_titles() -> None:
+    case = next(item for item in load_cases() if item["case_id"] == "LC07")
+
+    assert case["description"] not in _document(case).title
