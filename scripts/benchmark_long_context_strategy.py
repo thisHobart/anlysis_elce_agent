@@ -205,9 +205,7 @@ class FunctionalLongContextGateway:
         elif OUTAGE in text:
             candidates.append(_outage())
         elif CORRECTION in text:
-            return schema.model_validate(
-                {"disposition": "uncertain", "uncertainty_reason": "更正缺少被更正事件上下文"}
-            )
+            candidates.append(_outage(30, corrected=True))
         if TAIL in text:
             candidates.append(_tail())
         if RESTORE in text:
@@ -252,6 +250,32 @@ class FunctionalLongContextGateway:
                 ]
             }
         )
+
+
+class FaultInjectingGateway:
+    """Apply the same deterministic failed-range scenario to real provider runs."""
+
+    def __init__(self, delegate) -> None:
+        self.delegate = delegate
+
+    @property
+    def model_name(self):
+        return self.delegate.model_name
+
+    @property
+    def enabled(self):
+        return self.delegate.enabled
+
+    def invoke_structured(self, *, messages: list[ModelMessage], schema):
+        payload = next(
+            json.loads(message.content)
+            for message in messages
+            if message.role == "user" and message.content.lstrip().startswith("{")
+        )
+        text = payload["segment"]["text"] if "segment" in payload else payload["body"]
+        if "FAIL_STEP" in text:
+            raise ModelResponseError("injected live functional failure")
+        return self.delegate.invoke_structured(messages=messages, schema=schema)
 
 
 def load_cases(path: Path = DEFAULT_CASES) -> list[dict[str, Any]]:
@@ -333,7 +357,7 @@ def run_benchmark(
                 "coverage_complete": bool(coverage and coverage.complete),
                 "price_eligible_events": sum(event.analysis_eligibility == "eligible" for event in events),
                 "passed": (
-                    matched == sum(expected_types.values())
+                    actual_types == expected_types
                     and capacities == sorted(case["expected_capacities_mw"])
                     and bool(coverage and coverage.complete)
                     if case["expectation"] == "complete"
@@ -374,7 +398,7 @@ def main() -> int:
         runs = [
             run_benchmark(
                 args.cases,
-                gateway_factory=build_model_gateway,
+                gateway_factory=lambda: FaultInjectingGateway(build_model_gateway()),
                 unit_tokens=args.unit_tokens,
             )
             for _ in range(args.repeats)
