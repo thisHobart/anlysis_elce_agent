@@ -475,6 +475,13 @@ def run_benchmark(
                 source = getattr(document, span.text_field)
                 evidence_valid += source[span.start_char : span.end_char] == span.quote
         coverage = result.coverage
+        quarantine_reason_codes = [
+            item.reason_code
+            for item in (
+                *((result.quarantine,) if result.quarantine is not None else ()),
+                *result.candidate_quarantines,
+            )
+        ]
         if coverage is not None:
             total_calls += coverage.model_calls
             total_tokens += coverage.estimated_input_tokens
@@ -491,6 +498,7 @@ def run_benchmark(
                 "expected_capacities_mw": sorted(case["expected_capacities_mw"]),
                 "actual_capacities_mw": capacities,
                 "coverage_complete": bool(coverage and coverage.complete),
+                "quarantine_reason_codes": quarantine_reason_codes,
                 "price_eligible_events": price_admissions,
                 "latency_seconds": round(latency, 4),
                 "passed": (
@@ -555,6 +563,7 @@ def main() -> int:
                     tuple(case["actual_statuses"]),
                     tuple(case["actual_capacities_mw"]),
                     case["coverage_complete"],
+                    tuple(case["quarantine_reason_codes"]),
                     case["price_eligible_events"],
                 )
                 for case in run["cases"]
