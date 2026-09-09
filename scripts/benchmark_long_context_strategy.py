@@ -39,6 +39,8 @@ from app.research.news.model_extraction import (
 )
 
 DEFAULT_CASES = ROOT / "tests" / "fixtures" / "news_long_context" / "gold_cases.yaml"
+BENCHMARK_RESERVED_OUTPUT_TOKENS = 4096
+BENCHMARK_SAFETY_TOKENS = 1024
 
 OUTAGE = "华能测试电厂1号机组于2026-05-24T02:30:00+08:00紧急停机，影响出力约60万千瓦。"
 CORRECTION = "更正：上述华能测试电厂1号机组影响出力应为30万千瓦，事件时间仍为2026-05-24T02:30:00+08:00。"
@@ -396,8 +398,8 @@ def run_context_boundary_checks() -> dict[str, Any]:
         messages,
         ModelNewsExtraction,
         context_window_tokens=10**12,
-        reserved_output_tokens=100,
-        safety_tokens=50,
+        reserved_output_tokens=BENCHMARK_RESERVED_OUTPUT_TOKENS,
+        safety_tokens=BENCHMARK_SAFETY_TOKENS,
     )
     required = measured.required_tokens
     profiles = (
@@ -412,8 +414,8 @@ def run_context_boundary_checks() -> dict[str, Any]:
                 messages,
                 ModelNewsExtraction,
                 context_window_tokens=limit,
-                reserved_output_tokens=100,
-                safety_tokens=50,
+                reserved_output_tokens=BENCHMARK_RESERVED_OUTPUT_TOKENS,
+                safety_tokens=BENCHMARK_SAFETY_TOKENS,
             )
             accepted = True
         except ModelContextLimitError:
