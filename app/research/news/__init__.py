@@ -92,6 +92,7 @@ from app.research.news.features import (
     build_event_features,
     snapshot_to_csv_rows,
 )
+from app.research.news.long_context import FullContextNewsExtractor, ModelRoute
 from app.research.news.merging import AsOfEventAssembler, EventView, merge_event_records
 from app.research.news.model_extraction import (
     MODEL_EXTRACTION_PROMPT_VERSION,
@@ -165,6 +166,7 @@ __all__ = [
     "ExtractionQuarantine",
     "ExtractionTrace",
     "ExtractionValidationError",
+    "FullContextNewsExtractor",
     "JsonlCollectedNewsAdapter",
     "LeadTimeReading",
     "MarketClock",
@@ -174,6 +176,7 @@ __all__ = [
     "ModelEvidenceClaim",
     "ModelNewsExtraction",
     "ModelQuantityCandidate",
+    "ModelRoute",
     "NewsDocument",
     "NewsEventExtractor",
     "NewsNormalizer",
