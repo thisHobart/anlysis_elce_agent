@@ -1,4 +1,7 @@
-strategy,branch,repeats,cases_per_run,strict_passed_by_run,average_passed_cases,stable_case_rate,average_event_precision,average_event_recall,evidence_integrity,unsafe_price_admissions,average_model_calls,average_estimated_input_tokens,strict_failures
-full_context,codex/p2-full-context,2,6,6|5,5.5,0.8333,1.0000,0.9167,1.0000,0,6.0,20829,run2:LC04
-chunk_merge,codex/p2-chunk-merge,2,6,4|5,4.5,0.8333,1.0000,0.9167,1.0000,0,9.0,29220,run1:LC02|LC04;run2:LC02
-incremental_state,codex/p2-incremental-state,2,6,5|3,4.0,0.6667,0.8452,0.9167,1.0000,0,14.5,27790,run1:LC06;run2:LC02|LC04|LC06
+test_mode,strategy,branch,repeats,cases_per_run,strict_passed_by_run,average_passed_cases,stable_case_rate,event_precision_by_run,event_recall_by_run,evidence_integrity,unsafe_price_admissions,average_model_calls,average_estimated_input_tokens,average_latency_seconds,p95_latency_seconds,output_tokens_available,estimated_cost_available,failures
+deterministic,full_context,codex/p2-full-context,1,10,10,10.0,1.0,1.0,1.0,1.0,0,9.0,30644,0.0033,0.0083,false,false,none
+deterministic,chunk_merge,codex/p2-chunk-merge,1,10,9,9.0,1.0,1.0,1.0,1.0,0,641.0,1794745,0.2112,1.0722,false,false,LC07:disputed_irrelevance
+deterministic,incremental_state,codex/p2-incremental-state,1,10,8,8.0,1.0,1.0,0.875,1.0,0,168.0,297653,0.0445,0.2052,false,false,LC06:uncertain_extraction;LC07:status_not_cancelled
+live,full_context,codex/p2-full-context,2,10,9|8,8.5,0.9,1.0|1.0,0.875|0.75,1.0,0,9.0,30644,11.9765,29.8742,false,false,run1:LC07-output_truncated;run2:LC04-output_truncated|LC07-output_truncated
+live,chunk_merge,codex/p2-chunk-merge,2,10,8|8,8.0,0.8,1.0|1.0,0.875|0.75,1.0,0,13.0,41830,15.5936,34.0226,false,false,run1:LC07-output_truncated|LC08-response_invalid;run2:LC04-output_truncated|LC07-output_truncated
+live,incremental_state,codex/p2-incremental-state,2,10,7|8,7.5,0.8,1.0|1.0,0.875|1.0,1.0,0,22.0,41366.5,24.7129,70.8166,false,false,run1:LC04-output_truncated|LC06-response_invalid|LC08-response_invalid;run2:LC04-response_invalid|LC06-response_invalid
