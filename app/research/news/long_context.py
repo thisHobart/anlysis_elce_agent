@@ -26,6 +26,34 @@ from app.research.news.model_extraction import (
     build_model_news_extraction_messages,
 )
 
+LONG_CONTEXT_STRATEGY = "full_context"
+
+
+def build_long_context_extractor(
+    gateway: ModelGateway,
+    *,
+    market_timezone: str,
+    context_window_tokens: int,
+    unit_tokens: int,
+) -> FullContextNewsExtractor:
+    """Uniform factory used by the cross-branch functional benchmark."""
+
+    del unit_tokens
+    return FullContextNewsExtractor(
+        (
+            ModelRoute(
+                "configured-full-context-model",
+                gateway,
+                context_window_tokens=context_window_tokens,
+                reserved_output_tokens=100,
+                safety_tokens=50,
+            ),
+        ),
+        market_timezone=market_timezone,
+        extraction_passes=1,
+        max_repair_attempts=0,
+    )
+
 
 @dataclass(frozen=True)
 class ModelRoute:

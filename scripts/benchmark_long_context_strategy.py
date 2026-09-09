@@ -4,21 +4,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
+from app.llm.gateway import ModelMessage, ModelResponseError
+from app.research.news import CollectedNewsRecord, NewsNormalizer
 from app.research.news.long_context import (
     LONG_CONTEXT_STRATEGY,
     build_long_context_extractor,
 )
 
-from app.llm.gateway import ModelMessage, ModelResponseError
-from app.research.news import CollectedNewsRecord, NewsNormalizer
-
-ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CASES = ROOT / "tests" / "fixtures" / "news_long_context" / "gold_cases.yaml"
 
 OUTAGE = "华能测试电厂1号机组于2026-05-24T02:30:00+08:00紧急停机，影响出力约60万千瓦。"
@@ -287,7 +293,7 @@ def run_benchmark(path: Path = DEFAULT_CASES) -> dict[str, Any]:
             gateway,
             market_timezone="Asia/Shanghai",
             context_window_tokens=30_000,
-            unit_tokens=80,
+            unit_tokens=40,
         )
         document = _document(case)
         result = extractor.extract(document)
