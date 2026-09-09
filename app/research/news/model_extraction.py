@@ -22,6 +22,7 @@ from app.llm.gateway import (
     ModelOutputTruncatedError,
     ModelResponseError,
     ModelThinkingError,
+    ModelTransientError,
 )
 from app.research.news.contracts import (
     EventExtractionBatch,
@@ -423,6 +424,13 @@ class StructuredNewsEventExtractor:
             return self._quarantine(
                 document,
                 reason_code="model_output_truncated",
+                message=str(exc),
+            )
+        except ModelTransientError as exc:
+            print(f"[新闻抽取] 模型端点暂时不可用，隔离：{exc}")
+            return self._quarantine(
+                document,
+                reason_code="model_unavailable",
                 message=str(exc),
             )
         except ModelResponseError as exc:

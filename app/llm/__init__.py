@@ -10,6 +10,7 @@ from app.llm.gateway import (
     ModelOutputTruncatedError,
     ModelProtocolError,
     ModelResponseError,
+    ModelTransientError,
 )
 from app.llm.gemini import GeminiModelGateway
 from app.llm.openai_compatible import ResearchModelGateway
@@ -24,6 +25,7 @@ __all__ = [
     "ModelOutputTruncatedError",
     "ModelProtocolError",
     "ModelResponseError",
+    "ModelTransientError",
     "ResearchModelGateway",
     "build_model_gateway",
 ]

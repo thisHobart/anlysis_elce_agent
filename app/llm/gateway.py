@@ -62,6 +62,10 @@ class ModelResponseError(ModelGatewayError):
     """The model returned an invalid or empty response."""
 
 
+class ModelTransientError(ModelGatewayError):
+    """A retryable transport or provider failure affected one invocation."""
+
+
 class ModelContextLimitError(ModelResponseError):
     """A complete request cannot fit in the configured model context window."""
 

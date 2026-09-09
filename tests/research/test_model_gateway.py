@@ -14,6 +14,7 @@ from app.llm.gateway import (
     ModelOutputTruncatedError,
     ModelProtocolError,
     ModelResponseError,
+    ModelTransientError,
 )
 from app.llm.openai_compatible import ResearchModelGateway
 
@@ -145,6 +146,18 @@ def test_sdk_length_exception_is_exposed_as_output_truncation() -> None:
     gateway._model = model
 
     with pytest.raises(ModelOutputTruncatedError, match="token 限制"):
+        gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
+
+
+def test_provider_500_is_exposed_as_invocation_scoped_transient_failure() -> None:
+    server_error = RuntimeError("internal server error")
+    server_error.status_code = 500
+    gateway = ResearchModelGateway(_settings())
+    model = RecordingModel()
+    model.structured_error = server_error
+    gateway._model = model
+
+    with pytest.raises(ModelTransientError, match="暂时不可用"):
         gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
 
 

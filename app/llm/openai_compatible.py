@@ -20,6 +20,7 @@ from app.llm.gateway import (
     ModelResponseError,
     ModelThinkingError,
     ModelToolCall,
+    ModelTransientError,
     StructuredResult,
 )
 from app.llm.langchain_support import (
@@ -303,6 +304,8 @@ class ResearchModelGateway:
         except Exception as exc:
             if is_output_truncation_error(exc):
                 raise ModelOutputTruncatedError(f"模型输出达到 token 限制：{exc}") from exc
+            if compat.is_transient_failure(exc):
+                raise ModelTransientError(f"模型端点暂时不可用：{type(exc).__name__}: {exc}") from exc
             if compat.is_rejected_request(exc):
                 raise self._protocol_error("结构化输出/Function Calling", exc) from exc
             raise ModelGatewayError(f"大模型调用失败：{type(exc).__name__}: {exc}") from exc
@@ -319,6 +322,8 @@ class ResearchModelGateway:
         except ModelGatewayError:
             raise
         except Exception as exc:
+            if compat.is_transient_failure(exc):
+                raise ModelTransientError(f"模型端点暂时不可用：{type(exc).__name__}: {exc}") from exc
             raise ModelGatewayError(f"大模型调用失败：{type(exc).__name__}: {exc}") from exc
         if not answer:
             raise ModelResponseError("大模型返回了空回复。")
@@ -353,6 +358,8 @@ class ResearchModelGateway:
         except ValidationError as exc:
             raise ModelResponseError(f"大模型函数参数无法解析：{exc}") from exc
         except Exception as exc:
+            if compat.is_transient_failure(exc):
+                raise ModelTransientError(f"模型端点暂时不可用：{type(exc).__name__}: {exc}") from exc
             if compat.is_rejected_request(exc):
                 raise self._protocol_error("Function Calling", exc) from exc
             raise ModelGatewayError(f"大模型函数选择失败：{type(exc).__name__}: {exc}") from exc
