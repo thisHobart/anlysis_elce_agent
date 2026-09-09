@@ -1,0 +1,4 @@
+strategy,branch,repeats,cases_per_run,strict_passed_by_run,average_passed_cases,stable_case_rate,average_event_precision,average_event_recall,evidence_integrity,unsafe_price_admissions,average_model_calls,average_estimated_input_tokens,strict_failures
+full_context,codex/p2-full-context,2,6,6|5,5.5,0.8333,1.0000,0.9167,1.0000,0,6.0,20829,run2:LC04
+chunk_merge,codex/p2-chunk-merge,2,6,4|5,4.5,0.8333,1.0000,0.9167,1.0000,0,9.0,29220,run1:LC02|LC04;run2:LC02
+incremental_state,codex/p2-incremental-state,2,6,5|3,4.0,0.6667,0.8452,0.9167,1.0000,0,14.5,27790,run1:LC06;run2:LC02|LC04|LC06
