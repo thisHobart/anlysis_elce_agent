@@ -9,7 +9,7 @@
 
 | 检查 | 状态 | 结果 |
 |---|---|---|
-| 三分支全量 pytest | PASS | 全文 604、分块 606、增量状态 607，均全部通过 |
+| 三分支全量 pytest | PASS | 全文 604、分块 607、增量状态 608，均全部通过 |
 | 三分支 Ruff | PASS | `app`、`tests`、`scripts` 均通过 |
 | 价格准入集成测试 | PASS | 每分支 3 个场景：完整事件、部分失败、撤回事件 |
 | 确定性功能基准 | PASS WITH FINDINGS | 10 个统一用例；安全门禁三者通过；严格通过 10/9/8 |
@@ -40,6 +40,7 @@
 | 5 | SHOULD FIX | 当前网关没有可靠输出 token 和价格 usage | 报告标记不可用；列为生产前数据契约门禁 | Accepted for selection |
 | 6 | SHOULD FIX | 真实模型只有 2 轮、语料为 10 个合成用例 | 限制结论为 MVP 选型；生产前要求真实新闻保留集 | Accepted for selection |
 | 7 | MUST FIX BEFORE DEPLOYMENT | 本地 `llm_context_window_tokens=0`，测试显式使用 30,000 | 部署前必须为每个路由配置并核验正数窗口 | Deferred to deployment gate |
+| 8 | MUST FIX | benchmark 预检一度只预留 100 输出 token 和 50 安全 token，与真实网关 4,096/1,024 不一致 | 三分支统一为 4,096/1,024；确定性、阈值和全量回归重跑，实时模型输入内容未改变 | Fixed |
 
 ## 交付决定
 
@@ -48,4 +49,3 @@
 - [ ] 阻止本次方案选择。
 
 限制条件：生产准入必须补做真实新闻保留集、实际长度分布、隔离率、输出截断率和真实 usage/成本验证，并完成部署上下文窗口配置。
-
