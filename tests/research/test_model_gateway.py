@@ -60,6 +60,8 @@ class BoundModel:
         self.owner = owner
 
     def invoke(self, messages):
+        if self.owner.structured_error is not None:
+            raise self.owner.structured_error
         self.owner.last_messages = messages
         return {
             "raw": self.owner.response,
@@ -88,6 +90,7 @@ class RecordingModel:
             ],
             response_metadata={},
         )
+        self.structured_error = None
 
     def with_structured_output(self, schema, *, method, include_raw):
         self.method = method
@@ -131,6 +134,17 @@ def test_parseable_structured_output_is_rejected_when_provider_reports_truncatio
     gateway._model = model
 
     with pytest.raises(ModelOutputTruncatedError, match="响应不完整"):
+        gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
+
+
+def test_sdk_length_exception_is_exposed_as_output_truncation() -> None:
+    LengthFinishReasonError = type("LengthFinishReasonError", (RuntimeError,), {})
+    gateway = ResearchModelGateway(_settings())
+    model = RecordingModel()
+    model.structured_error = LengthFinishReasonError("length limit was reached")
+    gateway._model = model
+
+    with pytest.raises(ModelOutputTruncatedError, match="token 限制"):
         gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
 
 

@@ -10,11 +10,12 @@ from pydantic import BaseModel, ValidationError
 
 from app.config import Settings, get_settings
 from app.llm import compat
-from app.llm.context_safety import ensure_complete_response
+from app.llm.context_safety import ensure_complete_response, is_output_truncation_error
 from app.llm.gateway import (
     ModelConfigurationError,
     ModelGatewayError,
     ModelMessage,
+    ModelOutputTruncatedError,
     ModelProtocolError,
     ModelResponseError,
     ModelThinkingError,
@@ -300,6 +301,8 @@ class ResearchModelGateway:
         except (ValidationError, ValueError, TypeError, AttributeError) as exc:
             raise ModelResponseError(f"大模型结构化函数参数无法解析：{exc}") from exc
         except Exception as exc:
+            if is_output_truncation_error(exc):
+                raise ModelOutputTruncatedError(f"模型输出达到 token 限制：{exc}") from exc
             if compat.is_rejected_request(exc):
                 raise self._protocol_error("结构化输出/Function Calling", exc) from exc
             raise ModelGatewayError(f"大模型调用失败：{type(exc).__name__}: {exc}") from exc

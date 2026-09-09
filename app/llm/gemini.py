@@ -9,11 +9,12 @@ from pydantic import BaseModel, ValidationError
 
 from app.config import Settings, get_settings
 from app.llm import compat
-from app.llm.context_safety import ensure_complete_response
+from app.llm.context_safety import ensure_complete_response, is_output_truncation_error
 from app.llm.gateway import (
     ModelConfigurationError,
     ModelGatewayError,
     ModelMessage,
+    ModelOutputTruncatedError,
     ModelProtocolError,
     ModelResponseError,
     ModelThinkingError,
@@ -164,6 +165,8 @@ class GeminiModelGateway:
         except (ValidationError, ValueError, TypeError, AttributeError) as exc:
             raise ModelResponseError(f"Gemini 响应未通过本地 schema 校验：{exc}") from exc
         except Exception as exc:
+            if is_output_truncation_error(exc):
+                raise ModelOutputTruncatedError(f"Gemini 输出达到 token 限制：{exc}") from exc
             if compat.is_rejected_request(exc):
                 raise ModelProtocolError(
                     "当前 Gemini 模型拒绝了原生 JSON Schema 请求："

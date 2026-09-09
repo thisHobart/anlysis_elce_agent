@@ -107,3 +107,19 @@ def ensure_complete_response(response: Any) -> None:
         raise ModelOutputTruncatedError(
             f"模型输出达到 token 限制，响应不完整（finish_reason={reason}）"
         )
+
+
+def is_output_truncation_error(error: BaseException) -> bool:
+    """Recognize SDK exceptions raised before a provider response envelope is returned."""
+
+    name = type(error).__name__.casefold()
+    message = str(error).casefold()
+    return name in {"lengthfinishreasonerror", "maxtokenserror"} or any(
+        marker in message
+        for marker in (
+            "length limit was reached",
+            "finish_reason=max_tokens",
+            "finish reason: max_tokens",
+            "finishreason.max_tokens",
+        )
+    )

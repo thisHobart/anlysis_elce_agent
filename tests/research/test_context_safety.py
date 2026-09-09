@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from app.llm.context_safety import (
     conservative_token_count,
     ensure_complete_response,
+    is_output_truncation_error,
     structured_request_budget,
 )
 from app.llm.gateway import ModelContextLimitError, ModelMessage, ModelOutputTruncatedError
@@ -65,3 +66,12 @@ def test_conservative_counter_does_not_split_or_mutate_unicode() -> None:
     text = "人工智能⚡AEMO-123"
     assert conservative_token_count(text) > 0
     assert text == "人工智能⚡AEMO-123"
+
+
+def test_sdk_length_exception_is_recognized_before_a_response_envelope_exists() -> None:
+    LengthFinishReasonError = type("LengthFinishReasonError", (RuntimeError,), {})
+
+    assert is_output_truncation_error(
+        LengthFinishReasonError("Could not parse response content as the length limit was reached")
+    )
+    assert not is_output_truncation_error(RuntimeError("connection reset"))
