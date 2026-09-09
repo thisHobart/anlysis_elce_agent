@@ -87,11 +87,11 @@ cases:
         repeat: 1
       - text: "普通背景材料。"
         repeat: 40
-      - text: "撤回：有关华能测试电厂1号机组于2026-05-24T02:30:00+08:00紧急停机的消息不实，该机组正常运行。"
+      - text: "撤回：有关华能测试电厂1号机组于2026-05-24T02:30:00+08:00紧急停机、影响出力60万千瓦的消息不实，该机组正常运行。"
         repeat: 1
     expected_event_types: [generation_outage]
     expected_statuses: [cancelled]
-    expected_capacities_mw: []
+    expected_capacities_mw: [600.0]
     expected_price_admissions: 0
     expectation: complete
 
