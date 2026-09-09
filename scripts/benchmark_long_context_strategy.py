@@ -282,18 +282,23 @@ def _document(case: dict[str, Any]):
     )
 
 
-def run_benchmark(path: Path = DEFAULT_CASES) -> dict[str, Any]:
+def run_benchmark(
+    path: Path = DEFAULT_CASES,
+    *,
+    gateway_factory=FunctionalLongContextGateway,
+    unit_tokens: int = 40,
+) -> dict[str, Any]:
     outcomes: list[dict[str, Any]] = []
     gold_total = actual_total = true_positive = 0
     evidence_valid = evidence_total = unsafe_price_admissions = 0
     total_calls = total_tokens = 0
     for case in load_cases(path):
-        gateway = FunctionalLongContextGateway()
+        gateway = gateway_factory()
         extractor = build_long_context_extractor(
             gateway,
             market_timezone="Asia/Shanghai",
             context_window_tokens=30_000,
-            unit_tokens=40,
+            unit_tokens=unit_tokens,
         )
         document = _document(case)
         result = extractor.extract(document)
@@ -357,8 +362,57 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cases", type=Path, default=DEFAULT_CASES)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--live", action="store_true", help="Use the configured real model endpoint")
+    parser.add_argument("--repeats", type=int, default=2)
+    parser.add_argument("--unit-tokens", type=int, default=800)
     args = parser.parse_args()
-    report = run_benchmark(args.cases)
+    if args.live:
+        from app.llm import build_model_gateway
+
+        if args.repeats < 1:
+            parser.error("--repeats must be positive")
+        runs = [
+            run_benchmark(
+                args.cases,
+                gateway_factory=build_model_gateway,
+                unit_tokens=args.unit_tokens,
+            )
+            for _ in range(args.repeats)
+        ]
+        signatures = [
+            [
+                (
+                    tuple(case["actual_event_types"]),
+                    tuple(case["actual_capacities_mw"]),
+                    case["coverage_complete"],
+                    case["price_eligible_events"],
+                )
+                for case in run["cases"]
+            ]
+            for run in runs
+        ]
+        stable = sum(
+            len({run_signature[index] for run_signature in signatures}) == 1
+            for index in range(len(signatures[0]))
+        )
+        report = {
+            "mode": "live",
+            "strategy": LONG_CONTEXT_STRATEGY,
+            "repeats": args.repeats,
+            "stable_case_rate": round(stable / len(signatures[0]), 4),
+            "average_passed_cases": round(
+                sum(run["passed_cases"] for run in runs) / len(runs), 4
+            ),
+            "average_model_calls": round(
+                sum(run["model_calls"] for run in runs) / len(runs), 4
+            ),
+            "average_estimated_input_tokens": round(
+                sum(run["estimated_input_tokens"] for run in runs) / len(runs), 4
+            ),
+            "runs": runs,
+        }
+    else:
+        report = run_benchmark(args.cases)
     rendered = json.dumps(report, ensure_ascii=False, indent=2)
     print(rendered)
     if args.output:
