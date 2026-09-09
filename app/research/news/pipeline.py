@@ -146,6 +146,8 @@ def run_news_price_study(
     def analysis_exclusion(event):
         if event.review_status == "rejected":
             return "人工复核拒绝，不进入价格分析"
+        if event.analysis_eligibility != "eligible":
+            return f"事件分析资格为 `{event.analysis_eligibility}`，不进入价格分析"
         if event.entity_resolution is not None and not event.entity_resolution.matches_market(market_clock.market):
             return "事件区域与市场标签冲突、市场范围不明确或跨市场总量无法分配，不进入该市场电价分析"
         if event.event_type in skipped_types:

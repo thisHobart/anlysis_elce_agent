@@ -76,6 +76,7 @@ QuarantineReason = Literal[
 ]
 TimeBasis = Literal["stated_absolute", "stated_components", "derived_from_publication"]
 ReviewStatus = Literal["unreviewed", "accepted", "corrected", "rejected"]
+ContextStrategy = Literal["full_context", "chunk_merge", "incremental_state"]
 RevisionFieldName = Literal[
     "affected_regions",
     "affected_assets",
@@ -264,6 +265,46 @@ class ExtractionTrace(BaseModel):
     output_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
+class CharacterRange(BaseModel):
+    """Half-open source range processed by one long-context strategy step."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    start_char: int = Field(ge=0)
+    end_char: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> CharacterRange:
+        if self.end_char <= self.start_char:
+            raise ValueError("end_char must be greater than start_char")
+        return self
+
+
+class ExtractionCoverage(BaseModel):
+    """Auditable source coverage and cost for one long-context extraction."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    strategy: ContextStrategy
+    total_characters: int = Field(ge=1)
+    processed_ranges: tuple[CharacterRange, ...] = ()
+    failed_ranges: tuple[CharacterRange, ...] = ()
+    model_calls: int = Field(default=0, ge=0)
+    estimated_input_tokens: int = Field(default=0, ge=0)
+    elapsed_seconds: float = Field(default=0.0, ge=0)
+
+    @property
+    def complete(self) -> bool:
+        if self.failed_ranges:
+            return False
+        covered_until = 0
+        for item in sorted(self.processed_ranges, key=lambda value: (value.start_char, value.end_char)):
+            if item.start_char > covered_until:
+                return False
+            covered_until = max(covered_until, item.end_char)
+        return covered_until >= self.total_characters
+
+
 class NewsInputIssue(BaseModel):
     """One rejected input line, kept independently from document extraction failures."""
 
@@ -342,7 +383,9 @@ class EventRecord(EntityFields):
     extractor_version: str = Field(min_length=1, max_length=32)
     extraction_trace: ExtractionTrace | None = None
     confidence: float | None = Field(default=None, ge=0, le=1)
-    analysis_eligibility: Literal["eligible", "needs_time_review"] = "eligible"
+    analysis_eligibility: Literal[
+        "eligible", "needs_time_review", "needs_coverage_review"
+    ] = "eligible"
     review_status: ReviewStatus = "unreviewed"
     evidence: tuple[EvidenceSpan, ...] = ()
     # A missing field means "this version did not restate it".  A cleared field means the
@@ -376,7 +419,7 @@ class EventRecord(EntityFields):
         ):
             raise ValueError("effective_end_at must not be before effective_start_at")
         if (self.relevance == "short_term" and self.effective_start_at is None
-                and self.analysis_eligibility != "needs_time_review"):
+                and self.analysis_eligibility == "eligible"):
             raise ValueError("short_term events require effective_start_at")
         if self.event_type == "irrelevant" and self.relevance != "irrelevant":
             raise ValueError("irrelevant event_type requires irrelevant relevance")
@@ -443,6 +486,7 @@ class EventExtractionResult(BaseModel):
     # remains the document-level outcome used when no event can safely be retained.
     candidate_quarantines: tuple[ExtractionQuarantine, ...] = ()
     pass_results: tuple[dict[str, Any], ...] = ()
+    coverage: ExtractionCoverage | None = None
     review_status: ReviewStatus = "unreviewed"
     supersedes_document_version_id: str | None = Field(default=None, pattern=r"^newsv_[a-f0-9]{24}$")
 
@@ -526,6 +570,9 @@ class EventStateRevision(EntityFields):
     status: EventStatus = "unknown"
     physical_effect: PhysicalEffect = "unknown"
     review_status: ReviewStatus = "unreviewed"
+    analysis_eligibility: Literal[
+        "eligible", "needs_time_review", "needs_coverage_review"
+    ] = "eligible"
 
     @property
     def region_keys(self) -> tuple[str, ...]:
@@ -588,6 +635,9 @@ class MergedEvent(EntityFields):
     document_refs: tuple[DocumentRef, ...] = Field(min_length=1)
     revision_count: int = Field(ge=1)
     review_status: ReviewStatus = "unreviewed"
+    analysis_eligibility: Literal[
+        "eligible", "needs_time_review", "needs_coverage_review"
+    ] = "eligible"
     confidence: float | None = Field(default=None, ge=0, le=1)
     time_resolution: TimeResolution | None = None
     state_history: tuple[EventStateRevision, ...] = ()

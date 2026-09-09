@@ -50,6 +50,7 @@ from app.research.news.clock import (
     zero_point,
 )
 from app.research.news.contracts import (
+    CharacterRange,
     CollectedNewsRecord,
     DocumentRef,
     EventExtractionBatch,
@@ -60,6 +61,7 @@ from app.research.news.contracts import (
     EventRecord,
     EventStateRevision,
     EvidenceSpan,
+    ExtractionCoverage,
     ExtractionQuarantine,
     ExtractionTrace,
     MergedEvent,
@@ -136,6 +138,7 @@ __all__ = [
     "AnalysisMethod",
     "AnalysisResult",
     "AsOfEventAssembler",
+    "CharacterRange",
     "CollectedNewsAdapter",
     "CollectedNewsAdapterError",
     "CollectedNewsRecord",
@@ -158,6 +161,7 @@ __all__ = [
     "EvidenceSpan",
     "ExternalNewsAdapterNotConfigured",
     "ExternalNewsApiPlaceholder",
+    "ExtractionCoverage",
     "ExtractionQuarantine",
     "ExtractionTrace",
     "ExtractionValidationError",

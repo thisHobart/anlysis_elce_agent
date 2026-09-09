@@ -301,6 +301,7 @@ def merge_event_records(
                     status=state_record.status,
                     physical_effect=state_record.physical_effect,
                     review_status=state_record.review_status,
+                    analysis_eligibility=state_record.analysis_eligibility,
                 )
             )
         merged.append(
@@ -324,6 +325,7 @@ def merge_event_records(
                 confidence=primary_record.confidence,
                 time_resolution=primary_record.time_resolution,
                 review_status=primary_record.review_status,
+                analysis_eligibility=primary_record.analysis_eligibility,
                 extraction_traces=extraction_traces,
                 source_event_ids=tuple(dict.fromkeys(record.event_id for record, _ in ordered)),
                 document_refs=refs,
