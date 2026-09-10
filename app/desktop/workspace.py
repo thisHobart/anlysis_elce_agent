@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from math import ceil
 from pathlib import Path
@@ -9,12 +10,13 @@ from typing import Any
 from uuid import uuid4
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtWidgets import QMessageBox, QSplitter, QWidget
+from PySide6.QtWidgets import QFileDialog, QMessageBox, QSplitter, QWidget
 
-from app.desktop.input_config import build_runtime_study, validate_input_path
-from app.desktop.message_widgets import ThinkingMessageWidget
+from app.desktop.input_config import FILE_FILTERS, build_runtime_study, validate_input_path
+from app.desktop.message_widgets import DataDetailsDialog, ThinkingMessageWidget
 from app.desktop.panes import STATUS_LABELS, ContextPane, ConversationPane, HistoryPane
 from app.desktop.session import (
+    DataPanelState,
     ResearchSession,
     SessionMessage,
     SessionRunRecord,
@@ -31,6 +33,8 @@ from app.research.agent.schemas import (
     ResearchProposal,
 )
 from app.research.application.coordinator import ResearchCoordinator
+from app.research.data.snapshot import input_file_manifest, study_fingerprint
+from app.research.data.sources.summary import DataSummary, build_summary, format_moment
 from app.research.graph.contracts import ApprovalState, EpisodeSummary, ResearchLoopSnapshot
 from app.research.graph.narration import (
     STAGE_LABELS,
@@ -41,12 +45,20 @@ from app.research.graph.narration import (
 from app.research.schemas.results import DataQualityReport
 from app.runtime_paths import default_research_output_directory
 
+DATA_CHANGED_NOTICE = "数据换了，之前的分析方案已经作废。重新问一次，我按新数据给方案。"
+
 
 class ResearchWorkspace(QSplitter):
     """Single source of UI truth for history, conversation, inputs, plan, and trace."""
 
     busy_changed = Signal(bool)
     status_changed = Signal(str)
+
+    LOCAL_FILE_PROMPTS: tuple[tuple[str, str], ...] = (
+        ("target", "选择电价数据文件"),
+        ("actuals", "选择影响因素数据（实际值，可跳过）"),
+        ("forecasts", "选择影响因素数据（预测值，可跳过）"),
+    )
 
     def __init__(
         self,
@@ -126,8 +138,13 @@ class ResearchWorkspace(QSplitter):
         self.conversation.plan_reject_requested.connect(self.reject_plan)
         self.conversation.end_research_requested.connect(self.end_current_research)
         self.conversation.draft_changed.connect(self._composer_draft_changed)
-        self.context.file_selected.connect(self.set_input_file)
-        self.context.file_cleared.connect(self.clear_input_file)
+        self.conversation.plan_revise_requested.connect(self.request_plan_revision)
+        self.conversation.data_details_requested.connect(self.show_data_details)
+        self.context.refetch_requested.connect(self.refetch_dataset)
+        self.context.reselect_requested.connect(self.reselect_dataset)
+        self.context.details_requested.connect(self.show_data_details)
+        self.context.retry_requested.connect(self.retry_dataset)
+        self.context.local_file_requested.connect(self.choose_local_files)
         self.context.trace_maximized.connect(self._set_trace_maximized)
 
         session = self._new_session()
@@ -295,20 +312,30 @@ class ResearchWorkspace(QSplitter):
             return
         self._cancel_plan_feedback_window()
         try:
-            resolved = validate_input_path(role, path)  # type: ignore[arg-type]
-            item = self.current_session.inputs[role]  # type: ignore[index]
-            if item.path and Path(item.path).resolve() == resolved:
+            if not self._assign_input_file(role, path):
                 return
-            item.path = str(resolved)
-            item.status = "selected"
-            item.detail = "待检查"
-            item.variables = []
-            self._invalidate_plan_for_input_change()
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "这个文件暂时用不了", str(exc))
             return
+        self._invalidate_plan_for_input_change()
+        self.current_session.dataset_fingerprint = self._current_dataset_fingerprint()
         self._add_trace("input", f"载入数据文件：{Path(path).name}", "completed", "输入数据已更新")
+        self._sync_data_panel()
         self._persist_and_render()
+
+    def _assign_input_file(self, role: str, path: str) -> bool:
+        """Point one role at a file; return False when it already pointed there."""
+
+        resolved = validate_input_path(role, path)  # type: ignore[arg-type]
+        item = self.current_session.inputs[role]  # type: ignore[index]
+        if item.path and Path(item.path).resolve() == resolved:
+            return False
+        item.path = str(resolved)
+        item.status = "selected"
+        item.detail = "待检查"
+        item.variables = []
+        self.current_session.source_kind = "file"
+        return True
 
     def clear_input_file(self, role: str) -> None:
         if self.is_busy:
@@ -323,8 +350,174 @@ class ResearchWorkspace(QSplitter):
         item.detail = "尚未选择"
         item.variables = []
         self._invalidate_plan_for_input_change()
+        self.current_session.dataset_fingerprint = self._current_dataset_fingerprint()
         self._add_trace("input", f"移除数据文件：{filename}", "completed", "输入数据已更新")
+        self._sync_data_panel()
         self._persist_and_render()
+
+    def choose_local_files(self) -> None:
+        """Fall back to files the analyst already has when no data can be fetched."""
+
+        if self.is_busy:
+            return
+        chosen: list[str] = []
+        for role, caption in self.LOCAL_FILE_PROMPTS:
+            selected, _filter = QFileDialog.getOpenFileName(self, caption, "", FILE_FILTERS[role])
+            if not selected:
+                if role == "target":
+                    return
+                continue
+            try:
+                if self._assign_input_file(role, selected):
+                    chosen.append(Path(selected).name)
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(self, "这个文件暂时用不了", str(exc))
+                return
+        if not chosen:
+            return
+        self._cancel_plan_feedback_window()
+        self._invalidate_plan_for_data_change(self._current_dataset_fingerprint())
+        self._add_trace("input", "改用本地文件", "completed", "、".join(chosen))
+        self._set_data_state("empty", None)
+        self._persist_and_render()
+
+    def refetch_dataset(self) -> None:
+        """Take the same data again; an unchanged dataset must not void a live plan."""
+
+        if self.is_busy:
+            return
+        session = self.current_session
+        fingerprint = self._current_dataset_fingerprint()
+        changed = self._invalidate_plan_for_data_change(fingerprint)
+        if changed:
+            self._add_trace("input", "重新取数", "completed", "数据有更新，之前的方案已作废")
+            self._set_data_state("empty", None)
+        else:
+            summary = session.data_summary
+            if summary is not None:
+                session.data_summary = replace(
+                    summary,
+                    fetched_at_text=format_moment(datetime.now(UTC).astimezone()),
+                )
+            self._add_trace("input", "重新取数", "completed", "数据没有变化")
+            self._set_data_state("ready", session.data_summary)
+        self._persist_and_render(keep_timeline=True)
+
+    def reselect_dataset(self) -> None:
+        """Throw the current dataset away and let the analyst point at another one."""
+
+        if self.is_busy:
+            return
+        self.choose_local_files()
+
+    def retry_dataset(self) -> None:
+        """Try the data source again without touching what was asked for."""
+
+        if self.is_busy:
+            return
+        session = self.current_session
+        if session.can_analyze:
+            self._add_trace("input", "重新连接数据", "completed", "已改用本地数据")
+            self._set_data_state("ready" if session.data_summary else "empty", session.data_summary)
+        else:
+            self._add_trace("input", "重新连接数据", "warning", "仍然连不上数据服务器")
+            self._set_data_state("unavailable", session.data_summary)
+        self._persist_and_render(keep_timeline=True)
+
+    def show_data_details(self) -> None:
+        """Open the one screen where database wording is allowed."""
+
+        DataDetailsDialog(self._dataset_details(), self).exec()
+
+    def request_plan_revision(self) -> None:
+        """Send the analyst to the composer instead of opening an editor on the plan."""
+
+        if self.conversation.current_plan_widget is not None:
+            self.conversation.current_plan_widget.set_feedback_paused()
+        self._cancel_plan_feedback_window()
+        self.conversation.input.setFocus()
+
+    def _dataset_details(self) -> dict[str, Any]:
+        session = self.current_session
+        details: dict[str, Any] = {
+            "source_kind": session.source_kind,
+            "dataset_fingerprint": session.dataset_fingerprint or "(none)",
+            "plan_data_fingerprint": (session.current_plan or {}).get("data_fingerprint") or "(none)",
+        }
+        files = [
+            f"{role}: {session.inputs[role].path}"
+            for role in ("target", "actuals", "forecasts")
+            if session.inputs[role].path
+        ]
+        if files:
+            details["input_files"] = files
+        if session.quality_report:
+            alignment = dict(session.quality_report.get("alignment", {}))
+            if alignment:
+                details["alignment"] = alignment
+            details["series"] = sorted(session.quality_report.get("series", {}))
+        if session.data_profile:
+            details["data_profile"] = session.data_profile
+        return details
+
+    def _current_dataset_fingerprint(self) -> str | None:
+        """Hash what would be read right now, using the planner's own definition."""
+
+        session = self.current_session
+        if not session.can_analyze:
+            return None
+        try:
+            config = build_runtime_study(session, output_directory=self.research_output_directory)
+            return study_fingerprint(config, input_file_manifest(config))
+        except (OSError, ValueError):
+            return None
+
+    def _invalidate_plan_for_data_change(self, fingerprint: str | None) -> bool:
+        """Void the approved plan only when the data behind it actually moved.
+
+        Taking the data again and getting the same thing back is an ordinary
+        action, and it must not cost the analyst a plan they already approved.
+        """
+
+        session = self.current_session
+        anchor = (session.current_plan or {}).get("data_fingerprint") or session.dataset_fingerprint
+        session.dataset_fingerprint = fingerprint
+        if fingerprint is not None and anchor is not None and fingerprint == anchor:
+            return False
+        self._invalidate_plan_for_input_change()
+        return True
+
+    def _set_data_state(self, state: DataPanelState, summary: DataSummary | None) -> None:
+        session = self.current_session
+        session.data_state = state
+        session.data_summary = summary
+        session.touch()
+        self.context.data_panel.set_state(state, summary)
+
+    def _sync_data_panel(self) -> None:
+        """Re-derive the panel state after the underlying data changed."""
+
+        session = self.current_session
+        if session.data_state == "ready" and not session.can_analyze:
+            self._set_data_state("empty", None)
+            return
+        self.context.data_panel.set_state(session.data_state, session.data_summary)
+
+    def _summary_from_proposal(self, proposal: ResearchProposal) -> DataSummary:
+        """Turn the deterministic data evidence into the words both surfaces show."""
+
+        profile = proposal.data_profile
+        alignment = proposal.quality_report.alignment
+        missing = max(0, alignment.expected_rows - alignment.complete_case_rows)
+        return build_summary(
+            market=profile.market,
+            target_name=profile.target_name,
+            exogenous_names=list(profile.exogenous_names),
+            start_time=profile.start_time,
+            end_time=profile.end_time,
+            frequency=profile.frequency,
+            missing_points=missing,
+        )
 
     def _invalidate_plan_for_input_change(self) -> None:
         self._cancel_plan_feedback_window()
@@ -342,7 +535,7 @@ class ResearchWorkspace(QSplitter):
                 SessionMessage(
                     role="system",
                     kind="notice",
-                    content="数据文件换了，之前的分析方案已经作废。重新提问一次，我会按新数据给方案。",
+                    content=DATA_CHANGED_NOTICE,
                 )
             )
         session.run_id = None
@@ -378,6 +571,11 @@ class ResearchWorkspace(QSplitter):
                 return
         self._task_previous_status = session.status
         session.status = "understanding"
+        if session.can_analyze:
+            self._set_data_state("exploring", session.data_summary)
+        elif session.data_state != "ready":
+            # Nothing to read yet: say so plainly and offer the way out of it.
+            self._set_data_state("unavailable", session.data_summary)
         self._start_thinking("read", "解析研究问题", "识别本轮的处理方式")
         conversation = self._agent_conversation(session, exclude_message_id=user_message.message_id)
         imported_state = self._legacy_graph_import(session) if not self.agent.has_thread(session.session_id) else None
@@ -499,12 +697,13 @@ class ResearchWorkspace(QSplitter):
                 (
                     message
                     for message in reversed(session.messages)
-                    if message.kind == "plan" and message.payload.get("plan", {}).get("plan_id") == plan.plan_id
+                    if message.kind in {"plan", "data_plan"}
+                    and message.payload.get("plan", {}).get("plan_id") == plan.plan_id
                 ),
                 None,
             )
             if existing is None:
-                if any(message.kind == "plan" for message in session.messages):
+                if any(message.kind in {"plan", "data_plan"} for message in session.messages):
                     self._set_plan_message_state("stale")
                 profile = values.get("data_profile") or {}
                 quality = DataQualityReport.model_validate(values["quality_report"])
@@ -767,6 +966,9 @@ class ResearchWorkspace(QSplitter):
         session = self.current_session
         self._complete_active_tool("数据检查完成")
         self._apply_quality_to_inputs(proposal)
+        summary = self._summary_from_proposal(proposal)
+        self._set_data_state("ready", summary)
+        self._warn_about_unnamed_variables(summary)
         self._append_message(SessionMessage(role="assistant", kind="text", content=proposal.assistant_message))
         self._append_plan_message(proposal.plan, proposal.data_profile.exogenous_names)
         session.current_plan = proposal.plan.model_dump(mode="json")
@@ -781,17 +983,35 @@ class ResearchWorkspace(QSplitter):
         self._persist_and_render(keep_timeline=True)
 
     def _append_plan_message(self, plan: EDAPlan, available_variables: list[str]) -> None:
+        """Confirm the data and the analysis in one card, never as two decisions."""
+
+        session = self.current_session
+        session.dataset_fingerprint = plan.data_fingerprint or session.dataset_fingerprint
         self._append_message(
             SessionMessage(
                 role="assistant",
-                kind="plan",
-                content="Agent 推荐方案",
+                kind="data_plan",
+                content="开始之前，跟你确认一下",
                 payload={
                     "plan": plan.model_dump(mode="json"),
                     "available_variables": available_variables,
+                    "data_summary": asdict(session.data_summary) if session.data_summary else None,
                     "state": "awaiting",
                 },
             )
+        )
+
+    def _warn_about_unnamed_variables(self, summary: DataSummary) -> None:
+        """Flag columns shown under their stored name without stopping the research."""
+
+        unnamed = [item.display for item in summary.variables if not item.resolved]
+        if not unnamed:
+            return
+        self._add_trace(
+            "input",
+            f"有 {len(unnamed)} 项数据没有中文名，先按原名显示",
+            "warning",
+            "、".join(unnamed),
         )
 
     def _restored_dialogue_status(self) -> str:
@@ -1243,7 +1463,10 @@ class ResearchWorkspace(QSplitter):
             self.context.trace.set_events(self.current_session.trace)
 
     def _set_plan_message_state(self, state: str, *, plan: EDAPlan | None = None) -> None:
-        message = next((item for item in reversed(self.current_session.messages) if item.kind == "plan"), None)
+        message = next(
+            (item for item in reversed(self.current_session.messages) if item.kind in {"plan", "data_plan"}),
+            None,
+        )
         if message is None:
             return
         message.payload["state"] = state

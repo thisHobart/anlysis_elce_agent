@@ -1,0 +1,57 @@
+# 数据列的中文名对照表。
+#
+# 界面上显示的每一个变量名都来自这里，不经模型翻译，同一列在任何一次会话里
+# 都叫同一个名字。没有对上的列会按原名显示并标黄，流程不会中断。
+#
+# 顶层的 `columns` 按列名匹配；其它顶层键按「表名 → 列名」精确匹配，用于
+# 两张表里同名列含义不同的情况。匹配顺序：表名+列名 → 列名 → 列名规范化
+# （小写、去下划线）后再比一次。
+#
+# 运维补名字时直接在 columns 下加一行即可，不需要改代码。
+
+columns:
+  # 电价
+  rt_price: 实时电价
+  rt_node_price: 节点电价
+  da_price: 日前电价
+  day_ahead_price: 日前电价
+  node_price: 节点电价
+  clearing_price: 出清电价
+  price: 电价
+
+  # 负荷
+  actual_load: 统调负荷
+  system_load: 统调负荷
+  total_load: 统调负荷
+  fcst_load: 负荷预测
+  load_forecast: 负荷预测
+  net_load: 净负荷
+
+  # 新能源出力
+  wind_power: 风电出力
+  wind_output: 风电出力
+  actual_wind: 风电出力
+  fcst_wind: 风电出力预测
+  solar_power: 光伏出力
+  pv_power: 光伏出力
+  actual_solar: 光伏出力
+  fcst_solar: 光伏出力预测
+  new_energy: 新能源出力
+  new_energy_output: 新能源出力
+  renewable_output: 新能源出力
+
+  # 电源与外送
+  thermal_power: 火电出力
+  hydro_power: 水电出力
+  nuclear_power: 核电出力
+  non_market_output: 非市场化机组出力
+  must_run_output: 非市场化机组出力
+  external_power: 外来电
+  tie_line_power: 外来电
+  outage_capacity: 检修容量
+
+  # 系统运行
+  sys_reserve: 备用容量
+  spinning_reserve: 旋转备用
+  temperature: 气温
+  air_temperature: 气温

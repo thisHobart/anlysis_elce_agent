@@ -8,7 +8,7 @@ QWidget {
 QMainWindow, QFrame#conversationPane, QScrollArea#conversationScroll {
     background: #FFFFFF;
 }
-QFrame#historyPane, QSplitter#contextPane, QFrame#inputFilesPanel,
+QFrame#historyPane, QSplitter#contextPane, QFrame#dataPanel,
 QFrame#tracePanel {
     background: #F6F7F9;
 }
@@ -28,7 +28,7 @@ QLabel#sessionTitle {
     font-size: 15px;
     font-weight: 600;
 }
-QLabel#sessionMeta, QLabel#contextHint, QLabel#fileRole, QLabel#resultMeta,
+QLabel#sessionMeta, QLabel#contextHint, QLabel#dataKey, QLabel#resultMeta,
 QLabel#toolDetail, QLabel#planObjective, QLabel#planHint, QLabel#stepDetail {
     color: #667085;
     font-size: 12px;
@@ -160,12 +160,38 @@ QFrame#planMessage, QFrame#resultMessage {
     border-radius: 10px;
 }
 QLabel#resultWarning { color: #B45309; }
-QFrame#fileSlot {
+QFrame#dataCard {
     background: #FFFFFF;
     border: 1px solid #E7EAEF;
     border-radius: 6px;
 }
-QLabel#fileName { font-weight: 500; }
+QFrame#dataDivider { background: #EEF0F3; border: none; }
+QLabel#dataValue { font-size: 13px; line-height: 1.55; }
+QLabel#dataSub, QLabel#dataMark { color: #98A2B3; font-size: 12px; }
+QLabel#dataStatus { font-size: 12px; }
+QLabel#dataStatus[dataState="ready"] { color: #0F766E; }
+QLabel#dataStatus[dataState="exploring"] { color: #3F51B5; }
+QLabel#dataStatus[dataState="unavailable"] { color: #BE123C; }
+QLabel#dataMark[dataState="settled"] { color: #0F766E; }
+QLabel#dataMark[dataState="waiting"] { color: #C9CDD4; }
+QLabel#dataValue[dataState="pending"], QLabel#dataValue[dataState="waiting"] { color: #98A2B3; }
+QPushButton#dataQuietLink {
+    background: transparent;
+    border: none;
+    color: #98A2B3;
+    font-size: 12px;
+    min-height: 18px;
+    padding: 0 2px;
+}
+QPushButton#dataQuietLink:hover { color: #667085; }
+QPushButton#dataQuietLink:disabled { color: #C9CDD4; }
+QProgressBar#dataProgress {
+    background: #EEF0F3;
+    border: none;
+    border-radius: 2px;
+}
+QProgressBar#dataProgress::chunk { background: #3F51B5; border-radius: 2px; }
+QPlainTextEdit#dataDetails { font-family: Consolas, "Courier New", monospace; font-size: 12px; }
 QTreeWidget#traceTree {
     background: #FFFFFF;
     color: #2A3040;

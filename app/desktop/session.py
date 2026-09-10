@@ -13,6 +13,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.research.agent.schemas import rename_legacy_step_keys
+from app.research.data.sources.summary import DataSummary
 from app.research.tools.catalog import FUNCTION_CATALOG
 from app.runtime_paths import application_data_directory
 
@@ -30,7 +31,9 @@ SessionStatus = Literal[
 ]
 InputRole = Literal["target", "actuals", "forecasts"]
 InputStatus = Literal["empty", "selected", "loading", "ready", "warning", "failed", "changed"]
-MessageKind = Literal["text", "notice", "thinking", "tool", "plan", "result", "error"]
+DataPanelState = Literal["empty", "exploring", "ready", "unavailable"]
+DataSourceKind = Literal["database", "file"]
+MessageKind = Literal["text", "notice", "thinking", "tool", "plan", "data_plan", "result", "error"]
 TraceCategory = Literal["session", "user", "agent", "input", "plan", "tool", "evaluation", "artifact", "error"]
 
 
@@ -134,7 +137,7 @@ class SessionRunRecord(BaseModel):
     memory_status: Literal["active", "stale"] = "active"
 
 
-SESSION_SCHEMA_VERSION = 11
+SESSION_SCHEMA_VERSION = 12
 """Projection schema written by this build; bump it whenever stored sessions change shape."""
 
 
@@ -170,6 +173,10 @@ class ResearchSession(BaseModel):
     report_path: str | None = None
     graph_event_count: int = 0
     graph_event_sequence: int = 0
+    source_kind: DataSourceKind = "database"
+    data_state: DataPanelState = "empty"
+    data_summary: DataSummary | None = None
+    dataset_fingerprint: str | None = None
 
     @field_validator("inputs", mode="before")
     @classmethod
@@ -209,7 +216,7 @@ def _stored_plans(session: ResearchSession) -> list[dict[str, Any]]:
     plans.extend(
         message.payload["plan"]
         for message in session.messages
-        if message.kind == "plan" and isinstance(message.payload.get("plan"), dict)
+        if message.kind in {"plan", "data_plan"} and isinstance(message.payload.get("plan"), dict)
     )
     return plans
 
@@ -236,12 +243,22 @@ def _migrate_10_to_11(session: ResearchSession) -> None:
     """Version data-scoped run memory and explicit stale-state tracking."""
 
 
+def _migrate_11_to_12(session: ResearchSession) -> None:
+    """Version the data panel replacing the three user-managed file slots.
+
+    A session saved before the panel existed carries no dataset description, so it
+    opens on the empty panel and needs one new question before it can continue.
+    The retired ``inputs`` payload stays on disk and is simply ignored.
+    """
+
+
 SESSION_MIGRATIONS: dict[int, Callable[[ResearchSession], None]] = {
     **{version: _carry_forward for version in range(1, 7)},
     7: _migrate_7_to_8,
     8: _migrate_8_to_9,
     9: _migrate_9_to_10,
     10: _migrate_10_to_11,
+    11: _migrate_11_to_12,
 }
 
 
@@ -261,7 +278,7 @@ def _apply_session_invariants(
         session.plan_stale = True
         session.status = "idle"
     for message in session.messages:
-        stored_plan = message.payload.get("plan") if message.kind == "plan" else None
+        stored_plan = message.payload.get("plan") if message.kind in {"plan", "data_plan"} else None
         if isinstance(stored_plan, dict) and not plan_is_executable(stored_plan, skill_versions):
             message.kind = "notice"
             message.content = STALE_PLAN_NOTICE

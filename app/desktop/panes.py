@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime
-from pathlib import Path
-from typing import Any
+from html import escape
+from typing import Any, ClassVar
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeySequence, QShortcut
+from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QComboBox,
-    QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -21,6 +20,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -31,8 +31,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.desktop.input_config import FILE_FILTERS, ROLE_LABELS
 from app.desktop.message_widgets import (
+    DataPlanMessageWidget,
     NoticeMessageWidget,
     PlanMessageWidget,
     ResultMessageWidget,
@@ -40,8 +40,9 @@ from app.desktop.message_widgets import (
     ThinkingMessageWidget,
     ToolMessageWidget,
 )
-from app.desktop.session import InputRole, ResearchSession, SessionInputFile, SessionMessage, TraceEvent
+from app.desktop.session import DataPanelState, ResearchSession, SessionMessage, TraceEvent
 from app.research.agent.schemas import EDAPlan
+from app.research.data.sources.summary import DataSummary, VariableLabel
 from app.research.graph.narration import narrate_event
 
 STATUS_LABELS = {
@@ -193,6 +194,8 @@ class ConversationPane(QFrame):
     cancel_requested = Signal()
     plan_run_requested = Signal(object)
     plan_reject_requested = Signal()
+    plan_revise_requested = Signal()
+    data_details_requested = Signal()
     end_research_requested = Signal()
     draft_changed = Signal(bool)
 
@@ -322,10 +325,15 @@ class ConversationPane(QFrame):
                 message.payload.get("detail", message.content),
                 status=message.payload.get("status", "running"),
             )
-        elif message.kind == "plan" and message.payload.get("plan"):
-            widget = PlanMessageWidget(
-                EDAPlan.model_validate(message.payload["plan"]),
-            )
+        elif message.kind in {"plan", "data_plan"} and message.payload.get("plan"):
+            plan = EDAPlan.model_validate(message.payload["plan"])
+            if message.kind == "data_plan":
+                widget = DataPlanMessageWidget(plan, summary=message.payload.get("data_summary"))
+                widget.details_requested.connect(self.data_details_requested)
+                widget.revise_requested.connect(self.plan_revise_requested)
+            else:
+                # Conversations saved before data and analysis were confirmed together.
+                widget = PlanMessageWidget(plan)
             widget.run_requested.connect(self.plan_run_requested)
             widget.reject_requested.connect(self.plan_reject_requested)
             plan_state = message.payload.get("state", "awaiting")
@@ -386,121 +394,353 @@ class ConversationPane(QFrame):
         self.scroll_to_bottom()
 
 
-class FileSlotRow(QFrame):
-    """Compact user-editable file slot; validation evidence remains Agent-internal."""
+DATA_FIELD_KEYS: tuple[str, ...] = ("电价", "影响因素", "时间范围")
 
-    selected = Signal(str, str)
-    cleared = Signal(str)
 
-    def __init__(self, role: InputRole, label: str) -> None:
+def variables_markup(variables: list[VariableLabel]) -> str:
+    """Join variable names, marking the ones still shown under their column name."""
+
+    return "、".join(
+        escape(item.display)
+        if item.resolved
+        else f'<span style="color:#B45309">{escape(item.display)}</span>'
+        for item in variables
+    )
+
+
+class DataRow(QWidget):
+    """One field of the dataset description: its name, its value, and how settled it is."""
+
+    PENDING_TEXT = "待定"
+
+    def __init__(self, key: str) -> None:
         super().__init__()
-        self.role = role
-        self.base_label = label
-        self.setAcceptDrops(True)
-        self.setObjectName("fileSlot")
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 7, 8, 7)
-        layout.setSpacing(6)
+        layout.setContentsMargins(10, 9, 10, 9)
+        layout.setSpacing(8)
+        self.mark = QLabel("")
+        self.mark.setObjectName("dataMark")
+        self.mark.setFixedWidth(12)
+        self.mark.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(self.mark)
         text = QVBoxLayout()
-        text.setSpacing(1)
-        self.name_label = QLabel("尚未选择")
-        self.name_label.setObjectName("fileName")
-        self.name_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.role_label = QLabel(label)
-        self.role_label.setObjectName("fileRole")
-        text.addWidget(self.name_label)
-        text.addWidget(self.role_label)
+        text.setSpacing(2)
+        self.key_label = QLabel(key)
+        self.key_label.setObjectName("dataKey")
+        text.addWidget(self.key_label)
+        self.value_label = QLabel(self.PENDING_TEXT)
+        self.value_label.setObjectName("dataValue")
+        self.value_label.setWordWrap(True)
+        self.value_label.setTextFormat(Qt.TextFormat.RichText)
+        self.value_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        text.addWidget(self.value_label)
+        # Parented on construction: setVisible on a parentless widget flashes it as a window.
+        self.sub_label = QLabel("", self)
+        self.sub_label.setObjectName("dataSub")
+        self.sub_label.setWordWrap(True)
+        self.sub_label.setVisible(False)
+        text.addWidget(self.sub_label)
         layout.addLayout(text, 1)
-        self.clear_button = QPushButton("×")
-        self.clear_button.setObjectName("quietButton")
-        self.clear_button.setToolTip("移除这个文件")
-        self.clear_button.setMaximumWidth(28)
-        self.clear_button.clicked.connect(lambda: self.cleared.emit(self.role))
-        self.clear_button.hide()
-        layout.addWidget(self.clear_button)
-        self.choose_button = QPushButton("选择")
-        self.choose_button.setObjectName("quietButton")
-        self.choose_button.setMaximumWidth(52)
-        self.choose_button.clicked.connect(self.choose)
-        layout.addWidget(self.choose_button)
 
-    def choose(self) -> None:
-        selected, _filter = QFileDialog.getOpenFileName(
-            self,
-            f"选择{self.base_label}",
-            "",
-            FILE_FILTERS[self.role],
+    def set_value(self, markup: str, *, sub: str = "", state: str = "settled", tooltip: str = "") -> None:
+        """Render one field; `state` is settled, pending, or waiting."""
+
+        marks = {"settled": "✓", "pending": "", "waiting": "○"}
+        self.mark.setText(marks.get(state, ""))
+        self.value_label.setText(markup or self.PENDING_TEXT)
+        self.value_label.setToolTip(tooltip)
+        self.sub_label.setText(sub)
+        self.sub_label.setVisible(bool(sub))
+        for widget in (self.mark, self.value_label):
+            widget.setProperty("dataState", state if markup else "waiting")
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+
+
+class DataCard(QFrame):
+    """White card holding the dataset fields, separated by hairlines."""
+
+    def __init__(self, keys: tuple[str, ...] = DATA_FIELD_KEYS) -> None:
+        super().__init__()
+        self.setObjectName("dataCard")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.rows: dict[str, DataRow] = {}
+        for index, key in enumerate(keys):
+            if index:
+                divider = QFrame()
+                divider.setObjectName("dataDivider")
+                divider.setFixedHeight(1)
+                layout.addWidget(divider)
+            row = DataRow(key)
+            self.rows[key] = row
+            layout.addWidget(row)
+
+    def apply(self, summary: DataSummary | None, *, exploring: bool = False) -> None:
+        """Fill the card from the one description the UI is allowed to read."""
+
+        summary = summary or DataSummary()
+        unsettled = "waiting" if exploring else "settled"
+        self.rows["电价"].set_value(
+            escape(summary.price_label),
+            state="settled" if summary.price_label else unsettled,
         )
-        if selected:
-            self.selected.emit(self.role, selected)
+        variables = summary.variables
+        if variables and exploring:
+            markup = "已找到" + "、".join(escape(item.display) for item in variables)
+            state = "pending"
+        else:
+            markup = variables_markup(variables)
+            state = "settled" if variables else unsettled
+        self.rows["影响因素"].set_value(
+            markup,
+            state=state,
+            tooltip="这项数据还没配中文名" if any(not item.resolved for item in variables) else "",
+        )
+        window = f"{summary.start_date} — {summary.end_date}" if summary.start_date else ""
+        sub = summary.granularity_text
+        if sub and summary.gap_text:
+            sub = f"{sub}，{summary.gap_text}"
+        self.rows["时间范围"].set_value(
+            escape(window),
+            sub=sub,
+            state="settled" if window else unsettled,
+        )
 
-    def set_file(self, item: SessionInputFile) -> None:
-        self.name_label.setText(Path(item.path).name if item.path else "尚未选择")
-        self.name_label.setToolTip(item.path)
-        self.role_label.setText(self.base_label)
-        self.choose_button.setText("更换" if item.path else "选择")
-        self.clear_button.setVisible(bool(item.path))
 
-    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+class DataPanel(QFrame):
+    """What data this research runs on, in the words an analyst already uses.
 
-    def dropEvent(self, event: QDropEvent) -> None:
-        urls = event.mimeData().urls()
-        if urls:
-            self.selected.emit(self.role, urls[0].toLocalFile())
-            event.acceptProposedAction()
+    The panel never reads a database contract; it renders one `DataSummary` that
+    was formatted once, upstream, which is why it and the confirmation card can
+    never word the same dataset differently.
+    """
 
+    refetch_requested = Signal()
+    reselect_requested = Signal()
+    details_requested = Signal()
+    retry_requested = Signal()
+    local_file_requested = Signal()
 
-class InputFilesPanel(QFrame):
-    """The only entry point for the three supported research data files."""
-
-    file_selected = Signal(str, str)
-    file_cleared = Signal(str)
+    EMPTY_TEXT = "还没开始。说说你想研究什么，我来找数据。"
+    EXPLORING_TEXT = "正在看有哪些数据能用…"
+    EXPLORING_NOTE = "现在只是在看有什么数据，还没开始取。找完会先给你确认。"
+    UNAVAILABLE_TITLE = "现在取不到数据"
+    UNAVAILABLE_BODY = "和数据服务器连不上。稍等一下再试；一直不行就找运维看看，或者先用本地文件继续。"
+    UNAVAILABLE_HISTORY_TITLE = "上次用的数据"
+    UNAVAILABLE_NOTE = "上次取的数据还在，可以直接接着分析，只是不是最新的。"
+    STATUS_TEXT: ClassVar[dict[str, str]] = {"ready": "已就绪", "exploring": "正在找数据", "unavailable": "取不到"}
+    SPINNER_FRAMES = ("◐", "◓", "◑", "◒")
 
     def __init__(self) -> None:
         super().__init__()
-        self.setObjectName("inputFilesPanel")
-        self.rows: dict[InputRole, FileSlotRow] = {}
+        self.setObjectName("dataPanel")
+        self._state: DataPanelState = "empty"
+        self._summary: DataSummary | None = None
+        self._busy = False
+        self._spinner_index = 0
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
+
         header = QHBoxLayout()
-        self.title_label = QLabel("数据文件")
+        self.title_label = QLabel("数据")
         self.title_label.setObjectName("contextTitle")
         header.addWidget(self.title_label)
         header.addStretch(1)
-        hint = QLabel("可拖入文件")
-        hint.setObjectName("contextHint")
-        header.addWidget(hint)
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("dataStatus")
+        header.addWidget(self.status_label)
         layout.addLayout(header)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        content = QWidget()
-        content.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(5)
-        for role in ("target", "actuals", "forecasts"):
-            row = FileSlotRow(role, ROLE_LABELS[role])
-            row.selected.connect(self.file_selected)
-            row.cleared.connect(self.file_cleared)
-            self.rows[role] = row
-            content_layout.addWidget(row)
-        content_layout.addStretch(1)
-        scroll.setWidget(content)
-        layout.addWidget(scroll, 1)
 
-    def set_session(self, session: ResearchSession) -> None:
-        for role, row in self.rows.items():
-            row.set_file(session.inputs[role])
+        self.empty_view = self._build_empty_view()
+        self.exploring_view = self._build_exploring_view()
+        self.ready_view = self._build_ready_view()
+        self.unavailable_view = self._build_unavailable_view()
+        for view in (self.empty_view, self.exploring_view, self.ready_view, self.unavailable_view):
+            layout.addWidget(view)
+        layout.addStretch(1)
+
+        self._spinner = QTimer(self)
+        self._spinner.setInterval(220)
+        self._spinner.timeout.connect(self._advance_spinner)
+        self.set_state("empty", None)
+
+    def _build_empty_view(self) -> QWidget:
+        view = QWidget(self)
+        layout = QVBoxLayout(view)
+        layout.setContentsMargins(2, 4, 2, 0)
+        self.empty_label = QLabel(self.EMPTY_TEXT)
+        self.empty_label.setObjectName("dataSub")
+        self.empty_label.setWordWrap(True)
+        layout.addWidget(self.empty_label)
+        return view
+
+    def _build_exploring_view(self) -> QWidget:
+        view = QWidget(self)
+        layout = QVBoxLayout(view)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        heading = QLabel(self.EXPLORING_TEXT)
+        heading.setObjectName("dataSub")
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+        self.progress = QProgressBar()
+        self.progress.setObjectName("dataProgress")
+        self.progress.setRange(0, 0)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(4)
+        layout.addWidget(self.progress)
+        self.exploring_card = DataCard()
+        layout.addWidget(self.exploring_card)
+        note = QLabel(self.EXPLORING_NOTE)
+        note.setObjectName("dataSub")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        return view
+
+    def _build_ready_view(self) -> QWidget:
+        view = QWidget(self)
+        layout = QVBoxLayout(view)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        self.ready_card = DataCard()
+        layout.addWidget(self.ready_card)
+        bottom = QHBoxLayout()
+        bottom.setSpacing(6)
+        self.fetched_label = QLabel("")
+        self.fetched_label.setObjectName("dataKey")
+        self.fetched_label.setWordWrap(True)
+        bottom.addWidget(self.fetched_label, 1)
+        self.refetch_button = QPushButton("取最新的")
+        self.refetch_button.setObjectName("quietButton")
+        self.refetch_button.setToolTip("按同一口径重新取一次数据")
+        self.refetch_button.clicked.connect(self.refetch_requested)
+        bottom.addWidget(self.refetch_button)
+        layout.addLayout(bottom)
+        links = QHBoxLayout()
+        links.setSpacing(4)
+        self.reselect_button = QPushButton("换一批数据")
+        self.reselect_button.setObjectName("dataQuietLink")
+        self.reselect_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.reselect_button.clicked.connect(self.reselect_requested)
+        links.addWidget(self.reselect_button)
+        separator = QLabel("·")
+        separator.setObjectName("dataSub")
+        links.addWidget(separator)
+        self.details_button = QPushButton("查看取数细节")
+        self.details_button.setObjectName("dataQuietLink")
+        self.details_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.details_button.clicked.connect(self.details_requested)
+        links.addWidget(self.details_button)
+        links.addStretch(1)
+        layout.addLayout(links)
+        return view
+
+    def _build_unavailable_view(self) -> QWidget:
+        view = QWidget(self)
+        layout = QVBoxLayout(view)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        title = QLabel(self.UNAVAILABLE_TITLE)
+        title.setObjectName("dataValue")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+        body = QLabel(self.UNAVAILABLE_BODY)
+        body.setObjectName("dataSub")
+        body.setWordWrap(True)
+        layout.addWidget(body)
+        actions = QHBoxLayout()
+        actions.setSpacing(6)
+        self.retry_button = QPushButton("再试一次")
+        self.retry_button.setObjectName("primaryButton")
+        self.retry_button.clicked.connect(self.retry_requested)
+        actions.addWidget(self.retry_button)
+        self.local_file_button = QPushButton("用本地文件")
+        self.local_file_button.setObjectName("quietButton")
+        self.local_file_button.clicked.connect(self.local_file_requested)
+        actions.addWidget(self.local_file_button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        # Parented on construction: setVisible on a parentless widget flashes it as a window.
+        self.history_container = QWidget(view)
+        history_layout = QVBoxLayout(self.history_container)
+        history_layout.setContentsMargins(0, 0, 0, 0)
+        history_layout.setSpacing(4)
+        history_title = QLabel(self.UNAVAILABLE_HISTORY_TITLE)
+        history_title.setObjectName("dataKey")
+        history_layout.addWidget(history_title)
+        self.history_card = DataCard()
+        history_layout.addWidget(self.history_card)
+        history_note = QLabel(self.UNAVAILABLE_NOTE)
+        history_note.setObjectName("dataSub")
+        history_note.setWordWrap(True)
+        history_layout.addWidget(history_note)
+        layout.addWidget(self.history_container)
+        return view
+
+    @property
+    def state(self) -> DataPanelState:
+        return self._state
+
+    @property
+    def summary(self) -> DataSummary | None:
+        return self._summary
+
+    def set_state(self, state: DataPanelState, summary: DataSummary | None) -> None:
+        self._state = state
+        self._summary = summary
+        self.empty_view.setVisible(state == "empty")
+        self.exploring_view.setVisible(state == "exploring")
+        self.ready_view.setVisible(state == "ready")
+        self.unavailable_view.setVisible(state == "unavailable")
+        if state == "exploring":
+            self.exploring_card.apply(summary, exploring=True)
+            self._spinner_index = 0
+            self._spinner.start()
+        else:
+            self._spinner.stop()
+        if state == "ready":
+            self.ready_card.apply(summary)
+            self.fetched_label.setText(f"数据取自{summary.fetched_at_text}" if summary else "")
+        if state == "unavailable":
+            # A first-ever failure has no earlier dataset to fall back on.
+            has_history = summary is not None and bool(summary.price_label)
+            self.history_container.setVisible(has_history)
+            if has_history:
+                self.history_card.apply(summary)
+        self._refresh_status()
+        self._apply_busy()
 
     def set_busy(self, busy: bool) -> None:
-        for row in self.rows.values():
-            row.choose_button.setEnabled(not busy)
-            row.clear_button.setEnabled(not busy)
+        self._busy = busy
+        self._apply_busy()
+
+    def set_session(self, session: ResearchSession) -> None:
+        self.set_state(session.data_state, session.data_summary)
+
+    def _apply_busy(self) -> None:
+        for button in (
+            self.refetch_button,
+            self.reselect_button,
+            self.details_button,
+            self.retry_button,
+            self.local_file_button,
+        ):
+            button.setEnabled(not self._busy)
+
+    def _advance_spinner(self) -> None:
+        self._spinner_index = (self._spinner_index + 1) % len(self.SPINNER_FRAMES)
+        self._refresh_status()
+
+    def _refresh_status(self) -> None:
+        marks = {"ready": "✓", "exploring": self.SPINNER_FRAMES[self._spinner_index], "unavailable": "⚠"}
+        text = self.STATUS_TEXT.get(self._state, "")
+        self.status_label.setText(f"{marks[self._state]} {text}" if text else "")
+        self.status_label.setProperty("dataState", self._state)
+        self.status_label.style().unpolish(self.status_label)
+        self.status_label.style().polish(self.status_label)
 
 
 class TracePanel(QFrame):
@@ -615,37 +855,45 @@ class TracePanel(QFrame):
 
 
 class ContextPane(QSplitter):
-    """User inputs and a maximizable, scrollable Agent trace."""
+    """The dataset in use and a maximizable, scrollable Agent trace."""
 
-    file_selected = Signal(str, str)
-    file_cleared = Signal(str)
+    refetch_requested = Signal()
+    reselect_requested = Signal()
+    details_requested = Signal()
+    retry_requested = Signal()
+    local_file_requested = Signal()
     trace_maximized = Signal(bool)
+
+    PANEL_SIZES: ClassVar[list[int]] = [262, 538]
 
     def __init__(self) -> None:
         super().__init__(Qt.Orientation.Vertical)
         self.setObjectName("contextPane")
-        self.inputs = InputFilesPanel()
+        self.data_panel = DataPanel()
         self.trace = TracePanel()
-        self.inputs.file_selected.connect(self.file_selected)
-        self.inputs.file_cleared.connect(self.file_cleared)
+        self.data_panel.refetch_requested.connect(self.refetch_requested)
+        self.data_panel.reselect_requested.connect(self.reselect_requested)
+        self.data_panel.details_requested.connect(self.details_requested)
+        self.data_panel.retry_requested.connect(self.retry_requested)
+        self.data_panel.local_file_requested.connect(self.local_file_requested)
         self.trace.maximize_requested.connect(self._set_trace_maximized)
-        self.addWidget(self.inputs)
+        self.addWidget(self.data_panel)
         self.addWidget(self.trace)
-        self.setSizes([290, 510])
+        self.setSizes(self.PANEL_SIZES)
         self.setStretchFactor(0, 0)
         self.setStretchFactor(1, 1)
 
     def set_session(self, session: ResearchSession) -> None:
-        self.inputs.set_session(session)
+        self.data_panel.set_session(session)
         self.trace.set_events(session.trace)
 
     def set_busy(self, busy: bool) -> None:
-        self.inputs.set_busy(busy)
+        self.data_panel.set_busy(busy)
 
     def _set_trace_maximized(self, maximized: bool) -> None:
-        self.inputs.setVisible(not maximized)
+        self.data_panel.setVisible(not maximized)
         if maximized:
             self.setSizes([0, max(self.height(), 1)])
         else:
-            self.setSizes([290, 510])
+            self.setSizes(self.PANEL_SIZES)
         self.trace_maximized.emit(maximized)

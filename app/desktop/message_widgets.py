@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import json
+from html import escape
 from typing import Any
 
 from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QPlainTextEdit,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
@@ -17,7 +21,8 @@ from PySide6.QtWidgets import (
 )
 
 from app.desktop.report_view import open_report
-from app.research.agent.schemas import AgentRunResult, EDAPlan
+from app.research.agent.schemas import AgentRunResult, EDAPlan, EDAPlanStep
+from app.research.data.sources.summary import DataSummary, VariableLabel
 from app.research.tools.catalog import FUNCTION_CATALOG, STAGE_TITLES
 
 STATUS_MARK = {
@@ -412,6 +417,225 @@ class PlanMessageWidget(QFrame):
         self.status_label.setText(status)
         self.run_button.hide()
         self.reject_button.hide()
+
+
+def step_display_text(step: EDAPlanStep) -> str:
+    """Say what one step does, as an action rather than as a method name.
+
+    The research protocol is meant to carry a `display_text` for every step; until
+    it does, the step title is already written as a phrase and reads correctly.
+    """
+
+    display = str(step.parameters.get("display_text") or "").strip()
+    return display or step.title
+
+
+def summary_fields(summary: DataSummary | None) -> list[tuple[str, str, str]]:
+    """Render the dataset as the panel renders it: same source, same wording.
+
+    Returns ``(field name, rich-text value, quiet sub-line)`` so the confirmation
+    card and the right-hand panel cannot drift apart.
+    """
+
+    summary = summary or DataSummary()
+    variables = "、".join(
+        escape(item.display)
+        if item.resolved
+        else f'<span style="color:#B45309">{escape(item.display)}</span>'
+        for item in summary.variables
+    )
+    window = f"{summary.start_date} — {summary.end_date}" if summary.start_date else ""
+    sub = summary.granularity_text
+    if sub and summary.gap_text:
+        sub = f"{sub}，{summary.gap_text}"
+    return [
+        ("电价", escape(summary.price_label), ""),
+        ("影响因素", variables, ""),
+        ("时间范围", escape(window), sub),
+    ]
+
+
+def as_summary(value: DataSummary | dict[str, Any] | None) -> DataSummary | None:
+    """Accept a live summary or the dict a saved conversation stores."""
+
+    if value is None or isinstance(value, DataSummary):
+        return value
+    variables = [
+        VariableLabel(display=str(item.get("display", "")), resolved=bool(item.get("resolved", True)))
+        for item in value.get("variables", [])
+        if isinstance(item, dict)
+    ]
+    return DataSummary(
+        price_label=str(value.get("price_label", "")),
+        variables=variables,
+        start_date=str(value.get("start_date", "")),
+        end_date=str(value.get("end_date", "")),
+        granularity_text=str(value.get("granularity_text", "")),
+        gap_text=value.get("gap_text") or None,
+        fetched_at_text=str(value.get("fetched_at_text", "")),
+    )
+
+
+class DataPlanMessageWidget(QFrame):
+    """One confirmation covering both the data and the analysis it will feed.
+
+    Splitting the two would create a state where the data is approved and the
+    analysis is not, which is not a thing the analyst ever meant to say.
+    """
+
+    run_requested = Signal(object)
+    reject_requested = Signal()
+    revise_requested = Signal()
+    details_requested = Signal()
+
+    TITLE = "开始之前，跟你确认一下"
+    DATA_SECTION = "要用的数据"
+    ACTION_SECTION = "要做的事"
+    FOOTNOTE = "点「可以开始」之后，这批数据会先固定下来。后面数据库再更新，也不会影响这一轮的结论。"
+
+    def __init__(self, plan: EDAPlan, *, summary: DataSummary | dict[str, Any] | None = None) -> None:
+        super().__init__()
+        self.setObjectName("planMessage")
+        self.setMinimumWidth(560)
+        self.setMaximumWidth(720)
+        self.plan = plan
+        self.summary = as_summary(summary)
+        self.step_checks: dict[str, QWidget] = {}
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        title = QLabel(self.TITLE)
+        title.setObjectName("planTitle")
+        header.addWidget(title)
+        header.addStretch(1)
+        self.status_label = QLabel("待确认")
+        self.status_label.setObjectName("planStatus")
+        header.addWidget(self.status_label)
+        layout.addLayout(header)
+
+        data_heading = QLabel(self.DATA_SECTION)
+        data_heading.setObjectName("planStage")
+        layout.addWidget(data_heading)
+        for key, value, sub in summary_fields(self.summary):
+            row = QLabel(f"{key}　{value}" if value else f"{key}　待定")
+            row.setObjectName("planStep")
+            row.setTextFormat(Qt.TextFormat.RichText)
+            row.setWordWrap(True)
+            layout.addWidget(row)
+            if sub:
+                sub_row = QLabel(sub)
+                sub_row.setObjectName("planHint")
+                sub_row.setWordWrap(True)
+                layout.addWidget(sub_row)
+
+        action_heading = QLabel(self.ACTION_SECTION)
+        action_heading.setObjectName("planStage")
+        layout.addWidget(action_heading)
+        for step in plan.enabled_steps:
+            row = QLabel(step_display_text(step))
+            row.setObjectName("planStep")
+            row.setWordWrap(True)
+            row.setToolTip(step.description)
+            self.step_checks[step.step_id] = row
+            layout.addWidget(row)
+
+        self.feedback_hint = QLabel(self.FOOTNOTE)
+        self.feedback_hint.setObjectName("planHint")
+        self.feedback_hint.setWordWrap(True)
+        layout.addWidget(self.feedback_hint)
+
+        actions = QHBoxLayout()
+        self.details_button = QPushButton("查看取数细节")
+        self.details_button.setObjectName("dataQuietLink")
+        self.details_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.details_button.clicked.connect(self.details_requested)
+        actions.addWidget(self.details_button)
+        actions.addStretch(1)
+        self.reject_button = QPushButton("先不做")
+        self.reject_button.clicked.connect(self.reject_requested)
+        actions.addWidget(self.reject_button)
+        self.revise_button = QPushButton("我想改改")
+        self.revise_button.clicked.connect(self.revise_requested)
+        actions.addWidget(self.revise_button)
+        self.run_button = QPushButton("可以开始")
+        self.run_button.setObjectName("primaryButton")
+        self.run_button.clicked.connect(lambda: self.run_requested.emit(self.plan))
+        actions.addWidget(self.run_button)
+        layout.addLayout(actions)
+
+    def approved_plan(self) -> EDAPlan:
+        return self.plan
+
+    def set_feedback_countdown(self, seconds: int) -> None:
+        minutes, remainder = divmod(max(0, int(seconds)), 60)
+        self.status_label.setText(f"{minutes} 分 {remainder} 秒后自动开始")
+        self._show_actions(True)
+
+    def set_explicit_approval(self) -> None:
+        self.status_label.setText("等待你确认")
+        self._show_actions(True)
+
+    def set_feedback_paused(self, text: str = "正在接收修改意见") -> None:
+        self.status_label.setText(text)
+
+    def set_running(self) -> None:
+        self.status_label.setText("执行中")
+        self._show_actions(False)
+
+    def set_finished(self, status: str = "已完成") -> None:
+        self.status_label.setText(status)
+        self._show_actions(False)
+
+    def _show_actions(self, visible: bool) -> None:
+        for button in (self.run_button, self.revise_button, self.reject_button):
+            button.setVisible(visible)
+
+
+class DataDetailsDialog(QDialog):
+    """Where the data actually came from, in database words.
+
+    This is the one screen the terminology rules do not cover: it exists so an
+    operator can chase down an odd result, and it takes two clicks to reach.
+    """
+
+    TITLE = "取数细节"
+    EMPTY_TEXT = "这一轮还没有记录取数细节。"
+
+    def __init__(self, details: dict[str, Any] | None, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(self.TITLE)
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+        body = QPlainTextEdit()
+        body.setObjectName("dataDetails")
+        body.setReadOnly(True)
+        body.setPlainText(self._render(details))
+        layout.addWidget(body, 1)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.accept)
+        actions.addWidget(close_button)
+        layout.addLayout(actions)
+
+    def _render(self, details: dict[str, Any] | None) -> str:
+        if not details:
+            return self.EMPTY_TEXT
+        lines: list[str] = []
+        for key, value in details.items():
+            if isinstance(value, (list, tuple)):
+                value = "\n  ".join(str(item) for item in value)
+                lines.append(f"{key}:\n  {value}")
+            elif isinstance(value, dict):
+                rendered = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+                lines.append(f"{key}:\n{rendered}")
+            else:
+                lines.append(f"{key}: {value}")
+        return "\n".join(lines)
 
 
 class ResultMessageWidget(QFrame):

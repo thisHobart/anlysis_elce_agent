@@ -139,6 +139,12 @@ def main(argv: list[str] | None = None) -> int:
     skill_args = [
         f"--add-data={path};app/research/skills/{path.name}" for path in builtin_skills
     ]
+    # The variable word list ships beside its loader so a packaged build resolves
+    # it the same way a source checkout does.
+    word_list = root / "configs" / WORD_LIST_FILENAME
+    if not word_list.is_file():
+        raise SystemExit(f"No variable word list was found at {word_list}.")
+    word_list_arg = f"--add-data={word_list};app/research/data/sources"
     original_path = os.environ.get("PATH", "")
     os.environ["PATH"] = sanitized_build_path(
         original_path,
@@ -164,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
                 "--hidden-import=statsmodels.tsa.stattools",
                 "--hidden-import=statsmodels.stats.diagnostic",
                 *skill_args,
+                word_list_arg,
                 *exclude_args,
             ]
         )

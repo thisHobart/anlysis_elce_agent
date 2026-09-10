@@ -476,25 +476,29 @@ def test_main_window_uses_one_three_pane_workspace(qt_app: QApplication, tmp_pat
         assert not hasattr(window, "tabs")
         assert window.workspace.current_session.title == "新会话"
         assert window.workspace.history.new_button.text() == "＋  新的研究"
-        assert window.workspace.context.inputs.title_label.text() == "数据文件"
+        panel = window.workspace.context.data_panel
+        assert panel.title_label.text() == "数据"
         assert not hasattr(window.workspace.conversation, "config_label")
-        assert list(window.workspace.context.inputs.rows) == ["target", "actuals", "forecasts"]
-        assert all(row.name_label.text() == "尚未选择" for row in window.workspace.context.inputs.rows.values())
-        assert all(not hasattr(row, "status_label") for row in window.workspace.context.inputs.rows.values())
-        assert all(not hasattr(row, "variables") for row in window.workspace.context.inputs.rows.values())
+        assert panel.state == "empty"
+        assert panel.empty_label.text() == "还没开始。说说你想研究什么，我来找数据。"
+        assert panel.empty_view.isVisibleTo(panel)
+        assert not panel.ready_view.isVisibleTo(panel)
+        assert not panel.unavailable_view.isVisibleTo(panel)
+        assert list(panel.ready_card.rows) == ["电价", "影响因素", "时间范围"]
+        assert not hasattr(window.workspace.context, "inputs")
         assert not hasattr(window.workspace.context, "plan")
         assert window.workspace.context.trace.tree.verticalScrollBar() is not None
         window.workspace.context.trace.maximize_button.click()
         qt_app.processEvents()
         assert window.workspace.history.isHidden()
         assert window.workspace.conversation.isHidden()
-        assert window.workspace.context.inputs.isHidden()
+        assert window.workspace.context.data_panel.isHidden()
         assert window.workspace.context.trace.maximize_button.text() == "还原"
         window.workspace.context.trace.maximize_button.click()
         qt_app.processEvents()
         assert not window.workspace.history.isHidden()
         assert not window.workspace.conversation.isHidden()
-        assert not window.workspace.context.inputs.isHidden()
+        assert not window.workspace.context.data_panel.isHidden()
         assert not window.workspace.current_session.can_analyze
     finally:
         window.close()
@@ -1001,7 +1005,7 @@ def test_continuous_conversation_runs_plan_and_answers_followup(
             not hasattr(row, "setChecked")
             for row in workspace.conversation.current_plan_widget.step_checks.values()
         )
-        assert "明确确认" in workspace.conversation.current_plan_widget.status_label.text()
+        assert "等待你确认" in workspace.conversation.current_plan_widget.status_label.text()
         assert not workspace._plan_feedback_timer.isActive()
         assert session.inputs["actuals"].variables
         assert all(event.status != "running" for event in session.trace)
