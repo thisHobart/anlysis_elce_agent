@@ -40,6 +40,8 @@
 | [结构化模型新闻抽取](structured-news-extraction.md) | 描述模型输出、证据、时间、数量和隔离链路 | 当前实现说明 |
 | [实体来源、类别与组合表达](news-entity-rules.md) | 定义区域来源、泛称资产和组合资产规则 | 当前实体契约，schema/Prompt 1.3.0 |
 | [真实来源新闻抽取基准](real-news-extraction-benchmark.md) | 记录开发集、保留集、指标和历史运行 | 当前基准定义 + 历史结果 |
+| [P2 长文本新闻抽取三方案评估](p2-long-context-strategy-evaluation.md) | 比较三种互斥上下文处理架构并记录选型 | 2026-09-09 评测快照；选择全文上下文模型路由 |
+| [P2 长文本三方案 QA 签核](p2-long-context-strategy-qa-signoff.md) | 记录自动检查、人工复核、问题修正和交付边界 | 2026-09-09；批准 MVP 选型，不代表生产准入 |
 
 ### P2 验证记录
 

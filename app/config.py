@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 120.0
     """Backend request timeout; intentionally hidden from the end-user dialog."""
     llm_max_retries: int = 1
+    llm_context_window_tokens: int = Field(default=0, ge=0)
+    """Configured model context window; 0 leaves preflight enforcement to the caller."""
+    llm_max_output_tokens: int = Field(default=4096, ge=256)
+    """Maximum generated tokens reserved by context preflight and sent to providers."""
+    llm_context_safety_tokens: int = Field(default=1024, ge=0)
+    """Additional headroom for provider-specific message framing and tokenization drift."""
     llm_thinking_policy: Literal["strip", "reject"] = "strip"
     """``strip`` discards provider reasoning; ``reject`` fails closed when it is present."""
     llm_history_messages: int = Field(default=8, ge=1, le=100)

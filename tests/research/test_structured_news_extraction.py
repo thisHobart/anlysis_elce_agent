@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from app.llm.gateway import ModelGatewayError, ModelResponseError
+from app.llm.gateway import ModelGatewayError, ModelResponseError, ModelTransientError
 from app.research.news import (
     AsOfEventAssembler,
     CollectedNewsRecord,
@@ -648,6 +648,14 @@ def test_a_bad_model_response_quarantines_one_document_without_crashing_the_batc
     assert result.events == ()
     assert result.quarantine is not None
     assert result.quarantine.reason_code == "model_response_invalid"
+
+    transient = StructuredNewsEventExtractor(
+        FailingGateway(ModelTransientError("provider 500")),
+        market_timezone="UTC",
+    ).extract(document)
+    assert transient.events == ()
+    assert transient.quarantine is not None
+    assert transient.quarantine.reason_code == "model_unavailable"
 
     # A broken endpoint is global, not this document's fault, so it still fails closed.
     with pytest.raises(ModelGatewayError, match="offline"):

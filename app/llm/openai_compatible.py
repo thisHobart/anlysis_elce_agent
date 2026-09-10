@@ -10,14 +10,17 @@ from pydantic import BaseModel, ValidationError
 
 from app.config import Settings, get_settings
 from app.llm import compat
+from app.llm.context_safety import ensure_complete_response, is_output_truncation_error
 from app.llm.gateway import (
     ModelConfigurationError,
     ModelGatewayError,
     ModelMessage,
+    ModelOutputTruncatedError,
     ModelProtocolError,
     ModelResponseError,
     ModelThinkingError,
     ModelToolCall,
+    ModelTransientError,
     StructuredResult,
 )
 from app.llm.langchain_support import (
@@ -169,6 +172,7 @@ class ResearchModelGateway:
             "timeout": self.settings.llm_timeout_seconds,
             "max_retries": self.settings.llm_max_retries,
             "use_responses_api": self.settings.llm_api_style == "responses",
+            "max_tokens": self.settings.llm_max_output_tokens,
         }
         if "temperature" not in self._disabled:
             options["temperature"] = 0
@@ -259,6 +263,7 @@ class ResearchModelGateway:
             if raw is None:
                 raise ModelResponseError("大模型结构化输出缺少 raw，无法验证协议。")
             self._guard_thinking(raw)
+            ensure_complete_response(raw)
             parsed = result.get("parsed")
             parsing_error = result.get("parsing_error")
             if parsing_error is not None:
@@ -297,6 +302,10 @@ class ResearchModelGateway:
         except (ValidationError, ValueError, TypeError, AttributeError) as exc:
             raise ModelResponseError(f"大模型结构化函数参数无法解析：{exc}") from exc
         except Exception as exc:
+            if is_output_truncation_error(exc):
+                raise ModelOutputTruncatedError(f"模型输出达到 token 限制：{exc}") from exc
+            if compat.is_transient_failure(exc):
+                raise ModelTransientError(f"模型端点暂时不可用：{type(exc).__name__}: {exc}") from exc
             if compat.is_rejected_request(exc):
                 raise self._protocol_error("结构化输出/Function Calling", exc) from exc
             raise ModelGatewayError(f"大模型调用失败：{type(exc).__name__}: {exc}") from exc
@@ -313,6 +322,8 @@ class ResearchModelGateway:
         except ModelGatewayError:
             raise
         except Exception as exc:
+            if compat.is_transient_failure(exc):
+                raise ModelTransientError(f"模型端点暂时不可用：{type(exc).__name__}: {exc}") from exc
             raise ModelGatewayError(f"大模型调用失败：{type(exc).__name__}: {exc}") from exc
         if not answer:
             raise ModelResponseError("大模型返回了空回复。")
@@ -347,6 +358,8 @@ class ResearchModelGateway:
         except ValidationError as exc:
             raise ModelResponseError(f"大模型函数参数无法解析：{exc}") from exc
         except Exception as exc:
+            if compat.is_transient_failure(exc):
+                raise ModelTransientError(f"模型端点暂时不可用：{type(exc).__name__}: {exc}") from exc
             if compat.is_rejected_request(exc):
                 raise self._protocol_error("Function Calling", exc) from exc
             raise ModelGatewayError(f"大模型函数选择失败：{type(exc).__name__}: {exc}") from exc

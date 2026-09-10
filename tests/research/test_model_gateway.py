@@ -11,8 +11,10 @@ from app.llm import compat
 from app.llm.gateway import (
     ModelConfigurationError,
     ModelMessage,
+    ModelOutputTruncatedError,
     ModelProtocolError,
     ModelResponseError,
+    ModelTransientError,
 )
 from app.llm.openai_compatible import ResearchModelGateway
 
@@ -59,6 +61,8 @@ class BoundModel:
         self.owner = owner
 
     def invoke(self, messages):
+        if self.owner.structured_error is not None:
+            raise self.owner.structured_error
         self.owner.last_messages = messages
         return {
             "raw": self.owner.response,
@@ -85,7 +89,9 @@ class RecordingModel:
                     "id": "call-1",
                 }
             ],
+            response_metadata={},
         )
+        self.structured_error = None
 
     def with_structured_output(self, schema, *, method, include_raw):
         self.method = method
@@ -120,6 +126,39 @@ def test_structured_output_uses_native_function_calling_and_typed_messages():
     assert model.method == "function_calling"
     assert model.include_raw is True
     assert isinstance(model.last_messages[0], HumanMessage)
+
+
+def test_parseable_structured_output_is_rejected_when_provider_reports_truncation():
+    gateway = ResearchModelGateway(_settings())
+    model = RecordingModel()
+    model.response.response_metadata = {"finish_reason": "length"}
+    gateway._model = model
+
+    with pytest.raises(ModelOutputTruncatedError, match="响应不完整"):
+        gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
+
+
+def test_sdk_length_exception_is_exposed_as_output_truncation() -> None:
+    LengthFinishReasonError = type("LengthFinishReasonError", (RuntimeError,), {})
+    gateway = ResearchModelGateway(_settings())
+    model = RecordingModel()
+    model.structured_error = LengthFinishReasonError("length limit was reached")
+    gateway._model = model
+
+    with pytest.raises(ModelOutputTruncatedError, match="token 限制"):
+        gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
+
+
+def test_provider_500_is_exposed_as_invocation_scoped_transient_failure() -> None:
+    server_error = RuntimeError("internal server error")
+    server_error.status_code = 500
+    gateway = ResearchModelGateway(_settings())
+    model = RecordingModel()
+    model.structured_error = server_error
+    gateway._model = model
+
+    with pytest.raises(ModelTransientError, match="暂时不可用"):
+        gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
 
 
 def test_structured_output_method_follows_the_configured_native_protocol():

@@ -50,6 +50,7 @@ from app.research.news.clock import (
     zero_point,
 )
 from app.research.news.contracts import (
+    CharacterRange,
     CollectedNewsRecord,
     DocumentRef,
     EventExtractionBatch,
@@ -60,6 +61,7 @@ from app.research.news.contracts import (
     EventRecord,
     EventStateRevision,
     EvidenceSpan,
+    ExtractionCoverage,
     ExtractionQuarantine,
     ExtractionTrace,
     MergedEvent,
@@ -90,6 +92,7 @@ from app.research.news.features import (
     build_event_features,
     snapshot_to_csv_rows,
 )
+from app.research.news.long_context import FullContextNewsExtractor, ModelRoute
 from app.research.news.merging import AsOfEventAssembler, EventView, merge_event_records
 from app.research.news.model_extraction import (
     MODEL_EXTRACTION_PROMPT_VERSION,
@@ -136,6 +139,7 @@ __all__ = [
     "AnalysisMethod",
     "AnalysisResult",
     "AsOfEventAssembler",
+    "CharacterRange",
     "CollectedNewsAdapter",
     "CollectedNewsAdapterError",
     "CollectedNewsRecord",
@@ -158,9 +162,11 @@ __all__ = [
     "EvidenceSpan",
     "ExternalNewsAdapterNotConfigured",
     "ExternalNewsApiPlaceholder",
+    "ExtractionCoverage",
     "ExtractionQuarantine",
     "ExtractionTrace",
     "ExtractionValidationError",
+    "FullContextNewsExtractor",
     "JsonlCollectedNewsAdapter",
     "LeadTimeReading",
     "MarketClock",
@@ -170,6 +176,7 @@ __all__ = [
     "ModelEvidenceClaim",
     "ModelNewsExtraction",
     "ModelQuantityCandidate",
+    "ModelRoute",
     "NewsDocument",
     "NewsEventExtractor",
     "NewsNormalizer",

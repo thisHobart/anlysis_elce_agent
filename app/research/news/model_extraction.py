@@ -16,10 +16,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from app.llm.gateway import (
     ModelConfigurationError,
+    ModelContextLimitError,
     ModelGateway,
     ModelMessage,
+    ModelOutputTruncatedError,
     ModelResponseError,
     ModelThinkingError,
+    ModelTransientError,
 )
 from app.research.news.contracts import (
     EventExtractionBatch,
@@ -409,6 +412,27 @@ class StructuredNewsEventExtractor:
             result = self._invoke_with_repair(messages)
         except (ModelThinkingError, ModelConfigurationError):
             raise
+        except ModelContextLimitError as exc:
+            print(f"[新闻抽取] 完整请求超过上下文限制，隔离：{exc}")
+            return self._quarantine(
+                document,
+                reason_code="context_limit_exceeded",
+                message=str(exc),
+            )
+        except ModelOutputTruncatedError as exc:
+            print(f"[新闻抽取] 模型输出被截断，隔离：{exc}")
+            return self._quarantine(
+                document,
+                reason_code="model_output_truncated",
+                message=str(exc),
+            )
+        except ModelTransientError as exc:
+            print(f"[新闻抽取] 模型端点暂时不可用，隔离：{exc}")
+            return self._quarantine(
+                document,
+                reason_code="model_unavailable",
+                message=str(exc),
+            )
         except ModelResponseError as exc:
             print(f"[新闻抽取] 模型响应无法用于本篇，隔离：{exc}")
             return self._quarantine(

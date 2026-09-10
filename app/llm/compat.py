@@ -70,6 +70,20 @@ def is_transport_failure(exc: BaseException) -> bool:
     return type(exc).__name__ in _TRANSPORT_ERRORS
 
 
+def is_transient_failure(exc: BaseException) -> bool:
+    """Report invocation-scoped failures that may succeed on a later request."""
+
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status >= 500 or status in {408, 429}
+    return type(exc).__name__ in {
+        "APITimeoutError",
+        "APIConnectionError",
+        "RateLimitError",
+        "InternalServerError",
+    }
+
+
 def unsupported_feature(
     exc: BaseException,
     disabled: frozenset[str] | set[str],
