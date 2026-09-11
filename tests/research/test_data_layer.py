@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from app.research.application.planning import prepare_research_data
 from app.research.data.alignment import align_loaded_series
 from app.research.data.loader import load_series
 from app.research.data.quality import build_quality_report
@@ -107,3 +108,51 @@ def test_very_sparse_target_is_not_marked_usable(tmp_path: Path):
     assert quality.series["price"].aligned_non_null_rows == 5
     assert quality.series["price"].aligned_coverage_rate < 0.1
     assert quality.usable_for_eda is False
+
+
+def test_factor_without_rows_in_selected_window_is_reported_not_fatal(tmp_path: Path):
+    target_path = tmp_path / "target.parquet"
+    factor_path = tmp_path / "factor.parquet"
+    pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=96, freq="15min"),
+            "price": range(96),
+        }
+    ).to_parquet(target_path, index=False)
+    pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-04-01", periods=4, freq="15min"),
+            "solar": range(4),
+        }
+    ).to_parquet(factor_path, index=False)
+    config = StudyConfig(
+        study=StudyDefinition(
+            name="window-test",
+            market="test",
+            frequency="15min",
+            start_time="2026-01-01",
+            end_time="2026-01-01 23:59:59",
+        ),
+        target=SeriesSpec(
+            name="price",
+            path=target_path,
+            timestamp_column="timestamp",
+            value_column="price",
+        ),
+        exogenous=[
+            SeriesSpec(
+                name="solar",
+                path=factor_path,
+                timestamp_column="timestamp",
+                value_column="solar",
+            )
+        ],
+    )
+
+    prepared = prepare_research_data(config)
+
+    assert prepared.aligned.frame["solar"].isna().all()
+    assert any(
+        issue.code == "series_has_no_values" and issue.series == "solar"
+        for issue in prepared.quality.issues
+    )

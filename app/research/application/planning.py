@@ -69,7 +69,10 @@ def prepare_research_data(config: StudyConfig) -> PreparedResearchData:
         "end_time": config.study.end_time,
     }
     target = load_series(config.target, **options)
-    exogenous = [load_series(spec, **options) for spec in config.exogenous]
+    # A chat-selected short window may predate a recently introduced factor.
+    # Preserve it as an all-missing quality finding instead of rejecting the
+    # whole price study; deterministic screening will keep it out of analysis.
+    exogenous = [load_series(spec, **options, allow_empty=True) for spec in config.exogenous]
     return assemble_research_data(config, target, exogenous)
 
 

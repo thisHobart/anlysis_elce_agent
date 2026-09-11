@@ -1,0 +1,68 @@
+version: 1
+regions:
+  - region_id: shandong
+    label: 山东
+    market: 山东电网
+    province_value: 山东省
+    timezone: Asia/Shanghai
+    frequency: 15min
+    credential_prefix: VPP_SHANDONG_DB_FEATURE
+    price_table: t_data_province_real_time_cleared_price
+    price_history_table: t_data_province_real_time_cleared_price_hour
+    price_label: 实时省级出清电价
+    target_name: rt_price
+    actual_series:
+      - name: actual_load
+        table: t_data_dr_province_actual_load
+        type_value: 11
+      - name: total_generation
+        table: t_data_dr_province_total_electricity
+      - name: non_market_output
+        table: t_data_dr_province_power_generation
+        type_value: 1
+      # The schema defines type 3 as thermal output. It is kept in the catalog so
+      # future rows are picked up automatically; the current Shandong table has 0.
+      - name: thermal_power
+        table: t_data_dr_province_power_generation
+        type_value: 3
+      - name: renewable_output
+        table: t_data_dr_province_actual_new_energy_exert
+        type_value: 0
+      - name: actual_wind
+        table: t_data_dr_province_actual_new_energy_exert
+        type_value: 4
+      - name: actual_hydro
+        table: t_data_dr_province_actual_new_energy_exert
+        type_value: 2
+      - name: actual_solar
+        table: t_data_dr_province_actual_new_energy_exert
+        type_value: 12
+      - name: positive_reserve
+        table: t_data_dr_province_system_info
+        type_value: 2
+      - name: negative_reserve
+        table: t_data_dr_province_system_info
+        type_value: 3
+    forecast_series:
+      - name: forecast_load
+        table: t_data_sdc_province_recently_forecast_load
+      - name: forecast_generation
+        table: t_data_sdc_province_recently_forecast_electricity
+      - name: forecast_wind
+        table: t_data_sdc_province_recently_forecast_electricity_energy
+        type_value: 4
+      - name: forecast_solar
+        table: t_data_sdc_province_recently_forecast_electricity_energy
+        type_value: 1
+      - name: forecast_hydro
+        table: t_data_sdc_province_recently_forecast_electricity_water
+    analytics_credential_prefix: VPP_SHANDONG_DB_ANALYTICS
+    weather_actual_table: t_spo_aiweather_province_hourly_forecast_ERA5
+    weather_forecast_table: t_spo_aiweather_province_hourly_forecast
+    weather_daily_table: t_spo_aiweather_province_daily_forecast
+    weather_columns:
+      - temperature
+      - wind_speed_eighty
+      - cloud_cover
+      - solar_radiation
+      - hour_precipitation

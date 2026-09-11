@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import QDialog, QLabel, QMainWindow, QMessageBox, QToolBar
 
@@ -10,6 +12,7 @@ from app.desktop.model_config import ModelConfigDialog
 from app.desktop.session import SessionStore
 from app.desktop.workspace import ResearchWorkspace
 from app.research.application.coordinator import ResearchCoordinator
+from app.research.data.sources.regions import RegionPriceFetch, RegionProfile
 
 
 class MainWindow(QMainWindow):
@@ -22,6 +25,8 @@ class MainWindow(QMainWindow):
         session_store: SessionStore | None = None,
         plan_feedback_seconds: int = 30,
         auto_execute_plan: bool = False,
+        region_profiles: dict[str, RegionProfile] | None = None,
+        region_fetcher: Callable[..., RegionPriceFetch] | None = None,
     ) -> None:
         super().__init__()
         self.setObjectName("mainWindow")
@@ -34,6 +39,8 @@ class MainWindow(QMainWindow):
             store=session_store,
             plan_feedback_seconds=plan_feedback_seconds,
             auto_execute_plan=auto_execute_plan,
+            region_profiles=region_profiles,
+            region_fetcher=region_fetcher,
         )
         toolbar = QToolBar("应用工具", self)
         toolbar.setObjectName("applicationToolbar")

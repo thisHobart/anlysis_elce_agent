@@ -19,7 +19,7 @@ from PySide6.QtGui import QTextDocument
 from PySide6.QtWidgets import QApplication, QFileDialog, QLabel
 
 from app.config import Settings
-from app.desktop.input_config import build_runtime_study
+from app.desktop.input_config import build_runtime_study, parse_chat_time_range
 from app.desktop.main_window import MainWindow
 from app.desktop.message_widgets import ResultMessageWidget, ThinkingMessageWidget
 from app.desktop.panes import ConversationPane, TracePanel
@@ -36,6 +36,7 @@ from app.desktop.session import (
 from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
 from app.research.agent.subagents.eda import EDASubagent
 from app.research.application.coordinator import ResearchCoordinator
+from app.research.data.inference import infer_study_context
 from app.research.graph.narration import STAGE_LABELS
 from app.research.skills.registry import SkillRegistry
 from app.research.tools.catalog import FUNCTION_CATALOG
@@ -524,7 +525,7 @@ def test_main_window_uses_one_three_pane_workspace(qt_app: QApplication, tmp_pat
         assert panel.title_label.text() == "数据"
         assert not hasattr(window.workspace.conversation, "config_label")
         assert panel.state == "empty"
-        assert panel.empty_label.text() == "还没开始。说说你想研究什么，我来找数据。"
+        assert panel.empty_label.text() == "还没取数。请从上方选择地区；也可以直接提问讨论研究方法。"
         assert panel.empty_view.isVisibleTo(panel)
         assert not panel.ready_view.isVisibleTo(panel)
         assert not panel.unavailable_view.isVisibleTo(panel)
@@ -619,6 +620,44 @@ def test_three_data_files_build_the_runtime_study_contract(
         window.close()
 
 
+def test_chat_can_set_and_clear_an_explicit_analysis_time_range():
+    selected = parse_chat_time_range("仅分析 2026年1月1日 00:15 到 2026年3月31日")
+    assert selected is not None
+    assert selected.action == "set"
+    assert selected.start_time.isoformat() == "2026-01-01T00:15:00"
+    assert selected.end_time.isoformat() == "2026-03-31T23:59:59.999999"
+
+    iso = parse_chat_time_range("分析区间 2026-04-01T00:15 至 2026-04-02T23:45")
+    assert iso is not None
+    assert iso.start_time.isoformat() == "2026-04-01T00:15:00"
+    assert iso.end_time.isoformat() == "2026-04-02T23:45:00"
+
+    cleared = parse_chat_time_range("恢复全部时间范围")
+    assert cleared is not None
+    assert cleared.action == "clear"
+    assert cleared.start_time is None and cleared.end_time is None
+
+
+def test_chat_time_range_never_guesses_a_missing_boundary():
+    with pytest.raises(ValueError, match="开始日期和结束日期"):
+        parse_chat_time_range("时间范围选择 2026-01-01")
+
+
+def test_runtime_study_applies_the_session_chat_time_range(tmp_path: Path):
+    index = pd.date_range("2026-01-01", periods=96 * 5, freq="15min")
+    target = tmp_path / "prices.parquet"
+    pd.DataFrame({"timestamp": index, "rt_price": range(len(index))}).to_parquet(target, index=False)
+    session = ResearchSession(source_kind="file")
+    session.inputs["target"].path = str(target)
+    session.analysis_start_time = "2026-01-02T00:00:00"
+    session.analysis_end_time = "2026-01-03T23:59:59.999999"
+
+    config = build_runtime_study(session)
+
+    assert config.study.start_time.isoformat() == "2026-01-02T00:00:00"
+    assert config.study.end_time.isoformat() == "2026-01-03T23:59:59.999999"
+
+
 def test_forecast_availability_column_is_inferred_without_a_config_file(tmp_path: Path):
     index = pd.date_range("2026-01-01", periods=24, freq="1h")
     target = tmp_path / "prices.csv"
@@ -639,6 +678,48 @@ def test_forecast_availability_column_is_inferred_without_a_config_file(tmp_path
 
     assert [item.name for item in context.exogenous] == ["load_forecast"]
     assert context.exogenous[0].available_at_column == "available_at"
+
+
+def test_actual_availability_column_is_metadata_not_a_variable(tmp_path: Path):
+    index = pd.date_range("2026-01-01", periods=24, freq="1h")
+    target = tmp_path / "prices.csv"
+    actuals = tmp_path / "actuals.parquet"
+    pd.DataFrame({"datetime": index, "price": range(24)}).to_csv(target, index=False)
+    pd.DataFrame(
+        {
+            "datetime": index,
+            "available_at": index + pd.Timedelta(days=1),
+            "temperature": range(24),
+        }
+    ).to_parquet(actuals, index=False)
+    session = ResearchSession()
+    session.inputs["target"].path = str(target)
+    session.inputs["actuals"].path = str(actuals)
+
+    context = build_runtime_study(session)
+
+    assert [item.name for item in context.exogenous] == ["temperature"]
+    assert context.exogenous[0].available_at_column == "available_at"
+
+
+def test_parquet_numeric_series_survives_an_empty_early_sample(tmp_path: Path):
+    index = pd.date_range("2026-01-01", periods=3000, freq="15min")
+    target = tmp_path / "prices.parquet"
+    forecasts = tmp_path / "forecasts.parquet"
+    pd.DataFrame({"timestamp": index, "rt_price": range(len(index))}).to_parquet(target, index=False)
+    sparse = pd.Series(float("nan"), index=range(len(index)))
+    sparse.iloc[2600:] = range(400)
+    pd.DataFrame(
+        {
+            "timestamp": index,
+            "available_at": index - pd.Timedelta(hours=1),
+            "forecast_solar": sparse,
+        }
+    ).to_parquet(forecasts, index=False)
+
+    context = infer_study_context(target_path=target, forecasts_path=forecasts)
+
+    assert [item.name for item in context.exogenous] == ["forecast_solar"]
 
 
 def test_session_history_persists_across_window_restart(

@@ -73,6 +73,7 @@ def load_series(
     study_timezone: str,
     start_time: datetime | None = None,
     end_time: datetime | None = None,
+    allow_empty: bool = False,
 ) -> LoadedSeries:
     """Read one source and normalize timestamps/numbers without hiding bad rows."""
 
@@ -106,7 +107,7 @@ def load_series(
     duplicate_timestamp_rows = int(duplicate_mask.sum())
     duplicate_timestamp_keys = int(frame.loc[duplicate_mask, "timestamp"].nunique())
     frame = frame.sort_values("timestamp", kind="stable").reset_index(drop=True)
-    if frame.empty:
+    if frame.empty and not allow_empty:
         raise ResearchDataError(f"{spec.name} has no valid rows in the configured study window")
 
     return LoadedSeries(

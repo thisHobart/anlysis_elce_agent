@@ -51,6 +51,12 @@ def _numeric_columns(
             continue
         source = frame[column].dropna()
         if source.empty:
+            # Parquet preserves a numeric schema even when an early sample has no
+            # values. Keep that declared series: a later part of a sparse outer
+            # join may contain the observations (for example a newly launched
+            # solar forecast).
+            if pd.api.types.is_numeric_dtype(frame[column].dtype):
+                result.append(name)
             continue
         converted = pd.to_numeric(source, errors="coerce")
         if float(converted.notna().mean()) >= 0.9:
@@ -154,7 +160,10 @@ def infer_study_context(
         source_path = Path(source_value).resolve()
         frame = _read_sample(source_path)
         timestamp = _timestamp_column(frame, source_path.name)
-        available_at = _availability_column(frame, timestamp) if availability == "forecast" else None
+        # Availability metadata can accompany both observations and forecasts.
+        # Excluding it from numeric inference prevents Parquet datetime columns
+        # from being interpreted as nanosecond-valued business variables.
+        available_at = _availability_column(frame, timestamp)
         for column in _numeric_columns(
             frame,
             timestamp,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from math import ceil
 from pathlib import Path
@@ -11,7 +12,12 @@ from uuid import uuid4
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QSplitter, QWidget
 
-from app.desktop.input_config import FILE_FILTERS, build_runtime_study, validate_input_path
+from app.desktop.input_config import (
+    FILE_FILTERS,
+    build_runtime_study,
+    parse_chat_time_range,
+    validate_input_path,
+)
 from app.desktop.message_widgets import DataDetailsDialog, ThinkingMessageWidget
 from app.desktop.panes import STATUS_LABELS, ContextPane, ConversationPane, HistoryPane
 from app.desktop.session import (
@@ -23,6 +29,7 @@ from app.desktop.session import (
     SessionStore,
     TraceEvent,
     VariableEvidence,
+    default_input_files,
 )
 from app.desktop.worker import FunctionWorker
 from app.research.agent.schemas import (
@@ -33,6 +40,13 @@ from app.research.agent.schemas import (
 )
 from app.research.application.coordinator import ResearchCoordinator
 from app.research.data.snapshot import input_file_manifest, study_fingerprint
+from app.research.data.sources.regions import (
+    RegionPriceFetch,
+    RegionProfile,
+    RegionSourceError,
+    fetch_region_price,
+    load_region_profiles,
+)
 from app.research.data.sources.summary import (
     DataSummary,
     build_partial_summary,
@@ -87,6 +101,8 @@ class ResearchWorkspace(QSplitter):
         store: SessionStore | None = None,
         plan_feedback_seconds: int = 30,
         auto_execute_plan: bool = False,
+        region_profiles: dict[str, RegionProfile] | None = None,
+        region_fetcher: Callable[..., RegionPriceFetch] | None = None,
     ) -> None:
         super().__init__(Qt.Orientation.Horizontal)
         self.setObjectName("researchWorkspace")
@@ -97,6 +113,16 @@ class ResearchWorkspace(QSplitter):
             if provided_store
             else default_research_output_directory()
         )
+        self.region_data_directory = self.store.path.parent / "region-data"
+        region_notice: str | None = None
+        if region_profiles is None:
+            try:
+                region_profiles = load_region_profiles()
+            except RegionSourceError as exc:
+                region_profiles = {}
+                region_notice = str(exc)
+        self.region_profiles = dict(region_profiles)
+        self.region_fetcher = region_fetcher or fetch_region_price
         self._owns_agent = agent is None
         self.agent = agent or ResearchCoordinator(
             checkpoint_path=self.store.path.with_name("research_graph.sqlite3")
@@ -110,6 +136,8 @@ class ResearchWorkspace(QSplitter):
         ]
         # Surfaced once, in the first session created after startup.
         self._recovery_notices = list(self.store.recovery_notices)
+        if region_notice:
+            self._recovery_notices.append(region_notice)
         self.current_session_id: str | None = None
         self._thread: QThread | None = None
         self._worker: FunctionWorker | None = None
@@ -120,6 +148,7 @@ class ResearchWorkspace(QSplitter):
         self._thinking_function: str | None = None
         self._last_progress_message = ""
         self._task_previous_status = "idle"
+        self._region_failure_summary: DataSummary | None = None
         self._active_interrupt_id: str | None = None
         self._active_state_revision: int | None = None
         self._active_interrupt_kind: str | None = None
@@ -165,6 +194,7 @@ class ResearchWorkspace(QSplitter):
         self.context.details_requested.connect(self.show_data_details)
         self.context.retry_requested.connect(self.retry_dataset)
         self.context.local_file_requested.connect(self.choose_local_files)
+        self.context.region_selected.connect(self.select_region)
         self.context.trace_maximized.connect(self._set_trace_maximized)
 
         session = self._new_session()
@@ -196,6 +226,14 @@ class ResearchWorkspace(QSplitter):
 
     def _new_session(self) -> ResearchSession:
         session = ResearchSession()
+        profile = self.region_profiles.get(session.region_id)
+        if profile is None and self.region_profiles:
+            profile = next(iter(self.region_profiles.values()))
+        if profile is not None:
+            session.region_id = profile.region_id
+            session.region_label = profile.label
+            session.region_market = profile.market
+            session.region_timezone = profile.timezone
         session.messages.append(
             SessionMessage(
                 role="assistant",
@@ -203,7 +241,7 @@ class ResearchWorkspace(QSplitter):
                 content=(
                     "你好，我可以帮你研究电价和它背后的影响因素。\n"
                     "直接说你想弄清什么就行，例如“负荷对实时电价的影响有多大”“峰谷价差在夏天有什么不同”。\n"
-                    "要真正跑分析，请在右侧放入目标电价数据；只想讨论方法时不放文件也可以。"
+                    "要真正跑分析，请在右侧选择地区并取数；只想讨论方法时不取数据也可以。"
                 ),
             )
         )
@@ -361,6 +399,8 @@ class ResearchWorkspace(QSplitter):
                 return
         if not chosen:
             return
+        self.current_session.analysis_start_time = None
+        self.current_session.analysis_end_time = None
         self._cancel_plan_feedback_window()
         self._invalidate_plan_for_data_change(self._current_dataset_fingerprint())
         self._add_trace("input", "改用本地文件", "completed", "、".join(chosen))
@@ -373,6 +413,9 @@ class ResearchWorkspace(QSplitter):
         if self.is_busy:
             return
         session = self.current_session
+        if session.source_kind == "database":
+            self.select_region(session.region_id)
+            return
         fingerprint = self._current_dataset_fingerprint()
         changed = self._invalidate_plan_for_data_change(fingerprint)
         if changed:
@@ -390,7 +433,7 @@ class ResearchWorkspace(QSplitter):
 
         if self.is_busy:
             return
-        self.choose_local_files()
+        self.context.data_panel.open_region_menu()
 
     def retry_dataset(self) -> None:
         """Try the data source again without touching what was asked for."""
@@ -398,12 +441,122 @@ class ResearchWorkspace(QSplitter):
         if self.is_busy:
             return
         session = self.current_session
+        if session.source_kind == "database":
+            self.select_region(session.region_id)
+            return
         if session.can_analyze:
             self._add_trace("input", "重新连接数据", "completed", "已改用本地数据")
             self._set_data_state("ready" if session.data_summary else "empty", session.data_summary)
         else:
             self._add_trace("input", "重新连接数据", "warning", "仍然连不上数据服务器")
             self._set_data_state("unavailable", session.data_summary)
+        self._persist_and_render(keep_timeline=True)
+
+    def select_region(self, region_id: str) -> None:
+        """Select and fetch the regional actual-price source for this conversation."""
+
+        if self.is_busy:
+            return
+        profile = self.region_profiles.get(region_id)
+        if profile is None:
+            QMessageBox.warning(self, "这个地区暂时不可用", "地区配置已经变化，请重新打开应用。")
+            return
+        session = self.current_session
+        changed_source = session.source_kind != "database" or session.region_id != profile.region_id
+        previous_summary = session.data_summary
+        failure_summary = None if changed_source else previous_summary
+        self._region_failure_summary = failure_summary
+        self._task_previous_status = session.status
+        if changed_source:
+            self._invalidate_plan_for_data_change(None)
+            session.inputs = default_input_files()
+            session.database_fetch_details = {}
+            session.analysis_start_time = None
+            session.analysis_end_time = None
+        session.source_kind = "database"
+        session.region_id = profile.region_id
+        session.region_label = profile.label
+        session.region_market = profile.market
+        session.region_timezone = profile.timezone
+        session.status = "inspecting_data"
+        actual_candidates = [item.name for item in profile.actual_series]
+        actual_candidates.extend(profile.weather_columns)
+        forecast_candidates = [item.name for item in profile.forecast_series]
+        forecast_candidates.extend(
+            f"forecast_{name}" if name in actual_candidates else name
+            for name in profile.weather_columns
+        )
+        table_names = {profile.target_name: profile.price_table}
+        table_names.update({item.name: item.table for item in profile.actual_series})
+        table_names.update({item.name: item.table for item in profile.forecast_series})
+        partial = build_partial_summary(
+            market=profile.market,
+            target_name=profile.target_name,
+            exogenous_names=[*actual_candidates, *forecast_candidates],
+            frequency=profile.frequency,
+            table_names=table_names,
+        )
+        self._set_data_state("exploring", partial)
+        self._add_trace("input", f"选择{profile.label}数据", "running", "正在取得实际电价")
+        self._start_worker(
+            kind="data_fetch",
+            operation=lambda progress: self.region_fetcher(
+                profile,
+                output_directory=self.region_data_directory / session.session_id,
+                progress=progress,
+            ),
+            success_handler=self._region_fetch_completed,
+            failure_handler=self._region_fetch_failed,
+        )
+
+    def _region_fetch_completed(self, result: RegionPriceFetch) -> None:
+        self._region_failure_summary = None
+        session = self.current_session
+        target = session.inputs["target"]
+        target.path = str(result.path)
+        target.status = "ready"
+        target.detail = f"{result.row_count:,} 个时间点"
+        target.variables = []
+        for role, path, names in (
+            ("actuals", result.actuals_path, result.actual_variable_names),
+            ("forecasts", result.forecasts_path, result.forecast_variable_names),
+        ):
+            item = session.inputs[role]
+            item.path = str(path) if path is not None else ""
+            item.status = "ready" if path is not None else "empty"
+            item.detail = f"{len(names)} 个变量" if names else "尚未选择"
+            item.variables = []
+        session.source_kind = "database"
+        session.database_fetch_details = result.safe_details()
+        fingerprint = self._current_dataset_fingerprint()
+        changed = self._invalidate_plan_for_data_change(fingerprint)
+        session.status = "idle" if changed else self._task_previous_status
+        self._set_data_state("ready", result.summary())
+        self._close_latest_running_trace("completed")
+        self._add_trace(
+            "input",
+            f"{result.profile.label}电价已就绪",
+            "completed",
+            f"{result.row_count:,} 个电价时间点，{len(result.actual_variable_names) + len(result.forecast_variable_names)} 个影响因素",
+        )
+        self._persist_and_render(keep_timeline=True)
+
+    def _region_fetch_failed(self, detail: str) -> None:
+        session = self.current_session
+        previous_summary = self._region_failure_summary
+        self._region_failure_summary = None
+        session.status = self._task_previous_status if self._task_previous_status != "inspecting_data" else "idle"
+        headline = detail.strip().splitlines()[-1] if detail.strip() else "取数失败"
+        self._close_latest_running_trace("failed")
+        self._set_data_state("unavailable", previous_summary)
+        self._append_message(
+            SessionMessage(
+                role="assistant",
+                kind="error",
+                content=f"{session.region_label}的数据现在取不到：{headline}",
+            )
+        )
+        self._add_trace("error", f"{session.region_label}取数未完成", "failed", headline)
         self._persist_and_render(keep_timeline=True)
 
     def show_data_details(self) -> None:
@@ -423,6 +576,7 @@ class ResearchWorkspace(QSplitter):
         session = self.current_session
         details: dict[str, Any] = {
             "source_kind": session.source_kind,
+            "region": session.region_label,
             "dataset_fingerprint": session.dataset_fingerprint or "(none)",
             "plan_data_fingerprint": (session.current_plan or {}).get("data_fingerprint") or "(none)",
         }
@@ -440,6 +594,8 @@ class ResearchWorkspace(QSplitter):
             details["series"] = sorted(session.quality_report.get("series", {}))
         if session.data_profile:
             details["data_profile"] = session.data_profile
+        if session.database_fetch_details:
+            details["database_fetch"] = session.database_fetch_details
         return details
 
     def _current_dataset_fingerprint(self) -> str | None:
@@ -531,6 +687,26 @@ class ResearchWorkspace(QSplitter):
         if self.is_busy:
             return
         session = self.current_session
+        try:
+            time_request = parse_chat_time_range(question)
+        except ValueError as exc:
+            session.derive_title(question)
+            self._append_message(SessionMessage(role="user", kind="text", content=question))
+            self._append_message(SessionMessage(role="assistant", kind="error", content=str(exc)))
+            self._add_trace("input", "时间范围没有更新", "warning", str(exc))
+            self._persist_and_render(keep_timeline=True)
+            return
+        if time_request is not None:
+            new_start = time_request.start_time.isoformat() if time_request.start_time else None
+            new_end = time_request.end_time.isoformat() if time_request.end_time else None
+            changed_window = (
+                session.analysis_start_time != new_start
+                or session.analysis_end_time != new_end
+            )
+            if changed_window:
+                self._invalidate_plan_for_input_change()
+                session.analysis_start_time = new_start
+                session.analysis_end_time = new_end
         self._cancel_plan_feedback_window()
         session.derive_title(question)
         user_message = SessionMessage(role="user", kind="text", content=question, turn_id=uuid4().hex)
@@ -539,6 +715,16 @@ class ResearchWorkspace(QSplitter):
         if len(question_label) > 52:
             question_label = f"{question_label[:51]}…"
         self._add_trace("user", f"提交研究问题：{question_label}", "completed", question)
+        if time_request is not None and changed_window:
+            if time_request.action == "clear":
+                self._add_trace("input", "恢复全部时间范围", "completed", "后续分析使用全部可用数据")
+            else:
+                self._add_trace(
+                    "input",
+                    "按聊天指定时间分析",
+                    "completed",
+                    f"{new_start} — {new_end}",
+                )
         study_config = None
         if session.can_analyze:
             try:
@@ -1271,7 +1457,14 @@ class ResearchWorkspace(QSplitter):
         self._add_trace("error", "数据文件校验失败", "failed", message)
         self._persist_and_render(keep_timeline=True)
 
-    def _start_worker(self, *, kind: str, operation: Any, success_handler: Any) -> None:
+    def _start_worker(
+        self,
+        *,
+        kind: str,
+        operation: Any,
+        success_handler: Any,
+        failure_handler: Any | None = None,
+    ) -> None:
         thread = QThread(self)
         worker = FunctionWorker(operation)
         worker.moveToThread(thread)
@@ -1279,7 +1472,7 @@ class ResearchWorkspace(QSplitter):
         worker.progress.connect(self._task_progress)
         worker.completed.connect(success_handler)
         worker.completed.connect(thread.quit)
-        worker.failed.connect(self._task_failed)
+        worker.failed.connect(failure_handler or self._task_failed)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(self._task_cancelled)
         worker.cancelled.connect(thread.quit)
@@ -1488,6 +1681,7 @@ class ResearchWorkspace(QSplitter):
         self.current_session.touch()
         self.store.save(self.sessions)
         self.history.set_sessions(self.sessions, self.current_session_id)
+        self._render_region_selector()
         if keep_timeline:
             self.conversation.title_label.setText(self.current_session.title)
             self.conversation.set_status(self.current_session.status)
@@ -1497,7 +1691,14 @@ class ResearchWorkspace(QSplitter):
 
     def _render_current(self) -> None:
         session = self.current_session
+        self._render_region_selector()
         self.conversation.set_session(session)
         self.context.set_session(session)
         self.history.set_sessions(self.sessions, self.current_session_id)
         self.status_changed.emit(STATUS_LABELS.get(session.status, session.status))
+
+    def _render_region_selector(self) -> None:
+        self.context.data_panel.set_regions(
+            [(profile.region_id, profile.label) for profile in self.region_profiles.values()],
+            self.current_session.region_id,
+        )

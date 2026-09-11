@@ -137,7 +137,7 @@ class SessionRunRecord(BaseModel):
     memory_status: Literal["active", "stale"] = "active"
 
 
-SESSION_SCHEMA_VERSION = 12
+SESSION_SCHEMA_VERSION = 14
 """Projection schema written by this build; bump it whenever stored sessions change shape."""
 
 
@@ -177,6 +177,13 @@ class ResearchSession(BaseModel):
     data_state: DataPanelState = "empty"
     data_summary: DataSummary | None = None
     dataset_fingerprint: str | None = None
+    region_id: str = "shandong"
+    region_label: str = "山东"
+    region_market: str = "山东电网"
+    region_timezone: str = "Asia/Shanghai"
+    database_fetch_details: dict[str, Any] = Field(default_factory=dict)
+    analysis_start_time: str | None = None
+    analysis_end_time: str | None = None
 
     @field_validator("inputs", mode="before")
     @classmethod
@@ -252,6 +259,14 @@ def _migrate_11_to_12(session: ResearchSession) -> None:
     """
 
 
+def _migrate_12_to_13(session: ResearchSession) -> None:
+    """Bind the selected regional data source to the conversation."""
+
+
+def _migrate_13_to_14(session: ResearchSession) -> None:
+    """Persist an optional chat-selected analysis time range."""
+
+
 SESSION_MIGRATIONS: dict[int, Callable[[ResearchSession], None]] = {
     **{version: _carry_forward for version in range(1, 7)},
     7: _migrate_7_to_8,
@@ -259,6 +274,8 @@ SESSION_MIGRATIONS: dict[int, Callable[[ResearchSession], None]] = {
     9: _migrate_9_to_10,
     10: _migrate_10_to_11,
     11: _migrate_11_to_12,
+    12: _migrate_12_to_13,
+    13: _migrate_13_to_14,
 }
 
 

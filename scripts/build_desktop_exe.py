@@ -129,7 +129,6 @@ def main(argv: list[str] | None = None) -> int:
         "sklearn",
         "sympy",
         "pypdf",
-        "pymysql",
         "pytest",
         "IPython",
         "notebook",
@@ -148,6 +147,10 @@ def main(argv: list[str] | None = None) -> int:
     if not word_list.is_file():
         raise SystemExit(f"No variable word list was found at {word_list}.")
     word_list_arg = f"--add-data={word_list};app/research/data/sources"
+    region_catalog = root / "configs" / "region_databases.yaml"
+    if not region_catalog.is_file():
+        raise SystemExit(f"No region database catalog was found at {region_catalog}.")
+    region_catalog_arg = f"--add-data={region_catalog};app/research/data/sources"
     original_path = os.environ.get("PATH", "")
     os.environ["PATH"] = sanitized_build_path(
         original_path,
@@ -176,8 +179,10 @@ def main(argv: list[str] | None = None) -> int:
                 # lazily, so a packaged build has to be told to carry it.
                 "--hidden-import=pyarrow",
                 "--hidden-import=pyarrow.parquet",
+                "--hidden-import=pymysql",
                 *skill_args,
                 word_list_arg,
+                region_catalog_arg,
                 *exclude_args,
             ]
         )

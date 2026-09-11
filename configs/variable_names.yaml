@@ -25,6 +25,7 @@ columns:
   total_load: 统调负荷
   fcst_load: 负荷预测
   load_forecast: 负荷预测
+  forecast_load: 负荷预测
   net_load: 净负荷
 
   # 新能源出力
@@ -32,10 +33,12 @@ columns:
   wind_output: 风电出力
   actual_wind: 风电出力
   fcst_wind: 风电出力预测
+  forecast_wind: 风电出力预测
   solar_power: 光伏出力
   pv_power: 光伏出力
   actual_solar: 光伏出力
   fcst_solar: 光伏出力预测
+  forecast_solar: 光伏出力预测
   new_energy: 新能源出力
   new_energy_output: 新能源出力
   renewable_output: 新能源出力
@@ -43,6 +46,9 @@ columns:
   # 电源与外送
   thermal_power: 火电出力
   hydro_power: 水电出力
+  actual_hydro: 水电出力
+  forecast_hydro: 水电出力预测
+  total_generation: 发电总出力
   nuclear_power: 核电出力
   non_market_output: 非市场化机组出力
   must_run_output: 非市场化机组出力
@@ -53,5 +59,19 @@ columns:
   # 系统运行
   sys_reserve: 备用容量
   spinning_reserve: 旋转备用
+  positive_reserve: 正备用容量
+  negative_reserve: 负备用容量
   temperature: 气温
   air_temperature: 气温
+  wind_speed_eighty: 80米风速
+  cloud_cover: 云量
+  solar_radiation: 太阳辐射
+  hour_precipitation: 小时降水
+  forecast_temperature: 气温预测
+  forecast_wind_speed_eighty: 80米风速预测
+  forecast_cloud_cover: 云量预测
+  forecast_solar_radiation: 太阳辐射预测
+  forecast_hour_precipitation: 小时降水预测
+
+t_data_sdc_province_recently_forecast_electricity:
+  forecast_generation: 发电出力预测

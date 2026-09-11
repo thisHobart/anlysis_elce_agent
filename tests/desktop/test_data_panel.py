@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import ast
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
+import pandas as pd
 import pytest
 from PySide6.QtWidgets import QApplication, QLabel
 
+from app.desktop.input_config import build_runtime_study
 from app.desktop.main_window import MainWindow
 from app.desktop.message_widgets import DataPlanMessageWidget, summary_fields
-from app.desktop.panes import DataPanel
-from app.desktop.session import ResearchSession, SessionStore
+from app.desktop.panes import DataPanel, FactorListDialog
+from app.desktop.session import SESSION_SCHEMA_VERSION, ResearchSession, SessionStore
 from app.research.application.coordinator import ResearchCoordinator
 from app.research.data.sources import naming
 from app.research.data.sources.materialize import snapshot_path
+from app.research.data.sources.regions import RegionPriceFetch, RegionProfile, RegionSourceError
 from app.research.data.sources.summary import DataSummary, VariableLabel, build_summary
 from tests.desktop.test_desktop import select_desktop_data, wait_until
 
@@ -90,6 +95,181 @@ def test_empty_panel_offers_nothing_to_click(qt_app: QApplication, tmp_path: Pat
         window.close()
 
 
+def test_ready_panel_compacts_and_exposes_all_factors(qt_app: QApplication):
+    panel = DataPanel()
+    summary = DataSummary(
+        price_label="山东电网 实时电价",
+        variables=[
+            VariableLabel("统调负荷"),
+            VariableLabel("发电总出力"),
+            VariableLabel("风电出力"),
+            VariableLabel("水电出力"),
+            VariableLabel("光伏出力"),
+            VariableLabel("负荷预测"),
+        ],
+        start_date="2025年11月1日",
+        end_date="2026年9月11日",
+        granularity_text="每 15 分钟一个点",
+    )
+    try:
+        panel.show()
+        panel.set_state("ready", summary)
+        qt_app.processEvents()
+
+        compact = panel.ready_card.rows["影响因素"].value_label.text()
+        assert "统调负荷、发电总出力、风电出力、水电出力" in compact
+        assert "共 6 项" in compact
+        assert "光伏出力" not in compact
+        assert panel.variables_button.isVisibleTo(panel)
+        assert panel.variables_button.text() == "查看全部 6 项影响因素"
+
+        dialog = FactorListDialog(summary.variables, panel)
+        assert [
+            dialog.tree.topLevelItem(index).text(0)
+            for index in range(dialog.tree.topLevelItemCount())
+        ] == ["实际值（5）", "预测值（1）"]
+        dialog.search.setText("负荷")
+        actual_group = dialog.tree.topLevelItem(0)
+        assert [
+            actual_group.child(index).text(0)
+            for index in range(actual_group.childCount())
+            if not actual_group.child(index).isHidden()
+        ] == ["统调负荷"]
+        assert not dialog.tree.topLevelItem(1).isHidden()
+        dialog.close()
+    finally:
+        panel.close()
+
+
+def test_region_button_fetches_shandong_for_only_the_current_session(
+    qt_app: QApplication,
+    tmp_path: Path,
+):
+    profile = RegionProfile(
+        region_id="shandong",
+        label="山东",
+        market="山东电网",
+        province_value="山东省",
+        timezone="Asia/Shanghai",
+        frequency="15min",
+        credential_prefix="VPP_SHANDONG_DB_FEATURE",
+        price_table="t_data_province_real_time_cleared_price",
+        price_label="实时省级出清电价",
+    )
+
+    def fetcher(selected, *, output_directory, progress):
+        assert selected is profile
+        progress(20, "正在取数")
+        path = Path(output_directory) / "shandong" / "actual-realtime-price.parquet"
+        path.parent.mkdir(parents=True)
+        pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-09-01", periods=8, freq="15min"),
+                "rt_price": range(8),
+                "available_at": pd.date_range("2026-09-01", periods=8, freq="15min"),
+            }
+        ).to_parquet(path, index=False)
+        actuals_path = path.with_name("actual-weather.parquet")
+        forecasts_path = path.with_name("forecast-weather.parquet")
+        pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-09-01", periods=8, freq="15min"),
+                "temperature": range(8),
+                "available_at": pd.date_range("2026-09-02", periods=8, freq="15min"),
+            }
+        ).to_parquet(actuals_path, index=False)
+        pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-09-01", periods=8, freq="15min"),
+                "temperature": range(8),
+                "available_at": pd.date_range("2026-08-31", periods=8, freq="15min"),
+            }
+        ).to_parquet(forecasts_path, index=False)
+        return RegionPriceFetch(
+            profile=profile,
+            path=path,
+            fetched_at=datetime.fromisoformat("2026-09-01T02:00:00+08:00"),
+            row_count=8,
+            start_at=datetime(2026, 9, 1, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            end_at=datetime(2026, 9, 1, 1, 45, tzinfo=ZoneInfo("Asia/Shanghai")),
+            duplicate_timestamp_rows=0,
+            invalid_rows=0,
+            database_name="prices",
+            actuals_path=actuals_path,
+            forecasts_path=forecasts_path,
+            actual_variable_names=("temperature",),
+            forecast_variable_names=("forecast_temperature",),
+        )
+
+    window = MainWindow(
+        session_store=SessionStore(tmp_path / "sessions.json"),
+        region_profiles={"shandong": profile},
+        region_fetcher=fetcher,
+    )
+    try:
+        workspace = window.workspace
+        original_session_id = workspace.current_session.session_id
+        panel = workspace.context.data_panel
+        assert panel.region_button.text() == "地区：山东 ▾"
+        panel.region_menu.actions()[0].trigger()
+        wait_until(qt_app, lambda: not workspace.is_busy)
+
+        session = workspace.current_session
+        assert session.session_id == original_session_id
+        assert session.region_id == "shandong"
+        assert session.source_kind == "database"
+        assert session.data_state == "ready"
+        assert session.can_analyze
+        assert session.data_summary is not None
+        assert session.data_summary.price_label == "山东电网 实时电价"
+        assert [item.display for item in session.data_summary.variables] == ["气温", "气温预测"]
+        assert session.database_fetch_details["rows"] == 8
+        assert panel.ready_card.rows["电价"].value_label.text() == "山东电网 实时电价"
+        assert panel.ready_card.rows["影响因素"].value_label.text() == "气温、气温预测"
+        config = build_runtime_study(session)
+        assert [item.name for item in config.exogenous] == ["temperature", "forecast_temperature"]
+        assert all(item.available_at_column == "available_at" for item in config.exogenous)
+    finally:
+        window.close()
+
+
+def test_region_fetch_failure_only_marks_data_unavailable(qt_app: QApplication, tmp_path: Path):
+    profile = RegionProfile(
+        region_id="shandong",
+        label="山东",
+        market="山东电网",
+        province_value="山东省",
+        timezone="Asia/Shanghai",
+        frequency="15min",
+        credential_prefix="VPP_SHANDONG_DB_FEATURE",
+        price_table="t_data_province_real_time_cleared_price",
+        price_label="实时省级出清电价",
+    )
+
+    def unavailable(*_args, **_kwargs):
+        raise RegionSourceError("测试连接不可用")
+
+    window = MainWindow(
+        session_store=SessionStore(tmp_path / "sessions.json"),
+        region_profiles={"shandong": profile},
+        region_fetcher=unavailable,
+    )
+    try:
+        panel = window.workspace.context.data_panel
+        panel.region_menu.actions()[0].trigger()
+        wait_until(qt_app, lambda: not window.workspace.is_busy)
+
+        session = window.workspace.current_session
+        assert session.data_state == "unavailable"
+        assert session.status == "idle"
+        assert not session.can_analyze
+        assert panel.unavailable_view.isVisibleTo(panel)
+        assert session.messages[-1].kind == "error"
+        assert "测试连接不可用" in session.messages[-1].content
+    finally:
+        window.close()
+
+
 def test_unavailable_panel_says_the_same_thing_whatever_broke(qt_app: QApplication, tmp_path: Path):
     window = MainWindow(session_store=SessionStore(tmp_path / "sessions.json"))
     try:
@@ -137,7 +317,7 @@ def test_exploring_panel_lights_up_what_is_settled_and_says_nothing_is_taken_yet
         assert "正在找数据" in panel.status_label.text()
         rows = panel.exploring_card.rows
         assert rows["电价"].mark.text() == "✓"
-        assert rows["影响因素"].value_label.text() == "已找到风电出力、光伏出力"
+        assert rows["影响因素"].value_label.text() == "正在核对：风电出力、光伏出力"
         # Nothing is claimed about a field the exploration has not reached.
         assert rows["时间范围"].value_label.text() == "待定"
         assert rows["时间范围"].mark.text() == "○"
@@ -176,7 +356,7 @@ def test_asking_a_question_lights_up_what_is_already_known(
         # The price is named the same way before and after the data is read.
         assert exploring["电价"] == (panel.ready_card.rows["电价"].value_label.text(), "✓", "")
         assert exploring["电价"][0] == "实时电价"
-        assert exploring["影响因素"][0].startswith("已找到")
+        assert exploring["影响因素"][0].startswith("正在核对：")
         assert "统调负荷" in exploring["影响因素"][0]
         assert exploring["时间范围"][:2] == ("待定", "○")
         assert exploring["时间范围"][2] == "每小时一个点"
@@ -292,6 +472,30 @@ def test_confirmation_card_and_panel_word_the_dataset_identically(
         for key, value, sub in summary_fields(session.data_summary):
             assert panel.ready_card.rows[key].value_label.text() == value
             assert panel.ready_card.rows[key].sub_label.text() == sub
+    finally:
+        window.close()
+
+
+def test_chat_selected_time_range_reaches_the_plan_and_data_panel(
+    qt_app: QApplication,
+    desktop_study: Path,
+    model_agent: ResearchCoordinator,
+    tmp_path: Path,
+):
+    window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
+    select_desktop_data(window, desktop_study)
+    try:
+        workspace = window.workspace
+        workspace.submit_question("仅分析 2026-01-02 到 2026-01-05 的电价与负荷关系")
+        wait_until(qt_app, lambda: not workspace.is_busy)
+
+        session = workspace.current_session
+        assert session.analysis_start_time == "2026-01-02T00:00:00"
+        assert session.analysis_end_time == "2026-01-05T23:59:59.999999"
+        assert session.data_profile["start_time"].startswith("2026-01-02T00:00:00")
+        assert session.data_profile["end_time"].startswith("2026-01-05T23:00:00")
+        panel_text = workspace.context.data_panel.ready_card.rows["时间范围"].value_label.text()
+        assert panel_text == "2026年1月2日 — 2026年1月5日"
     finally:
         window.close()
 
@@ -529,7 +733,7 @@ def test_a_session_saved_before_the_panel_still_opens(qt_app: QApplication, tmp_
     try:
         restored = next(item for item in window.workspace.sessions if item.session_id == "old")
         assert isinstance(restored, ResearchSession)
-        assert restored.schema_version == 12
+        assert restored.schema_version == SESSION_SCHEMA_VERSION
         assert restored.data_state == "empty"
         assert restored.data_summary is None
         assert restored.source_kind == "database"

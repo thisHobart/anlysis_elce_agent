@@ -10,6 +10,8 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -474,7 +476,13 @@ class DataCard(QFrame):
             self.rows[key] = row
             layout.addWidget(row)
 
-    def apply(self, summary: DataSummary | None, *, exploring: bool = False) -> None:
+    def apply(
+        self,
+        summary: DataSummary | None,
+        *,
+        exploring: bool = False,
+        max_variables: int | None = None,
+    ) -> None:
         """Fill the card from the one description the UI is allowed to read."""
 
         summary = summary or DataSummary()
@@ -484,16 +492,24 @@ class DataCard(QFrame):
             state="settled" if summary.price_label else unsettled,
         )
         variables = summary.variables
-        if variables and exploring:
-            markup = "已找到" + "、".join(escape(item.display) for item in variables)
+        shown_variables = variables[:max_variables] if max_variables else variables
+        if shown_variables and exploring:
+            markup = "正在核对：" + "、".join(escape(item.display) for item in shown_variables)
             state = "pending"
         else:
-            markup = variables_markup(variables)
+            markup = variables_markup(shown_variables)
             state = "settled" if variables else unsettled
+        if max_variables and len(variables) > max_variables:
+            markup = f"{markup}…（共 {len(variables)} 项）"
+        tooltip_parts = []
+        if len(shown_variables) < len(variables):
+            tooltip_parts.append("、".join(item.display for item in variables))
+        if any(not item.resolved for item in variables):
+            tooltip_parts.append("这项数据还没配中文名")
         self.rows["影响因素"].set_value(
             markup,
             state=state,
-            tooltip="这项数据还没配中文名" if any(not item.resolved for item in variables) else "",
+            tooltip="\n".join(tooltip_parts),
         )
         window = f"{summary.start_date} — {summary.end_date}" if summary.start_date else ""
         sub = summary.granularity_text
@@ -504,6 +520,68 @@ class DataCard(QFrame):
             sub=sub,
             state="settled" if window else unsettled,
         )
+
+
+class FactorListDialog(QDialog):
+    """Resizable, searchable view of every factor in the current dataset."""
+
+    def __init__(self, variables: list[VariableLabel], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("全部影响因素")
+        self.setMinimumSize(440, 360)
+        self.resize(560, 520)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+
+        self.summary_label = QLabel(f"共 {len(variables)} 项；可搜索，或展开分组查看。")
+        self.summary_label.setObjectName("dataSub")
+        layout.addWidget(self.summary_label)
+        self.search = QLineEdit(self)
+        self.search.setPlaceholderText("搜索影响因素")
+        self.search.setClearButtonEnabled(True)
+        layout.addWidget(self.search)
+        self.tree = QTreeWidget(self)
+        self.tree.setObjectName("factorTree")
+        self.tree.setHeaderHidden(True)
+        self.tree.setRootIsDecorated(True)
+        self.tree.setAlternatingRowColors(True)
+        layout.addWidget(self.tree, 1)
+
+        self._groups: list[QTreeWidgetItem] = []
+        grouped = (
+            ("实际值", [item for item in variables if "预测" not in item.display]),
+            ("预测值", [item for item in variables if "预测" in item.display]),
+        )
+        for title, items in grouped:
+            if not items:
+                continue
+            group = QTreeWidgetItem([f"{title}（{len(items)}）"])
+            group.setFlags(group.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            self.tree.addTopLevelItem(group)
+            self._groups.append(group)
+            for variable in items:
+                child = QTreeWidgetItem([variable.display])
+                if not variable.resolved:
+                    child.setToolTip(0, "这项数据还没配中文名")
+                group.addChild(child)
+            group.setExpanded(True)
+        self.search.textChanged.connect(self._filter)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _filter(self, text: str) -> None:
+        wanted = text.strip().casefold()
+        for group in self._groups:
+            visible_children = 0
+            for index in range(group.childCount()):
+                child = group.child(index)
+                visible = not wanted or wanted in child.text(0).casefold()
+                child.setHidden(not visible)
+                visible_children += int(visible)
+            group.setHidden(visible_children == 0)
 
 
 class DataPanel(QFrame):
@@ -519,8 +597,9 @@ class DataPanel(QFrame):
     details_requested = Signal()
     retry_requested = Signal()
     local_file_requested = Signal()
+    region_selected = Signal(str)
 
-    EMPTY_TEXT = "还没开始。说说你想研究什么，我来找数据。"
+    EMPTY_TEXT = "还没取数。请从上方选择地区；也可以直接提问讨论研究方法。"
     EXPLORING_TEXT = "正在看有哪些数据能用…"
     EXPLORING_NOTE = "现在只是在看有什么数据，还没开始取。找完会先给你确认。"
     UNAVAILABLE_TITLE = "现在取不到数据"
@@ -546,6 +625,12 @@ class DataPanel(QFrame):
         self.title_label.setObjectName("contextTitle")
         header.addWidget(self.title_label)
         header.addStretch(1)
+        self.region_button = QPushButton("地区：待选择")
+        self.region_button.setObjectName("quietButton")
+        self.region_button.setToolTip("选择本次会话使用的地区并取数")
+        self.region_menu = QMenu(self.region_button)
+        self.region_button.setMenu(self.region_menu)
+        header.addWidget(self.region_button)
         self.status_label = QLabel("")
         self.status_label.setObjectName("dataStatus")
         header.addWidget(self.status_label)
@@ -604,6 +689,12 @@ class DataPanel(QFrame):
         layout.setSpacing(6)
         self.ready_card = DataCard()
         layout.addWidget(self.ready_card)
+        self.variables_button = QPushButton("查看全部影响因素", view)
+        self.variables_button.setObjectName("dataQuietLink")
+        self.variables_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.variables_button.clicked.connect(self._show_variables_dialog)
+        self.variables_button.setVisible(False)
+        layout.addWidget(self.variables_button, 0, Qt.AlignmentFlag.AlignLeft)
         bottom = QHBoxLayout()
         bottom.setSpacing(6)
         self.fetched_label = QLabel("")
@@ -693,13 +784,14 @@ class DataPanel(QFrame):
         self.ready_view.setVisible(state == "ready")
         self.unavailable_view.setVisible(state == "unavailable")
         if state == "exploring":
-            self.exploring_card.apply(summary, exploring=True)
+            self.exploring_card.apply(summary, exploring=True, max_variables=4)
             self._spinner_index = 0
             self._spinner.start()
         else:
             self._spinner.stop()
         if state == "ready":
-            self.ready_card.apply(summary)
+            self.ready_card.apply(summary, max_variables=4)
+            self._apply_variables_menu(summary)
             self.fetched_label.setText(f"数据取自{summary.fetched_at_text}" if summary else "")
         if state == "unavailable":
             # A first-ever failure has no earlier dataset to fall back on.
@@ -717,15 +809,50 @@ class DataPanel(QFrame):
     def set_session(self, session: ResearchSession) -> None:
         self.set_state(session.data_state, session.data_summary)
 
+    def set_regions(self, regions: list[tuple[str, str]], selected_region_id: str) -> None:
+        """Populate the one session-scoped region control from the safe catalog."""
+
+        self.region_menu.clear()
+        selected_label = "待选择"
+        for region_id, label in regions:
+            action = self.region_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(region_id == selected_region_id)
+            action.triggered.connect(
+                lambda _checked=False, value=region_id: self.region_selected.emit(value)
+            )
+            if region_id == selected_region_id:
+                selected_label = label
+        self.region_button.setText(f"地区：{selected_label} ▾")
+        self.region_button.setEnabled(bool(regions) and not self._busy)
+
+    def open_region_menu(self) -> None:
+        if self.region_button.isEnabled():
+            self.region_button.showMenu()
+
     def _apply_busy(self) -> None:
         for button in (
+            self.region_button,
             self.refetch_button,
             self.reselect_button,
             self.details_button,
+            self.variables_button,
             self.retry_button,
             self.local_file_button,
         ):
             button.setEnabled(not self._busy)
+
+    def _apply_variables_menu(self, summary: DataSummary | None) -> None:
+        """Expose long factor lists without making the context panel excessively tall."""
+
+        variables = summary.variables if summary else []
+        self.variables_button.setVisible(len(variables) > 4)
+        if len(variables) <= 4:
+            return
+        self.variables_button.setText(f"查看全部 {len(variables)} 项影响因素")
+
+    def _show_variables_dialog(self) -> None:
+        FactorListDialog(self._summary.variables if self._summary else [], self).exec()
 
     def _advance_spinner(self) -> None:
         self._spinner_index = (self._spinner_index + 1) % len(self.SPINNER_FRAMES)
@@ -859,6 +986,7 @@ class ContextPane(QSplitter):
     details_requested = Signal()
     retry_requested = Signal()
     local_file_requested = Signal()
+    region_selected = Signal(str)
     trace_maximized = Signal(bool)
 
     PANEL_SIZES: ClassVar[list[int]] = [262, 538]
@@ -873,6 +1001,7 @@ class ContextPane(QSplitter):
         self.data_panel.details_requested.connect(self.details_requested)
         self.data_panel.retry_requested.connect(self.retry_requested)
         self.data_panel.local_file_requested.connect(self.local_file_requested)
+        self.data_panel.region_selected.connect(self.region_selected)
         self.trace.maximize_requested.connect(self._set_trace_maximized)
         self.addWidget(self.data_panel)
         self.addWidget(self.trace)
