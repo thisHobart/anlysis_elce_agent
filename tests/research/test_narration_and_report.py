@@ -57,6 +57,20 @@ def test_narration_keeps_identifiers_out_of_routing_and_evaluation_lines():
     assert "共 6 项" in locking.detail
 
 
+def test_narration_distinguishes_consecutive_question_processing_stages():
+    submitted = narrate_event({"name": "提交研究问题：分析电价", "status": "completed"})
+    received = narrate_event({"name": "接收研究问题：分析电价", "status": "completed"})
+    routed = narrate_event(
+        {"name": "主 Agent 路由：new_plan", "status": "completed", "details": {"intent": "new_plan"}}
+    )
+
+    assert [submitted.stage_label, received.stage_label, routed.stage_label] == [
+        "提交问题",
+        "解析问题",
+        "识别意图",
+    ]
+
+
 def test_failed_events_are_reported_as_problems():
     step = narrate_event(
         {

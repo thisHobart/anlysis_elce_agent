@@ -24,7 +24,10 @@ from app.research.tools.catalog import FUNCTION_CATALOG, STAGE_TITLES
 
 STAGE_LABELS: dict[str, str] = {
     "setup": "准备",
+    "submit": "提交问题",
     "read": "解析问题",
+    "route": "识别意图",
+    "goal": "明确目标",
     "design": "生成方案",
     "confirm": "等待确认",
     "compute": "执行分析",
@@ -164,14 +167,16 @@ def narrate_event(event: dict[str, Any]) -> ThinkingStep:
     if status == "failed" or head.endswith(("失败", "损坏", "耗尽")) or head.startswith("拒绝"):
         return _failure(head, tail, details)
 
-    if head in {"接收研究问题", "提交研究问题"}:
+    if head == "提交研究问题":
+        return ThinkingStep("submit", "提交研究问题", tail, status)
+    if head == "接收研究问题":
         return ThinkingStep("read", "解析研究问题", tail, status)
     if head == "主 Agent 路由":
         intent = str(details.get("intent", tail))
-        return ThinkingStep("read", "识别处理方式", INTENT_LABELS.get(intent, intent), status)
+        return ThinkingStep("route", "识别处理方式", INTENT_LABELS.get(intent, intent), status)
     if head == "开始研究 Episode":
         _identifier, _separator, goal = tail.partition(" · ")
-        return ThinkingStep("read", "启动研究目标", goal or tail, status)
+        return ThinkingStep("goal", "启动研究目标", goal or tail, status)
 
     if head.startswith("激活 Skill"):
         skill = str(details.get("skill", ""))
@@ -239,8 +244,8 @@ def narrate_event(event: dict[str, Any]) -> ThinkingStep:
 
 NODE_PROGRESS: dict[str, tuple[int, str, str, str]] = {
     "ingest_user": (3, "read", "解析研究问题", ""),
-    "main_agent": (8, "read", "识别处理方式", "在讨论、生成方案、修订方案与执行之间路由"),
-    "begin_episode": (10, "read", "启动研究目标", ""),
+    "main_agent": (8, "route", "识别处理方式", "在讨论、生成方案、修订方案与执行之间路由"),
+    "begin_episode": (10, "goal", "启动研究目标", ""),
     "resolve_skill": (14, "design", "加载研究方法", "从已注册的研究方法包中选择"),
     "eda_subagent": (24, "design", "生成分析方案", "选取回答该问题所需的最小分析集合"),
     "revise_user_plan": (26, "design", "修订分析方案", ""),
@@ -291,7 +296,10 @@ def narrate_node(node_name: str) -> tuple[int, ThinkingStep]:
 
 TRACE_CATEGORIES: dict[str, str] = {
     "setup": "session",
+    "submit": "user",
     "read": "agent",
+    "route": "agent",
+    "goal": "plan",
     "design": "plan",
     "confirm": "plan",
     "compute": "tool",

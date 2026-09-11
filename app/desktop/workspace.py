@@ -1301,7 +1301,10 @@ class ResearchWorkspace(QSplitter):
         del value
         session.status = {
             "setup": "inspecting_data",
+            "submit": "understanding",
             "read": "understanding",
+            "route": "understanding",
+            "goal": "understanding",
             "design": "understanding",
             "confirm": "understanding",
             "compute": "running",

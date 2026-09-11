@@ -22,7 +22,7 @@ from app.config import Settings
 from app.desktop.input_config import build_runtime_study
 from app.desktop.main_window import MainWindow
 from app.desktop.message_widgets import ResultMessageWidget, ThinkingMessageWidget
-from app.desktop.panes import ConversationPane
+from app.desktop.panes import ConversationPane, TracePanel
 from app.desktop.report_view import ReportBrowser, ReportWindow
 from app.desktop.session import (
     SESSION_SCHEMA_VERSION,
@@ -31,6 +31,7 @@ from app.desktop.session import (
     SessionMessage,
     SessionRunRecord,
     SessionStore,
+    TraceEvent,
 )
 from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
 from app.research.agent.subagents.eda import EDASubagent
@@ -451,6 +452,39 @@ def test_trace_keeps_every_loaded_data_file_visible(
         assert loaded == ["改用本地文件 — market_prices.csv、measurements.csv、predictions.csv"]
     finally:
         window.close()
+
+
+def test_trace_distinguishes_consecutive_question_processing_stages(qt_app: QApplication):
+    panel = TracePanel()
+    try:
+        panel.set_events(
+            [
+                TraceEvent(category="session", name="新建研究会话", status="completed"),
+                TraceEvent(category="user", name="提交研究问题：问题一", status="completed"),
+                TraceEvent(category="agent", name="接收研究问题：问题一", status="completed"),
+                TraceEvent(category="agent", name="主 Agent 路由", status="completed"),
+                TraceEvent(category="plan", name="生成候选方案：plan-1 · 分析目标", status="completed"),
+                TraceEvent(category="plan", name="方案校验通过", status="completed"),
+                TraceEvent(category="agent", name="回答用户：回复内容", status="completed"),
+            ]
+        )
+
+        stages = [
+            panel.tree.topLevelItem(index).text(1)
+            for index in range(panel.tree.topLevelItemCount())
+        ]
+
+        assert stages == [
+            "准备",
+            "提交问题",
+            "解析问题",
+            "识别意图",
+            "生成方案",
+            "生成方案",
+            "生成结论",
+        ]
+    finally:
+        panel.close()
 
 
 def test_conversation_follows_the_bottom_while_a_sent_question_progresses(
