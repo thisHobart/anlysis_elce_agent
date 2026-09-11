@@ -34,7 +34,6 @@ from PySide6.QtWidgets import (
 from app.desktop.message_widgets import (
     DataPlanMessageWidget,
     NoticeMessageWidget,
-    PlanMessageWidget,
     ResultMessageWidget,
     TextMessageWidget,
     ThinkingMessageWidget,
@@ -212,7 +211,7 @@ class ConversationPane(QFrame):
         self._running = False
         self._interaction_kind: str | None = None
         self._message_widgets: dict[str, QWidget] = {}
-        self.current_plan_widget: PlanMessageWidget | None = None
+        self.current_plan_widget: DataPlanMessageWidget | None = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -327,13 +326,11 @@ class ConversationPane(QFrame):
             )
         elif message.kind in {"plan", "data_plan"} and message.payload.get("plan"):
             plan = EDAPlan.model_validate(message.payload["plan"])
-            if message.kind == "data_plan":
-                widget = DataPlanMessageWidget(plan, summary=message.payload.get("data_summary"))
-                widget.details_requested.connect(self.data_details_requested)
-                widget.revise_requested.connect(self.plan_revise_requested)
-            else:
-                # Conversations saved before data and analysis were confirmed together.
-                widget = PlanMessageWidget(plan)
+            # A conversation saved before data and analysis were confirmed together
+            # has no stored dataset description, so those rows read 「待定」.
+            widget = DataPlanMessageWidget(plan, summary=message.payload.get("data_summary"))
+            widget.details_requested.connect(self.data_details_requested)
+            widget.revise_requested.connect(self.plan_revise_requested)
             widget.run_requested.connect(self.plan_run_requested)
             widget.reject_requested.connect(self.plan_reject_requested)
             plan_state = message.payload.get("state", "awaiting")
@@ -822,8 +819,8 @@ class TracePanel(QFrame):
             headline = step.title if not detail else f"{step.title} — {detail}"
             # Execution completion and result validation intentionally narrate
             # to the same completed-function title. Collapse only that lifecycle
-            # pair. Other repeated titles (for example three independently
-            # loaded input files) are separate audit events and must stay visible.
+            # pair. Other repeated titles are separate audit events and must stay
+            # visible, however similar they read.
             duplicate_function_completion = bool(
                 step.function_name
                 and step.function_name == previous_function

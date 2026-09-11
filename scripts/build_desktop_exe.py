@@ -114,6 +114,9 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit('PyInstaller is not installed. Run: python -m pip install -e ".[build]"') from exc
 
     root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(root))
+    from app.research.data.sources.naming import WORD_LIST_FILENAME
+
     entry = root / "app" / "desktop" / "__main__.py"
     mode = "--onefile" if args.onefile else "--onedir"
     desktop_excludes = (
@@ -169,6 +172,10 @@ def main(argv: list[str] | None = None) -> int:
                 "--hidden-import=statsmodels.tsa.seasonal",
                 "--hidden-import=statsmodels.tsa.stattools",
                 "--hidden-import=statsmodels.stats.diagnostic",
+                # Freezing a dataset writes Parquet, and pandas reaches pyarrow
+                # lazily, so a packaged build has to be told to carry it.
+                "--hidden-import=pyarrow",
+                "--hidden-import=pyarrow.parquet",
                 *skill_args,
                 word_list_arg,
                 *exclude_args,

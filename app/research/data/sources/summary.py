@@ -7,7 +7,7 @@ surfaces cannot drift apart and the same dataset always reads the same way.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from typing import Any
 
@@ -98,6 +98,31 @@ def format_gap(missing_points: int) -> str | None:
     return f"缺 {missing_points:,} 个点" if missing_points > 0 else None
 
 
+def build_partial_summary(
+    *,
+    market: str,
+    target_name: str,
+    exogenous_names: list[str],
+    frequency: str = "",
+    table_names: dict[str, str] | None = None,
+) -> DataSummary:
+    """Name what is already known before the data itself has been read.
+
+    Everything still being established is left empty rather than guessed, which is
+    how the panel knows to show 「待定」 for it.
+    """
+
+    lookup = table_names or {}
+    price_label = label_variable(target_name, table=lookup.get(target_name)).display
+    if market and market not in {"unspecified", "unknown"}:
+        price_label = f"{market} {price_label}"
+    return DataSummary(
+        price_label=price_label,
+        variables=[label_variable(name, table=lookup.get(name)) for name in exogenous_names],
+        granularity_text=format_granularity(frequency) if frequency else "",
+    )
+
+
 def build_summary(
     *,
     market: str,
@@ -116,20 +141,63 @@ def build_summary(
     name lookup; the table name itself never reaches the returned strings.
     """
 
-    lookup = table_names or {}
-    price_label = label_variable(target_name, table=lookup.get(target_name)).display
-    if market and market not in {"unspecified", "unknown"}:
-        price_label = f"{market} {price_label}"
-    return DataSummary(
-        price_label=price_label,
-        variables=[
-            label_variable(name, table=lookup.get(name)) for name in exogenous_names
-        ],
+    known = build_partial_summary(
+        market=market,
+        target_name=target_name,
+        exogenous_names=exogenous_names,
+        frequency=frequency,
+        table_names=table_names,
+    )
+    return replace(
+        known,
         start_date=format_date(start_time),
         end_date=format_date(end_time),
-        granularity_text=format_granularity(frequency),
         gap_text=format_gap(missing_points),
         fetched_at_text=format_moment(fetched_at or datetime.now(UTC).astimezone()),
+    )
+
+
+def summary_payload(summary: DataSummary | None) -> dict[str, Any] | None:
+    """Render a summary as the plain dict a snapshot, a graph state, or a session stores."""
+
+    if summary is None:
+        return None
+    return {
+        "price_label": summary.price_label,
+        "variables": [{"display": item.display, "resolved": item.resolved} for item in summary.variables],
+        "start_date": summary.start_date,
+        "end_date": summary.end_date,
+        "granularity_text": summary.granularity_text,
+        "gap_text": summary.gap_text,
+        "fetched_at_text": summary.fetched_at_text,
+    }
+
+
+def parse_summary(value: Any) -> DataSummary:
+    """Rebuild a summary from the dict a snapshot or a saved conversation stored.
+
+    Anything unreadable becomes an empty summary rather than an error: the panel
+    can show 「待定」, but it cannot show a traceback.
+    """
+
+    if isinstance(value, DataSummary):
+        return value
+    if not isinstance(value, dict):
+        return DataSummary()
+    raw_variables = value.get("variables")
+    variables = [
+        VariableLabel(display=str(item.get("display", "")), resolved=bool(item.get("resolved", True)))
+        for item in (raw_variables if isinstance(raw_variables, list) else [])
+        if isinstance(item, dict)
+    ]
+    return DataSummary(
+        price_label=str(value.get("price_label", "")),
+        variables=variables,
+        start_date=str(value.get("start_date", "")),
+        end_date=str(value.get("end_date", "")),
+        granularity_text=str(value.get("granularity_text", "")),
+        gap_text=value.get("gap_text") or None,
+        fetched_at_text=str(value.get("fetched_at_text", "")),
     )
 
 

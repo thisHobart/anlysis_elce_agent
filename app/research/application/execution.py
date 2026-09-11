@@ -20,7 +20,12 @@ from app.research.agent.errors import (
     SkillVersionMismatchError,
 )
 from app.research.agent.schemas import AgentRunResult, ConversationMessage, EDAPlan
-from app.research.application.planning import noop_progress, prepare_research_data, resolve_config
+from app.research.application.planning import (
+    noop_progress,
+    prepare_research_data,
+    resolve_config,
+    restore_prepared_data,
+)
 from app.research.data.snapshot import input_file_manifest, study_fingerprint
 from app.research.evaluation.eda import evaluate_agent_run
 from app.research.reporting.artifacts import write_agent_research_package
@@ -150,14 +155,22 @@ class EDAExecutionService:
                 installed_tool.arguments_model.model_validate(arguments)
             except (TypeError, ValueError) as exc:
                 raise RepairablePlanError(f"函数 {step.function} 参数无效：{exc}") from exc
-        prepared = prepare_research_data(config)
-        inputs = input_file_manifest(config)
-        study_hash = study_fingerprint(config, inputs)
-        if plan.data_fingerprint is not None and plan.data_fingerprint != study_hash:
-            raise DataFingerprintMismatchError(
-                "研究数据或自动识别的数据上下文在方案生成后发生变化；"
-                "为避免在新数据上执行旧方案，请重新生成分析方案"
-            )
+        frozen = restore_prepared_data(plan.data_fingerprint, config)
+        if frozen is not None:
+            # The approved dataset was written down when the plan was proposed, so a
+            # source that moved since then changes nothing about this run.
+            prepared, snapshot = frozen
+            inputs = snapshot.input_manifest
+            study_hash = plan.data_fingerprint
+        else:
+            prepared = prepare_research_data(config)
+            inputs = input_file_manifest(config)
+            study_hash = study_fingerprint(config, inputs)
+            if plan.data_fingerprint != study_hash:
+                raise DataFingerprintMismatchError(
+                    "研究数据或自动识别的数据上下文在方案生成后发生变化；"
+                    "为避免在新数据上执行旧方案，请重新生成分析方案"
+                )
         if not prepared.quality.usable_for_eda:
             raise InsufficientDataError("target data does not meet the minimum observation requirement for EDA")
         available_variables = {spec.name for spec in config.exogenous}

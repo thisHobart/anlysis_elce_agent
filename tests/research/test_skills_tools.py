@@ -36,6 +36,47 @@ def test_builtin_eda_skill_is_discoverable_and_versioned():
     assert set(skill.research_protocol.function_order) == set(FUNCTION_CATALOG)
 
 
+# The confirmation card is read by a power-market analyst, so a step is written
+# as the thing it does. These are the words that would give the method away.
+METHOD_WORDS = (
+    "Granger",
+    "VIF",
+    "IQR",
+    "Pearson",
+    "Spearman",
+    "Tukey",
+    "互信息",
+    "自相关",
+    "平稳性",
+    "季节分解",
+    "分位",
+    "共线",
+    "方差",
+    "变换",
+    "基线",
+    "检验",
+    "扫描",
+    "画像",
+)
+
+
+@pytest.mark.parametrize("skill_name", ["price-exogenous-eda", "price-forecastability-audit"])
+def test_every_protocol_step_is_written_for_the_analyst(skill_name: str):
+    skill = SkillRegistry.default(Settings(skill_paths="")).get(skill_name)
+    protocol = skill.research_protocol
+    assert protocol is not None
+
+    texts = protocol.display_text_by_function
+    assert sorted(texts) == sorted(protocol.function_order)
+    offences = [
+        (function, word)
+        for function, line in texts.items()
+        for word in (*METHOD_WORDS, function)
+        if word in line
+    ]
+    assert offences == []
+
+
 def test_builtin_domain_protocol_orders_model_calls_locally(synthetic_study: Path):
     skill = SkillRegistry.default(Settings(skill_paths="")).get("price-exogenous-eda")
     config = load_study_config(synthetic_study)
@@ -85,6 +126,15 @@ def test_builtin_domain_protocol_orders_model_calls_locally(synthetic_study: Pat
     assert plan.research_protocol_id == "electricity-price-evidence-ladder"
     assert plan.research_protocol_version == "2.2.1"
     assert plan.research_protocol_function_order == list(skill.research_protocol.function_order)
+    # The plan carries the analyst-facing wording, so the confirmation card never
+    # has to name a statistical method.
+    quality_step = next(step for step in plan.steps if step.function == "data_quality")
+    assert plan.step_text(quality_step) == "先看这批数据完不完整、时间点对不对得上"
+    assert plan.step_text(quality_step) != quality_step.title
+    assert all(
+        plan.step_text(step) == plan.research_protocol_step_texts[step.function]
+        for step in plan.enabled_steps
+    )
     assert any("请求参数禁用 thinking" in note for note in plan.planning_notes)
 
     class RevisionDialogue:

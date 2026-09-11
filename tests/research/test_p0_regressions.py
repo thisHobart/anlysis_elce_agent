@@ -208,6 +208,7 @@ def test_execution_reuses_one_prepared_snapshot_for_queue_and_finalize(
     config = load_study_config(synthetic_study)
     service = EDAExecutionService(prepared_cache_size=2)
     real_prepare = execution_module.prepare_research_data
+    real_restore = execution_module.restore_prepared_data
     calls = 0
 
     def counted_prepare(study_config):
@@ -215,7 +216,16 @@ def test_execution_reuses_one_prepared_snapshot_for_queue_and_finalize(
         calls += 1
         return real_prepare(study_config)
 
+    def counted_restore(fingerprint, study_config):
+        nonlocal calls
+        restored = real_restore(fingerprint, study_config)
+        if restored is not None:
+            calls += 1
+        return restored
+
+    # Either route reads the data; the point is that it happens once for the whole run.
     monkeypatch.setattr(execution_module, "prepare_research_data", counted_prepare)
+    monkeypatch.setattr(execution_module, "restore_prepared_data", counted_restore)
     service.prepare(plan=proposal.plan, study_config=config)
     results = [
         service.execute_call(plan=proposal.plan, study_config=config, call=call)

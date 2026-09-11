@@ -10,6 +10,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.research.agent.prompts import PLANNING_PROMPT_VERSION
+from app.research.data.sources.summary import DataSummary
 from app.research.planning.variables import VariableSelectionMode, VariableSelectionStage
 from app.research.schemas.feedback import FeedbackPacket
 from app.research.schemas.results import DataQualityReport
@@ -96,6 +97,7 @@ class EDAPlan(BaseModel):
     research_protocol_id: str | None = None
     research_protocol_version: str | None = None
     research_protocol_function_order: list[EDAToolName] = Field(default_factory=list)
+    research_protocol_step_texts: dict[EDAToolName, str] = Field(default_factory=dict)
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     hypotheses: list[str] = Field(default_factory=list)
     unverifiable_hypotheses: list[str] = Field(default_factory=list)
@@ -217,6 +219,16 @@ class EDAPlan(BaseModel):
     def enabled_steps(self) -> list[EDAPlanStep]:
         return [step for step in self.steps if step.enabled]
 
+    def step_text(self, step: EDAPlanStep) -> str:
+        """Say what one step does in the words the research protocol chose.
+
+        The catalog title names a statistical method, which is the right label
+        for a report and the wrong one for the analyst approving the run, so the
+        protocol line wins wherever it exists.
+        """
+
+        return self.research_protocol_step_texts.get(step.function) or step.title
+
     def ordered_by_research_protocol(self) -> EDAPlan:
         """Return a copy whose step order follows the protocol captured in this plan."""
 
@@ -312,6 +324,9 @@ class ResearchProposal(BaseModel):
     assistant_message: str
     data_profile: ResearchDataProfile
     quality_report: DataQualityReport
+    # Written once when the dataset was frozen, so the panel and the confirmation
+    # card keep naming the moment the data was actually read.
+    data_summary: DataSummary | None = None
 
 
 class ResearchTurnResult(BaseModel):

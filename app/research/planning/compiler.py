@@ -341,6 +341,11 @@ class EDAPlanCompiler:
                 if skill.research_protocol is not None
                 else []
             ),
+            research_protocol_step_texts=(
+                dict(skill.research_protocol.display_text_by_function)
+                if skill.research_protocol is not None
+                else {}
+            ),
             hypotheses=agenda,
             unverifiable_hypotheses=parked,
             selected_variables=selected,

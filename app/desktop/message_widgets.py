@@ -21,9 +21,8 @@ from PySide6.QtWidgets import (
 )
 
 from app.desktop.report_view import open_report
-from app.research.agent.schemas import AgentRunResult, EDAPlan, EDAPlanStep
-from app.research.data.sources.summary import DataSummary, VariableLabel
-from app.research.tools.catalog import FUNCTION_CATALOG, STAGE_TITLES
+from app.research.agent.schemas import AgentRunResult, EDAPlan
+from app.research.data.sources.summary import DataSummary, parse_summary
 
 STATUS_MARK = {
     "running": "◐",
@@ -312,124 +311,6 @@ class ToolMessageWidget(QFrame):
             self.detail_label.setText(detail)
 
 
-class PlanMessageWidget(QFrame):
-    """Read-only analysis plan; changes are requested in plain language."""
-
-    run_requested = Signal(object)
-    reject_requested = Signal()
-
-    def __init__(self, plan: EDAPlan) -> None:
-        super().__init__()
-        self.setObjectName("planMessage")
-        self.setMinimumWidth(560)
-        self.setMaximumWidth(720)
-        self.plan = plan
-        self.step_checks: dict[str, QWidget] = {}
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(10)
-
-        header = QHBoxLayout()
-        title = QLabel("建议的分析方案" if plan.revision <= 1 else f"修订后的分析方案（第 {plan.revision} 版）")
-        title.setObjectName("planTitle")
-        header.addWidget(title)
-        header.addStretch(1)
-        self.status_label = QLabel("待确认")
-        self.status_label.setObjectName("planStatus")
-        header.addWidget(self.status_label)
-        layout.addLayout(header)
-
-        objective = QLabel(plan.objective)
-        objective.setWordWrap(True)
-        objective.setObjectName("planObjective")
-        layout.addWidget(objective)
-
-        if plan.selected_variables:
-            variables = QLabel("纳入分析的影响因素：" + "、".join(plan.selected_variables))
-            variables.setWordWrap(True)
-            variables.setObjectName("planObjective")
-            layout.addWidget(variables)
-
-        grouped: dict[str, list[Any]] = {}
-        for step in plan.enabled_steps:
-            grouped.setdefault(FUNCTION_CATALOG[step.function].stage, []).append(step)
-        for stage, steps in grouped.items():
-            group = QLabel(STAGE_TITLES.get(stage, stage))
-            group.setObjectName("planStage")
-            layout.addWidget(group)
-            for step in steps:
-                row = QLabel(f"· {step.title}｜{FUNCTION_CATALOG[step.function].answers}")
-                row.setObjectName("planStep")
-                row.setWordWrap(True)
-                row.setToolTip(f"{step.description}\n选择理由：{step.rationale}")
-                self.step_checks[step.step_id] = row
-                layout.addWidget(row)
-
-        if plan.hypotheses:
-            hypotheses = QLabel("想验证的判断\n" + "\n".join(f"· {item}" for item in plan.hypotheses[:5]))
-            hypotheses.setWordWrap(True)
-            hypotheses.setObjectName("planObjective")
-            layout.addWidget(hypotheses)
-
-        self.feedback_hint = QLabel("想改或想先了解方案，可以直接在下面说；只有明确确认后才会开始执行。")
-        self.feedback_hint.setWordWrap(True)
-        self.feedback_hint.setObjectName("planHint")
-        layout.addWidget(self.feedback_hint)
-
-        actions = QHBoxLayout()
-        actions.addStretch(1)
-        self.reject_button = QPushButton("拒绝方案")
-        self.reject_button.clicked.connect(self.reject_requested)
-        actions.addWidget(self.reject_button)
-        self.run_button = QPushButton("立即开始")
-        self.run_button.setObjectName("primaryButton")
-        self.run_button.clicked.connect(self._emit_plan)
-        actions.addWidget(self.run_button)
-        layout.addLayout(actions)
-
-    def approved_plan(self) -> EDAPlan:
-        return self.plan
-
-    def _emit_plan(self) -> None:
-        self.run_requested.emit(self.plan)
-
-    def set_feedback_countdown(self, seconds: int) -> None:
-        self.status_label.setText(f"{seconds} 秒后自动执行")
-        self.feedback_hint.setText("想改就直接在下面说；输入期间倒计时会暂停。")
-        self.run_button.show()
-        self.reject_button.show()
-
-    def set_explicit_approval(self) -> None:
-        self.status_label.setText("等待明确确认")
-        self.feedback_hint.setText("想改或想先了解方案，可以直接在下面说；只有明确确认后才会开始执行。")
-        self.run_button.show()
-        self.reject_button.show()
-
-    def set_feedback_paused(self, text: str = "正在接收修改意见") -> None:
-        self.status_label.setText(text)
-
-    def set_running(self) -> None:
-        self.status_label.setText("执行中")
-        self.run_button.hide()
-        self.reject_button.hide()
-
-    def set_finished(self, status: str = "已完成") -> None:
-        self.status_label.setText(status)
-        self.run_button.hide()
-        self.reject_button.hide()
-
-
-def step_display_text(step: EDAPlanStep) -> str:
-    """Say what one step does, as an action rather than as a method name.
-
-    The research protocol is meant to carry a `display_text` for every step; until
-    it does, the step title is already written as a phrase and reads correctly.
-    """
-
-    display = str(step.parameters.get("display_text") or "").strip()
-    return display or step.title
-
-
 def summary_fields(summary: DataSummary | None) -> list[tuple[str, str, str]]:
     """Render the dataset as the panel renders it: same source, same wording.
 
@@ -460,20 +341,7 @@ def as_summary(value: DataSummary | dict[str, Any] | None) -> DataSummary | None
 
     if value is None or isinstance(value, DataSummary):
         return value
-    variables = [
-        VariableLabel(display=str(item.get("display", "")), resolved=bool(item.get("resolved", True)))
-        for item in value.get("variables", [])
-        if isinstance(item, dict)
-    ]
-    return DataSummary(
-        price_label=str(value.get("price_label", "")),
-        variables=variables,
-        start_date=str(value.get("start_date", "")),
-        end_date=str(value.get("end_date", "")),
-        granularity_text=str(value.get("granularity_text", "")),
-        gap_text=value.get("gap_text") or None,
-        fetched_at_text=str(value.get("fetched_at_text", "")),
-    )
+    return parse_summary(value)
 
 
 class DataPlanMessageWidget(QFrame):
@@ -534,7 +402,7 @@ class DataPlanMessageWidget(QFrame):
         action_heading.setObjectName("planStage")
         layout.addWidget(action_heading)
         for step in plan.enabled_steps:
-            row = QLabel(step_display_text(step))
+            row = QLabel(plan.step_text(step))
             row.setObjectName("planStep")
             row.setWordWrap(True)
             row.setToolTip(step.description)

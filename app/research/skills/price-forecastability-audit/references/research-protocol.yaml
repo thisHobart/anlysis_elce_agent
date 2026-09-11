@@ -25,6 +25,7 @@ stages:
     objective: 明确被预测的市场产品、目标单位、时间粒度、时区、预测起点和预测范围。
     functions: []
     function_rules: {}
+    function_display_text: {}
     exit_gate: 关键字段已知或被明确记录为限制；不得用默认常识替代具体市场规则。
 
   - stage_id: data_readiness
@@ -36,6 +37,8 @@ stages:
       data_quality: >-
         每个方案强制执行一次，由本地编译器加入。确认有效样本量、覆盖缺口位置与重复时间戳；
         缺口成片出现时，滚动统计与季节分解结论都要标注受影响区间。
+    function_display_text:
+      data_quality: 先看这批数据完不完整、时间点对不对得上
     exit_gate: 目标满足最低 EDA 样本要求；不足两个完整日周期时不进入季节分解与偏自相关。
 
   - stage_id: price_shape
@@ -60,6 +63,12 @@ stages:
         低估真实难度，定级要下调；concentration 指出风险时段；negative_share 非零时单独说明负价。
       price_segment_distribution_comparison: >-
         用户明确给出子样本边界时做，一次 segments 调用覆盖全部子样本。
+    function_display_text:
+      price_descriptive_distribution: 看电价整体在什么水平，高的低的差多少
+      price_duration_curve: 看高价时段占了多少时间、又占了多少钱
+      price_tukey_outer_fence: 把明显偏高和偏低的时点挑出来
+      price_spike_regime_profile: 看高价是偶尔冒一次还是连着好几个时段，有没有负电价
+      price_segment_distribution_comparison: 按你划的时段分开，比一比电价高低
     exit_gate: 已区分常态价格区间与极端状态，并说明极端事件是孤立出现还是成片出现。
 
   - stage_id: price_dynamics
@@ -91,6 +100,13 @@ stages:
       price_partial_autocorrelation: >-
         取 suggested_autoregressive_order 与 significance_band 看直接记忆；
         一阶后即落入置信带说明接近随机游走，模型增益空间有限。
+    function_display_text:
+      price_calendar_group_profile: 看电价在一天之内、一周之内的高低规律
+      price_rolling_mean_std: 看电价的起伏是不是一阵大一阵小
+      price_stationarity_tests: 看电价是围着一个水平上下走，还是整体在往上或往下挪
+      price_seasonal_decomposition: 把电价里的长期走势和每天的固定起伏分开看
+      price_lag_autocorrelation: 看前面时段的电价还能影响后面多久
+      price_partial_autocorrelation: 看要往前看几个时段，才够解释现在的电价
     exit_gate: 平稳性 verdict、季节强度和记忆阶数三项均有结论或明确限制，不用单一指标下结论。
 
   - stage_id: modeling_readiness
@@ -107,6 +123,9 @@ stages:
         引用 best_baseline_label 与 best_mae 原值作为达标线。best_baseline 为 daily_naive 或
         weekly_naive 支持结构清晰；为 persistence 且日/周 naive 的 mae_ratio_to_persistence 均大于 1
         时归入以持续性为主。near_zero_share ≥ 1% 时不得使用百分比误差指标。
+    function_display_text:
+      price_variance_stabilization_check: 看电价要不要先换算一下再用来做预测
+      price_naive_baseline_benchmark: 先用最简单的办法算一遍误差，作为后面的及格线
     exit_gate: >-
       已归入结构清晰、以持续性为主、难度高或需先预处理之一，误差底线与预处理建议均已记录；
       进入预测阶段前仍需时间顺序切分与样本外验证。

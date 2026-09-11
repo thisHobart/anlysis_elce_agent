@@ -6,7 +6,7 @@ import ast
 from pathlib import Path
 
 import pytest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel
 
 from app.desktop.main_window import MainWindow
 from app.desktop.message_widgets import DataPlanMessageWidget, summary_fields
@@ -14,6 +14,7 @@ from app.desktop.panes import DataPanel
 from app.desktop.session import ResearchSession, SessionStore
 from app.research.application.coordinator import ResearchCoordinator
 from app.research.data.sources import naming
+from app.research.data.sources.materialize import snapshot_path
 from app.research.data.sources.summary import DataSummary, VariableLabel, build_summary
 from tests.desktop.test_desktop import select_desktop_data, wait_until
 
@@ -30,6 +31,8 @@ FORBIDDEN_WORDS = (
     "长表",
     "连接串",
     "隧道",
+    "端口",
+    "取数契约",
     "表名",
     "字段名",
     "max_lag",
@@ -111,6 +114,75 @@ def test_unavailable_panel_says_the_same_thing_whatever_broke(qt_app: QApplicati
         panel.set_state("unavailable", earlier)
         assert panel.history_container.isVisibleTo(panel)
         assert "山东电网 实时电价" in panel.history_card.rows["电价"].value_label.text()
+    finally:
+        window.close()
+
+
+def test_exploring_panel_lights_up_what_is_settled_and_says_nothing_is_taken_yet(
+    qt_app: QApplication,
+    tmp_path: Path,
+):
+    window = MainWindow(session_store=SessionStore(tmp_path / "sessions.json"))
+    try:
+        panel = window.workspace.context.data_panel
+        panel.set_state(
+            "exploring",
+            DataSummary(
+                price_label="山东电网 实时电价",
+                variables=[VariableLabel("风电出力"), VariableLabel("光伏出力")],
+            ),
+        )
+
+        assert panel.exploring_view.isVisibleTo(panel)
+        assert "正在找数据" in panel.status_label.text()
+        rows = panel.exploring_card.rows
+        assert rows["电价"].mark.text() == "✓"
+        assert rows["影响因素"].value_label.text() == "已找到风电出力、光伏出力"
+        # Nothing is claimed about a field the exploration has not reached.
+        assert rows["时间范围"].value_label.text() == "待定"
+        assert rows["时间范围"].mark.text() == "○"
+        labels = [item.text() for item in panel.exploring_view.findChildren(QLabel)]
+        assert DataPanel.EXPLORING_TEXT in labels
+        assert DataPanel.EXPLORING_NOTE in labels
+    finally:
+        window.close()
+
+
+def test_asking_a_question_lights_up_what_is_already_known(
+    qt_app: QApplication,
+    desktop_study: Path,
+    model_agent: ResearchCoordinator,
+    tmp_path: Path,
+):
+    """§9.2: the card fills in as the exploration learns, instead of staying blank."""
+
+    window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
+    select_desktop_data(window, desktop_study)
+    try:
+        workspace = window.workspace
+        panel = workspace.context.data_panel
+
+        # The work runs on a worker thread, so reading the panel straight after the
+        # call catches it mid-exploration, before any answer comes back.
+        workspace.submit_question("分析电价分布")
+        exploring_state = panel.state
+        exploring = {
+            key: (row.value_label.text(), row.mark.text(), row.sub_label.text())
+            for key, row in panel.exploring_card.rows.items()
+        }
+        wait_until(qt_app, lambda: not workspace.is_busy)
+
+        assert exploring_state == "exploring"
+        # The price is named the same way before and after the data is read.
+        assert exploring["电价"] == (panel.ready_card.rows["电价"].value_label.text(), "✓", "")
+        assert exploring["电价"][0] == "实时电价"
+        assert exploring["影响因素"][0].startswith("已找到")
+        assert "统调负荷" in exploring["影响因素"][0]
+        assert exploring["时间范围"][:2] == ("待定", "○")
+        assert exploring["时间范围"][2] == "每小时一个点"
+
+        assert workspace.current_session.data_state == "ready"
+        assert panel.ready_card.rows["时间范围"].value_label.text() != "待定"
     finally:
         window.close()
 
@@ -224,6 +296,71 @@ def test_confirmation_card_and_panel_word_the_dataset_identically(
         window.close()
 
 
+def test_confirmation_card_names_actions_rather_than_methods(
+    qt_app: QApplication,
+    desktop_study: Path,
+    model_agent: ResearchCoordinator,
+    tmp_path: Path,
+):
+    window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
+    select_desktop_data(window, desktop_study)
+    try:
+        workspace = window.workspace
+        workspace.submit_question("分析 actual_load 与电价 2 小时的滞后关系")
+        wait_until(qt_app, lambda: not workspace.is_busy)
+
+        card = workspace.conversation.current_plan_widget
+        assert isinstance(card, DataPlanMessageWidget)
+        assert card.DATA_SECTION == "要用的数据"
+        assert card.ACTION_SECTION == "要做的事"
+
+        plan = card.plan
+        rendered = [card.step_checks[step.step_id].text() for step in plan.enabled_steps]
+        assert len(rendered) > 1
+        assert rendered == [plan.step_text(step) for step in plan.enabled_steps]
+        # A step reads as the thing it does, and never as the method behind it.
+        assert all(text != step.title for text, step in zip(rendered, plan.enabled_steps))
+        assert all(not text[:1].isdigit() for text in rendered)
+        assert "先看这批数据完不完整、时间点对不对得上" in rendered
+    finally:
+        window.close()
+
+
+def test_a_column_without_a_chinese_name_warns_instead_of_stopping(
+    qt_app: QApplication,
+    desktop_study: Path,
+    model_agent: ResearchCoordinator,
+    tmp_path: Path,
+):
+    window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
+    select_desktop_data(window, desktop_study)
+    try:
+        workspace = window.workspace
+        workspace.submit_question("分析 forecast_generation 与电价的关系")
+        wait_until(qt_app, lambda: not workspace.is_busy)
+
+        session = workspace.current_session
+        summary = session.data_summary
+        assert summary is not None
+        unnamed = [item.display for item in summary.variables if not item.resolved]
+        assert "forecast_generation" in unnamed
+        # The research keeps going; the missing name is an audit note, not a stop.
+        assert session.data_state == "ready"
+        assert session.current_plan is not None
+        warnings = [
+            event
+            for event in session.trace
+            if event.status == "warning" and "没有中文名" in event.name
+        ]
+        assert warnings
+        assert warnings[-1].category == "input"
+        assert warnings[-1].name == f"有 {len(unnamed)} 项数据没有中文名，先按原名显示"
+        # The stored name travels with the warning so the analyst can ask about it.
+        assert "forecast_generation" in warnings[-1].summary
+    finally:
+        window.close()
+
+
 def test_countdown_chip_counts_in_minutes_and_seconds(
     qt_app: QApplication,
     desktop_study: Path,
@@ -245,6 +382,47 @@ def test_countdown_chip_counts_in_minutes_and_seconds(
         window.close()
 
 
+def test_approving_fixes_the_data_so_a_later_change_cannot_move_the_result(
+    qt_app: QApplication,
+    desktop_study: Path,
+    model_agent: ResearchCoordinator,
+    tmp_path: Path,
+):
+    """§9.4: what was approved is what runs, whatever happens to the source afterwards."""
+
+    import pandas as pd
+
+    window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
+    select_desktop_data(window, desktop_study)
+    try:
+        workspace = window.workspace
+        workspace.submit_question("分析电价分布")
+        wait_until(qt_app, lambda: not workspace.is_busy)
+        session = workspace.current_session
+        assert session.data_summary is not None
+        fetched_at = session.data_summary.fetched_at_text
+        approved = workspace.conversation.current_plan_widget.approved_plan()
+        # Proposing wrote the data down; the run below reads that copy, not the file.
+        assert snapshot_path(session.dataset_fingerprint).is_dir()
+
+        target = Path(session.inputs["target"].path)
+        frame = pd.read_csv(target)
+        frame.iloc[0, -1] = float(frame.iloc[0, -1]) + 400.0
+        frame.to_csv(target, index=False)
+
+        workspace.run_plan(approved)
+        wait_until(qt_app, lambda: not workspace.is_busy)
+
+        assert session.status == "completed"
+        assert session.report_path and Path(session.report_path).is_file()
+        assert not session.plan_stale
+        # The panel keeps naming the moment the data was read, not the moment the
+        # file changed underneath it.
+        assert session.data_summary.fetched_at_text == fetched_at
+    finally:
+        window.close()
+
+
 def test_taking_the_same_data_again_keeps_an_approved_plan(
     qt_app: QApplication,
     desktop_study: Path,
@@ -259,7 +437,9 @@ def test_taking_the_same_data_again_keeps_an_approved_plan(
         wait_until(qt_app, lambda: not workspace.is_busy)
         session = workspace.current_session
         assert session.current_plan is not None
+        assert session.data_summary is not None
         plan_id = session.current_plan["plan_id"]
+        fetched_at = session.data_summary.fetched_at_text
 
         workspace.refetch_dataset()
 
@@ -267,6 +447,8 @@ def test_taking_the_same_data_again_keeps_an_approved_plan(
         assert workspace.current_session.current_plan["plan_id"] == plan_id
         assert not workspace.current_session.plan_stale
         assert workspace.current_session.data_state == "ready"
+        # Identical data is still data from when it was first read.
+        assert workspace.current_session.data_summary.fetched_at_text == fetched_at
     finally:
         window.close()
 
@@ -299,6 +481,37 @@ def test_changed_data_voids_the_plan_with_the_agreed_notice(
         assert workspace.current_session.current_plan is None
         assert workspace.current_session.plan_stale
         assert workspace.current_session.messages[-1].content == DATA_CHANGED_NOTICE
+    finally:
+        window.close()
+
+
+def test_a_plan_card_saved_before_the_merge_renders_in_the_new_card(
+    qt_app: QApplication,
+    desktop_study: Path,
+    model_agent: ResearchCoordinator,
+    tmp_path: Path,
+):
+    """The old approval card is gone, so history renders in the one card that remains."""
+
+    from tests.desktop.test_desktop import _fresh_plan, _session_with_plan
+
+    stored = _session_with_plan(_fresh_plan(desktop_study, model_agent))
+    store = SessionStore(tmp_path / "sessions.json")
+    store.save([stored])
+
+    window = MainWindow(agent=model_agent, session_store=store)
+    try:
+        # Opening the app starts a new conversation, so reach for the saved one.
+        window.workspace.select_session(stored.session_id)
+        card = window.workspace.conversation.current_plan_widget
+        assert isinstance(card, DataPlanMessageWidget)
+        # That conversation stored no dataset description, and the card says so
+        # rather than inventing one from today's data.
+        labels = [item.text() for item in card.findChildren(QLabel)]
+        assert card.TITLE in labels
+        assert "电价　待定" in labels
+        assert "影响因素　待定" in labels
+        assert "时间范围　待定" in labels
     finally:
         window.close()
 

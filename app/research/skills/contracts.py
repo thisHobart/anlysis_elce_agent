@@ -20,6 +20,7 @@ class ResearchProtocolStage(BaseModel):
     objective: str = Field(min_length=1)
     functions: list[str] = Field(default_factory=list)
     function_rules: dict[str, str] = Field(default_factory=dict)
+    function_display_text: dict[str, str] = Field(default_factory=dict)
     exit_gate: str = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -33,6 +34,11 @@ class ResearchProtocolStage(BaseModel):
         if unmatched_rules:
             raise ValueError(
                 f"研究协议阶段 {self.stage_id} 的函数规则没有对应函数：{', '.join(unmatched_rules)}"
+            )
+        unmatched_display = sorted(set(self.function_display_text).difference(self.functions))
+        if unmatched_display:
+            raise ValueError(
+                f"研究协议阶段 {self.stage_id} 的步骤说明没有对应函数：{', '.join(unmatched_display)}"
             )
         return self
 
@@ -67,6 +73,20 @@ class ResearchProtocol(BaseModel):
         """Return the stable domain order used by the local plan compiler."""
 
         return tuple(name for stage in self.stages for name in stage.functions)
+
+    @property
+    def display_text_by_function(self) -> dict[str, str]:
+        """Return one plain-language line per step, for the confirmation card.
+
+        A protocol that leaves a step unwritten simply has no entry here; the
+        card then falls back to the catalog title rather than showing nothing.
+        """
+
+        return {
+            name: text
+            for stage in self.stages
+            for name, text in stage.function_display_text.items()
+        }
 
     def compact_context(self) -> dict[str, Any]:
         """Return the complete, bounded protocol supplied to the function selector."""

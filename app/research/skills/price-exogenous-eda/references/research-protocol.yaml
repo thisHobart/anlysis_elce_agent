@@ -29,6 +29,7 @@ stages:
     objective: 明确被预测的市场产品、目标单位、时间粒度、时区、预测起点、预测范围和决策截止时点。
     functions: []
     function_rules: {}
+    function_display_text: {}
     exit_gate: 关键字段已知或被明确记录为限制；不得用默认常识替代具体市场规则。
 
   - stage_id: data_readiness
@@ -40,6 +41,8 @@ stages:
       data_quality: >-
         每个方案强制执行一次，由本地编译器加入。读三件事：目标有效样本是否支撑时序结论；
         每个变量的 availability_type 与 median_availability_lag_hours；覆盖缺口与重复时间戳的位置。
+    function_display_text:
+      data_quality: 先看这批数据完不完整、时间点对不对得上
     exit_gate: >-
       目标满足最低 EDA 样本要求；有效样本不足两个完整日周期时不进入季节分解与偏自相关；
       每个变量都已定出候选资格，存在前视风险的变量不得成为预测候选。
@@ -90,6 +93,18 @@ stages:
         significance_band；一阶后即落入置信带说明接近随机游走。
       price_segment_distribution_comparison: >-
         用户明确给出子样本边界时做，一次 segments 调用覆盖全部子样本。
+    function_display_text:
+      price_descriptive_distribution: 看电价整体在什么水平，高的低的差多少
+      price_duration_curve: 看高价时段占了多少时间、又占了多少钱
+      price_tukey_outer_fence: 把明显偏高和偏低的时点挑出来
+      price_spike_regime_profile: 看高价是偶尔冒一次还是连着好几个时段，有没有负电价
+      price_calendar_group_profile: 看电价在一天之内、一周之内的高低规律
+      price_rolling_mean_std: 看电价的起伏是不是一阵大一阵小
+      price_stationarity_tests: 看电价是围着一个水平上下走，还是整体在往上或往下挪
+      price_seasonal_decomposition: 把电价里的长期走势和每天的固定起伏分开看
+      price_lag_autocorrelation: 看前面时段的电价还能影响后面多久
+      price_partial_autocorrelation: 看要往前看几个时段，才够解释现在的电价
+      price_segment_distribution_comparison: 按你划的时段分开，比一比电价高低
     exit_gate: >-
       平稳性 verdict、季节强度、记忆阶数、波动状态和极端状态五项各有结论或明确限制；
       不用单一汇总统计代表价格机制。
@@ -120,6 +135,13 @@ stages:
       exogenous_variance_inflation: >-
         两两相关不足以解释冗余、怀疑多变量共同解释时做；至少两个变量。
         severity 为 severe 的一组变量在特征建议中只保留一个代表。
+    function_display_text:
+      exogenous_descriptive_distribution: 看每项影响因素的大小范围，有没有大段没数
+      exogenous_iqr_outliers: 把影响因素里明显不正常的数挑出来
+      exogenous_linear_index_trend: 看影响因素这段时间是不是整体在变大或变小
+      exogenous_stationarity_tests: 看影响因素自己是不是也在整体往上或往下挪
+      exogenous_pearson_collinearity: 看哪两项影响因素其实说的是同一件事
+      exogenous_variance_inflation: 看几项影响因素之间有没有互相重复
     exit_gate: >-
       每个变量均有覆盖与可获得性结论；异常和趋势没有被误当作预测信号；冗余与非平稳变量已标记。
 
@@ -160,6 +182,17 @@ stages:
         为 magnitude_unstable 时只能写方向一致、强度随时间变化。
       relationship_pearson_segment_comparison: >-
         用户明确给出子样本边界时做，一次 segments 调用覆盖全部子样本。
+    function_display_text:
+      relationship_scipy_pearson_pairwise: 看每项影响因素和同一时刻的电价一起怎么变
+      relationship_scipy_spearman_pairwise: 看它们是不是同涨同跌，只是变化幅度不成比例
+      relationship_mutual_information_scan: 看有没有直上直下看不出来、但确实存在的关联
+      relationship_pearson_positive_lead_scan: 找影响因素提前多久开始带动电价
+      relationship_granger_causality_scan: 看影响因素的过去数据能不能帮着说明之后的电价
+      relationship_pearson_by_hour: 看这层关系在一天的不同时段是不是一样
+      relationship_pearson_by_month: 看这层关系在不同月份是不是一样
+      relationship_feature_quartile_response: 看影响因素从低到高变化时，电价跟着怎么走
+      relationship_rolling_correlation_stability: 看这层关系这几年稳不稳，会不会反过来
+      relationship_pearson_segment_comparison: 按你划的时段分开，比一比这层关系
     exit_gate: >-
       每个候选关系都说明方向、效应量、样本量、滞后语义和可获得性风险，
       且至少验证一项稳定性证据，否则只能表述为全样本平均关系。
@@ -177,6 +210,9 @@ stages:
       price_naive_baseline_benchmark: >-
         需要后续模型的达标线时做。引用 best_baseline_label 与 best_mae 原值；
         near_zero_share ≥ 1% 时不得使用百分比误差指标。
+    function_display_text:
+      price_variance_stabilization_check: 看电价要不要先换算一下再用来做预测
+      price_naive_baseline_benchmark: 先用最简单的办法算一遍误差，作为后面的及格线
     exit_gate: >-
       每个候选变量归入可进入算法实验、仅可描述、存在泄漏风险或证据不足之一；
       不以相关性直接批准特征，进入预测阶段前仍需时间顺序切分与样本外增量验证。

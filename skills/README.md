@@ -13,7 +13,7 @@ skills/
     └── scripts/      # 可选；第一阶段不会自动执行
 ```
 
-应用自带两个核心 Skill（`price-exogenous-eda` 与 `price-forecastability-audit`），此目录用于追加你自己的专业流程。加载器读取 `SKILL.md` 的元数据和指令。Skill 可在 `metadata.protocol-file` 中声明包内相对路径的 YAML 领域研究协议；协议只能引用应用已注册函数，且必须完整覆盖该 Skill 的授权函数。加载器拒绝绝对路径和任何越出 Skill 目录的引用。外部 Skill 不能通过指令注册新函数，也不会自动执行 `scripts/` 中的代码。
+应用自带两个核心 Skill（`price-exogenous-eda` 与 `price-forecastability-audit`），此目录用于追加你自己的专业流程。加载器读取 `SKILL.md` 的元数据和指令。Skill 可在 `metadata.protocol-file` 中声明包内相对路径的 YAML 领域研究协议；协议只能引用应用已注册函数，且必须完整覆盖该 Skill 的授权函数。加载器拒绝绝对路径和任何越出 Skill 目录的引用。协议还可以为每个函数写一句 `function_display_text`，确认卡片会逐字照读这句话，不写就退回函数标题——那是方法名，业务人员读不出要做什么。外部 Skill 不能通过指令注册新函数，也不会自动执行 `scripts/` 中的代码。
 
 如果需要从其他位置加载 Skill，可在 `.env` 中使用系统路径分隔符配置：
 

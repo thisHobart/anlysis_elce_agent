@@ -24,6 +24,7 @@ from app.research.agent.schemas import ConversationMessage, EDAPlan
 from app.research.application.execution import EDAExecutionService
 from app.research.application.planning import EDAPlanningService, noop_progress
 from app.research.data.loader import ResearchDataError
+from app.research.data.sources.summary import summary_payload
 from app.research.graph.contracts import (
     ApprovalState,
     AuthorizationEnvelope,
@@ -931,6 +932,7 @@ def build_research_workflow(
             "loop_cursor": cursor.model_dump(mode="json"),
             "current_plan": proposal.plan.model_dump(mode="json"),
             "data_profile": proposal.data_profile.model_dump(mode="json"),
+            "data_summary": summary_payload(proposal.data_summary),
             "quality_report": proposal.quality_report.model_dump(mode="json"),
             "plan_history": [*state.get("plan_history", []), proposal.plan.model_dump(mode="json")],
             "plan_fingerprints": [*state.get("plan_fingerprints", []), fingerprint],

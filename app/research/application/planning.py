@@ -15,6 +15,11 @@ from app.research.data.alignment import AlignmentResult, align_loaded_series
 from app.research.data.loader import LoadedSeries, load_series
 from app.research.data.quality import build_quality_report
 from app.research.data.snapshot import input_file_manifest, study_fingerprint
+from app.research.data.sources.materialize import (
+    MaterializedSnapshot,
+    materialize_dataset,
+    restore_dataset,
+)
 from app.research.schemas.feedback import FeedbackPacket
 from app.research.schemas.results import DataQualityReport
 from app.research.schemas.study import StudyConfig, load_study_config
@@ -38,6 +43,23 @@ class PreparedResearchData:
     quality: DataQualityReport
 
 
+def assemble_research_data(
+    config: StudyConfig,
+    target: LoadedSeries,
+    exogenous: list[LoadedSeries],
+) -> PreparedResearchData:
+    """Derive the analysis frame and quality evidence from already-read series.
+
+    Alignment and quality are pure functions of the series and the configuration,
+    so data read from a frozen snapshot produces exactly the same evidence as data
+    read from the sources.
+    """
+
+    aligned = align_loaded_series(target, exogenous, config)
+    quality = build_quality_report(target, exogenous, aligned, config)
+    return PreparedResearchData(config=config, target=target, exogenous=exogenous, aligned=aligned, quality=quality)
+
+
 def prepare_research_data(config: StudyConfig) -> PreparedResearchData:
     """Load all configured series and create the canonical analysis frame."""
 
@@ -48,9 +70,41 @@ def prepare_research_data(config: StudyConfig) -> PreparedResearchData:
     }
     target = load_series(config.target, **options)
     exogenous = [load_series(spec, **options) for spec in config.exogenous]
-    aligned = align_loaded_series(target, exogenous, config)
-    quality = build_quality_report(target, exogenous, aligned, config)
-    return PreparedResearchData(config=config, target=target, exogenous=exogenous, aligned=aligned, quality=quality)
+    return assemble_research_data(config, target, exogenous)
+
+
+def restore_prepared_data(fingerprint: str | None, config: StudyConfig) -> tuple[PreparedResearchData, MaterializedSnapshot] | None:
+    """Rebuild the analysis inputs from a frozen dataset, or return None if there is none."""
+
+    restored = restore_dataset(fingerprint, config=config)
+    if restored is None:
+        return None
+    return assemble_research_data(config, restored.target, restored.exogenous), restored.snapshot
+
+
+def freeze_research_data(
+    prepared: PreparedResearchData,
+    *,
+    fingerprint: str,
+    input_manifest: list[dict[str, Any]],
+) -> MaterializedSnapshot | None:
+    """Write this dataset down so the approved plan can no longer be moved under.
+
+    Failing to write is not failing to research: the run falls back to reading the
+    sources, which is what happened before snapshots existed.
+    """
+
+    try:
+        return materialize_dataset(
+            config=prepared.config,
+            target=prepared.target,
+            exogenous=prepared.exogenous,
+            quality=prepared.quality,
+            fingerprint=fingerprint,
+            input_manifest=input_manifest,
+        )
+    except (OSError, ValueError, ImportError):
+        return None
 
 
 def resolve_config(*, config_path: str | Path | None, study_config: StudyConfig | None) -> StudyConfig:
@@ -120,6 +174,9 @@ class EDAPlanningService:
         prepared = prepare_research_data(config)
         inputs = input_file_manifest(config)
         current_data_fingerprint = study_fingerprint(config, inputs)
+        # Freeze before the plan exists, so what the analyst approves and what the
+        # run reads are the same rows even if the sources move in between.
+        snapshot = freeze_research_data(prepared, fingerprint=current_data_fingerprint, input_manifest=inputs)
         callback(65, "EDA Subagent 分析问题与数据画像")
         history = [
             {
@@ -158,6 +215,7 @@ class EDAPlanningService:
             assistant_message=_proposal_message(plan, profile),
             data_profile=profile,
             quality_report=prepared.quality,
+            data_summary=snapshot.summary if snapshot is not None else None,
         )
 
     def revise_from_feedback(

@@ -28,8 +28,8 @@ QLabel#sessionTitle {
     font-size: 15px;
     font-weight: 600;
 }
-QLabel#sessionMeta, QLabel#contextHint, QLabel#dataKey, QLabel#resultMeta,
-QLabel#toolDetail, QLabel#planObjective, QLabel#planHint, QLabel#stepDetail {
+QLabel#dataKey, QLabel#resultMeta,
+QLabel#toolDetail, QLabel#planHint, QLabel#stepDetail {
     color: #667085;
     font-size: 12px;
 }
@@ -46,7 +46,7 @@ QLabel#contextTitle, QLabel#planTitle, QLabel#resultTitle, QLabel#thinkingTitle 
     font-weight: 600;
     font-size: 13.5px;
 }
-QLabel#planStage, QLabel#resultHeading {
+QLabel#planStage {
     color: #3F51B5;
     font-size: 12px;
     font-weight: 600;

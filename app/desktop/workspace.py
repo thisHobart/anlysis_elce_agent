@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from math import ceil
 from pathlib import Path
@@ -34,7 +33,13 @@ from app.research.agent.schemas import (
 )
 from app.research.application.coordinator import ResearchCoordinator
 from app.research.data.snapshot import input_file_manifest, study_fingerprint
-from app.research.data.sources.summary import DataSummary, build_summary, format_moment
+from app.research.data.sources.summary import (
+    DataSummary,
+    build_partial_summary,
+    build_summary,
+    parse_summary,
+    summary_payload,
+)
 from app.research.graph.contracts import ApprovalState, EpisodeSummary, ResearchLoopSnapshot
 from app.research.graph.narration import (
     STAGE_LABELS,
@@ -43,7 +48,22 @@ from app.research.graph.narration import (
     trace_category,
 )
 from app.research.schemas.results import DataQualityReport
+from app.research.schemas.study import StudyConfig
 from app.runtime_paths import default_research_output_directory
+
+
+def _known_so_far(config: StudyConfig | None) -> DataSummary | None:
+    """Describe the dataset from the study alone, before any of it has been read."""
+
+    if config is None:
+        return None
+    return build_partial_summary(
+        market=config.study.market,
+        target_name=config.target.name,
+        exogenous_names=[spec.name for spec in config.exogenous],
+        frequency=config.study.frequency,
+    )
+
 
 DATA_CHANGED_NOTICE = "数据换了，之前的分析方案已经作废。重新问一次，我按新数据给方案。"
 
@@ -307,22 +327,6 @@ class ResearchWorkspace(QSplitter):
             self.current_session_id = self.sessions[0].session_id
         self._persist_and_render()
 
-    def set_input_file(self, role: str, path: str) -> None:
-        if self.is_busy:
-            return
-        self._cancel_plan_feedback_window()
-        try:
-            if not self._assign_input_file(role, path):
-                return
-        except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, "这个文件暂时用不了", str(exc))
-            return
-        self._invalidate_plan_for_input_change()
-        self.current_session.dataset_fingerprint = self._current_dataset_fingerprint()
-        self._add_trace("input", f"载入数据文件：{Path(path).name}", "completed", "输入数据已更新")
-        self._sync_data_panel()
-        self._persist_and_render()
-
     def _assign_input_file(self, role: str, path: str) -> bool:
         """Point one role at a file; return False when it already pointed there."""
 
@@ -336,24 +340,6 @@ class ResearchWorkspace(QSplitter):
         item.variables = []
         self.current_session.source_kind = "file"
         return True
-
-    def clear_input_file(self, role: str) -> None:
-        if self.is_busy:
-            return
-        self._cancel_plan_feedback_window()
-        item = self.current_session.inputs[role]  # type: ignore[index]
-        if not item.path:
-            return
-        filename = Path(item.path).name
-        item.path = ""
-        item.status = "empty"
-        item.detail = "尚未选择"
-        item.variables = []
-        self._invalidate_plan_for_input_change()
-        self.current_session.dataset_fingerprint = self._current_dataset_fingerprint()
-        self._add_trace("input", f"移除数据文件：{filename}", "completed", "输入数据已更新")
-        self._sync_data_panel()
-        self._persist_and_render()
 
     def choose_local_files(self) -> None:
         """Fall back to files the analyst already has when no data can be fetched."""
@@ -393,12 +379,8 @@ class ResearchWorkspace(QSplitter):
             self._add_trace("input", "重新取数", "completed", "数据有更新，之前的方案已作废")
             self._set_data_state("empty", None)
         else:
-            summary = session.data_summary
-            if summary is not None:
-                session.data_summary = replace(
-                    summary,
-                    fetched_at_text=format_moment(datetime.now(UTC).astimezone()),
-                )
+            # Identical data is still data from the moment it was first read, so the
+            # panel keeps saying so. The trace is where「我刚看过」belongs.
             self._add_trace("input", "重新取数", "completed", "数据没有变化")
             self._set_data_state("ready", session.data_summary)
         self._persist_and_render(keep_timeline=True)
@@ -494,18 +476,16 @@ class ResearchWorkspace(QSplitter):
         session.touch()
         self.context.data_panel.set_state(state, summary)
 
-    def _sync_data_panel(self) -> None:
-        """Re-derive the panel state after the underlying data changed."""
-
-        session = self.current_session
-        if session.data_state == "ready" and not session.can_analyze:
-            self._set_data_state("empty", None)
-            return
-        self.context.data_panel.set_state(session.data_state, session.data_summary)
-
     def _summary_from_proposal(self, proposal: ResearchProposal) -> DataSummary:
-        """Turn the deterministic data evidence into the words both surfaces show."""
+        """Take the words written when the data was frozen, or derive them if it was not.
 
+        The frozen wording is preferred because it names the moment the data was
+        actually read; deriving it here would restamp it as「now」every time the
+        analyst asks another question about the same data.
+        """
+
+        if proposal.data_summary is not None:
+            return proposal.data_summary
         profile = proposal.data_profile
         alignment = proposal.quality_report.alignment
         missing = max(0, alignment.expected_rows - alignment.complete_case_rows)
@@ -572,7 +552,9 @@ class ResearchWorkspace(QSplitter):
         self._task_previous_status = session.status
         session.status = "understanding"
         if session.can_analyze:
-            self._set_data_state("exploring", session.data_summary)
+            # Light up what is already known so the panel fills in as it learns,
+            # rather than sitting blank until the whole answer arrives.
+            self._set_data_state("exploring", session.data_summary or _known_so_far(study_config))
         elif session.data_state != "ready":
             # Nothing to read yet: say so plainly and offer the way out of it.
             self._set_data_state("unavailable", session.data_summary)
@@ -707,11 +689,13 @@ class ResearchWorkspace(QSplitter):
                     self._set_plan_message_state("stale")
                 profile = values.get("data_profile") or {}
                 quality = DataQualityReport.model_validate(values["quality_report"])
+                stored_summary = values.get("data_summary")
                 proposal = ResearchProposal(
                     plan=plan,
                     assistant_message="模型方案已通过确定性校验，等待你的修改或确认。",
                     data_profile=ResearchDataProfile.model_validate(profile),
                     quality_report=quality,
+                    data_summary=parse_summary(stored_summary) if stored_summary else None,
                 )
                 self._proposal_completed(proposal)
                 return
@@ -995,7 +979,7 @@ class ResearchWorkspace(QSplitter):
                 payload={
                     "plan": plan.model_dump(mode="json"),
                     "available_variables": available_variables,
-                    "data_summary": asdict(session.data_summary) if session.data_summary else None,
+                    "data_summary": summary_payload(session.data_summary),
                     "state": "awaiting",
                 },
             )

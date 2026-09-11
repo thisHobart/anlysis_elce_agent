@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from app.research.application.execution import EDAExecutionService
 from app.research.application.planning import prepare_research_data
 from app.research.data.loader import ResearchDataError
 from app.research.data.snapshot import input_file_manifest, study_fingerprint
+from app.research.data.sources.materialize import snapshot_root
 from app.research.evaluation.eda import evaluate_agent_run
 from app.research.schemas.results import QualityIssue
 from app.research.schemas.study import load_study_config
@@ -1000,13 +1002,47 @@ def test_unplanned_hypothesis_requires_approval_instead_of_auto_repair(synthetic
     assert any(packet.requires_user for packet in result.evaluation.feedback_packets)
 
 
-def test_execution_rejects_files_changed_after_plan_generation(synthetic_study: Path, tmp_path: Path):
-    agent = _model_agent()
-    proposal = agent.propose(question="分析电价分布", config_path=synthetic_study)
+def _move_the_target_data(synthetic_study: Path, *, by: float) -> None:
     config = load_study_config(synthetic_study)
     frame = pd.read_csv(config.target.path)
-    frame.loc[0, config.target.value_column] = float(frame.loc[0, config.target.value_column]) + 1
+    frame.loc[0, config.target.value_column] = float(frame.loc[0, config.target.value_column]) + by
     frame.to_csv(config.target.path, index=False)
+
+
+def test_an_approved_plan_runs_on_the_data_it_was_approved_for(synthetic_study: Path, tmp_path: Path):
+    """A source that moves after approval must not move the conclusions."""
+
+    proposal = _model_agent().propose(question="分析电价分布", config_path=synthetic_study)
+    baseline = _model_agent().execute(
+        plan=proposal.plan,
+        config_path=synthetic_study,
+        output_directory=tmp_path / "before-artifacts",
+        run_id="frozen-before",
+    )
+
+    _move_the_target_data(synthetic_study, by=250.0)
+
+    # A separate coordinator, so the answer comes from the frozen data rather than
+    # from an in-process cache of the previous run.
+    after = _model_agent().execute(
+        plan=proposal.plan,
+        config_path=synthetic_study,
+        output_directory=tmp_path / "after-artifacts",
+        run_id="frozen-after",
+    )
+
+    assert after.eda_summary == baseline.eda_summary
+    assert after.quality_report == baseline.quality_report
+    assert after.aligned_rows == baseline.aligned_rows
+
+
+def test_execution_rejects_files_changed_after_plan_generation(synthetic_study: Path, tmp_path: Path):
+    """Without the frozen copy there is nothing to fall back on, so the run stops."""
+
+    agent = _model_agent()
+    proposal = agent.propose(question="分析电价分布", config_path=synthetic_study)
+    shutil.rmtree(snapshot_root(), ignore_errors=True)
+    _move_the_target_data(synthetic_study, by=1.0)
 
     with pytest.raises(ResearchDataError, match="方案生成后发生变化"):
         agent.execute(

@@ -26,6 +26,7 @@ class ResearchLoopState(TypedDict, total=False):
     messages: list[dict[str, Any]]
     study_config: dict[str, Any] | None
     data_profile: dict[str, Any] | None
+    data_summary: dict[str, Any] | None
     quality_report: dict[str, Any] | None
     active_skill: dict[str, Any] | None
     decision: dict[str, Any] | None

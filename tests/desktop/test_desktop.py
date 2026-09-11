@@ -6,6 +6,7 @@ import json
 import os
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -15,7 +16,7 @@ import pytest
 import yaml
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QTextDocument
-from PySide6.QtWidgets import QApplication, QLabel
+from PySide6.QtWidgets import QApplication, QFileDialog, QLabel
 
 from app.config import Settings
 from app.desktop.input_config import build_runtime_study
@@ -405,15 +406,27 @@ def wait_until(qt_app: QApplication, predicate, timeout_seconds: float = 12.0) -
     raise AssertionError("Qt operation did not finish before timeout")
 
 
+def choose_files(window: MainWindow, *paths: str) -> None:
+    """Answer one file dialog per role, the way a person works the fallback.
+
+    An empty answer is a cancelled dialog, which leaves that role as it was.
+    """
+
+    answers = iter(paths)
+    with patch.object(QFileDialog, "getOpenFileName", lambda *args, **kwargs: (next(answers, ""), "")):
+        window.workspace.choose_local_files()
+
+
 def select_desktop_data(window: MainWindow, desktop_study: Path) -> None:
     """Populate the three user-facing data roles without a configuration file."""
 
-    for role, filename in (
-        ("target", "market_prices.csv"),
-        ("actuals", "measurements.csv"),
-        ("forecasts", "predictions.csv"),
-    ):
-        window.workspace.set_input_file(role, str(desktop_study.parent / filename))
+    choose_files(
+        window,
+        *(
+            str(desktop_study.parent / name)
+            for name in ("market_prices.csv", "measurements.csv", "predictions.csv")
+        ),
+    )
 
 
 def test_trace_keeps_every_loaded_data_file_visible(
@@ -431,14 +444,11 @@ def test_trace_keeps_every_loaded_data_file_visible(
         loaded = [
             tree.topLevelItem(index).text(2)
             for index in range(tree.topLevelItemCount())
-            if tree.topLevelItem(index).text(2).startswith("载入数据文件")
+            if tree.topLevelItem(index).text(2).startswith("改用本地文件")
         ]
 
-        assert loaded == [
-            "载入数据文件 — market_prices.csv",
-            "载入数据文件 — measurements.csv",
-            "载入数据文件 — predictions.csv",
-        ]
+        # One choice by the analyst, one row, and every file it took is named in it.
+        assert loaded == ["改用本地文件 — market_prices.csv、measurements.csv、predictions.csv"]
     finally:
         window.close()
 
@@ -531,7 +541,7 @@ def test_target_only_arbitrary_filename_builds_price_only_plan(
     window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
     try:
         workspace = window.workspace
-        workspace.set_input_file("target", str(desktop_study.parent / "market_prices.csv"))
+        choose_files(window, str(desktop_study.parent / "market_prices.csv"))
         config = build_runtime_study(workspace.current_session)
         assert config.target.path.name == "market_prices.csv"
         assert config.exogenous == []
@@ -595,25 +605,6 @@ def test_forecast_availability_column_is_inferred_without_a_config_file(tmp_path
 
     assert [item.name for item in context.exogenous] == ["load_forecast"]
     assert context.exogenous[0].available_at_column == "available_at"
-
-
-def test_exogenous_files_can_be_cleared_without_affecting_the_target(
-    qt_app: QApplication,
-    desktop_study: Path,
-    model_agent: ResearchCoordinator,
-    tmp_path: Path,
-):
-    window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
-    try:
-        select_desktop_data(window, desktop_study)
-        workspace = window.workspace
-        workspace.clear_input_file("actuals")
-        workspace.clear_input_file("forecasts")
-        config = build_runtime_study(workspace.current_session)
-        assert config.exogenous == []
-        assert workspace.current_session.inputs["target"].path
-    finally:
-        window.close()
 
 
 def test_session_history_persists_across_window_restart(
@@ -1203,7 +1194,7 @@ def test_run_trace_reads_as_a_professional_audit_log(
         # Every loaded input stays visible; only duplicate lifecycle rows for the
         # same completed function are collapsed.
         titles = [text.split(" — ")[0] for text in texts]
-        assert titles.count("载入数据文件") == 3
+        assert titles.count("改用本地文件") == 1
         function_titles = [
             title
             for title in titles
@@ -1313,7 +1304,13 @@ def test_replacing_input_invalidates_existing_plan(
         replacement = tmp_path / "replacement" / "alternate_predictions.csv"
         replacement.parent.mkdir()
         pd.read_csv(tmp_path / "predictions.csv").to_csv(replacement, index=False)
-        workspace.set_input_file("forecasts", str(replacement))
+        # Only the forecast file actually moves; the other two answers repeat themselves.
+        choose_files(
+            window,
+            workspace.current_session.inputs["target"].path,
+            workspace.current_session.inputs["actuals"].path,
+            str(replacement),
+        )
         assert workspace.current_session.current_plan is None
         assert workspace.current_session.plan_stale
         assert workspace.current_session.runs[0].memory_status == "stale"
