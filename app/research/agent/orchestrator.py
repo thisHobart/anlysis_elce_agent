@@ -32,7 +32,15 @@ from app.research.schemas.study import StudyConfig
 from app.research.tools.catalog import FUNCTION_CATALOG, function_metadata
 from app.research.tools.contracts import SegmentDefinition
 
-DialogueIntent = Literal["discussion", "new_plan", "revise_plan", "explain_result", "execute_plan"]
+DialogueIntent = Literal[
+    "discussion",
+    "new_plan",
+    "revise_plan",
+    "explain_result",
+    "execute_plan",
+    "new_forecast_plan",
+    "execute_forecast_plan",
+]
 FUNCTION_METADATA = function_metadata()
 
 
@@ -350,6 +358,8 @@ class ModelResearchDialogue:
                 "revise_plan": "按用户反馈生成当前方案的变更",
                 "explain_result": "引用已有结构化证据解释结果",
                 "execute_plan": "用户明确确认运行当前方案",
+                "new_forecast_plan": "用户要求山东次日省级实时电价预测；参数由本地固定",
+                "execute_forecast_plan": "用户明确确认运行已冻结的预测方案",
             },
             "revision_contract": {
                 "unchanged_fields": "null",

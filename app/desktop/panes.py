@@ -35,6 +35,8 @@ from PySide6.QtWidgets import (
 
 from app.desktop.message_widgets import (
     DataPlanMessageWidget,
+    ForecastPlanMessageWidget,
+    ForecastResultMessageWidget,
     NoticeMessageWidget,
     ResultMessageWidget,
     TextMessageWidget,
@@ -44,6 +46,7 @@ from app.desktop.message_widgets import (
 from app.desktop.session import DataPanelState, ResearchSession, SessionMessage, TraceEvent
 from app.research.agent.schemas import EDAPlan
 from app.research.data.sources.summary import DataSummary, VariableLabel
+from app.research.forecasting.contracts import ForecastPlan
 from app.research.graph.narration import narrate_event
 
 STATUS_LABELS = {
@@ -213,7 +216,7 @@ class ConversationPane(QFrame):
         self._running = False
         self._interaction_kind: str | None = None
         self._message_widgets: dict[str, QWidget] = {}
-        self.current_plan_widget: DataPlanMessageWidget | None = None
+        self.current_plan_widget: DataPlanMessageWidget | ForecastPlanMessageWidget | None = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -342,8 +345,27 @@ class ConversationPane(QFrame):
                 labels = {"completed": "已完成", "failed": "执行失败", "stopped": "已停止", "stale": "已作废"}
                 widget.set_finished(labels[plan_state])
             self.current_plan_widget = widget
+        elif message.kind == "forecast_plan" and message.payload.get("plan"):
+            plan = ForecastPlan.model_validate(message.payload["plan"])
+            widget = ForecastPlanMessageWidget(plan)
+            widget.run_requested.connect(self.plan_run_requested)
+            widget.reject_requested.connect(self.plan_reject_requested)
+            plan_state = message.payload.get("state", "awaiting")
+            if plan_state == "running":
+                widget.set_running()
+            elif plan_state in {"completed", "failed", "stopped", "stale"}:
+                labels = {
+                    "completed": "已完成",
+                    "failed": "执行失败",
+                    "stopped": "已停止",
+                    "stale": "已作废",
+                }
+                widget.set_finished(labels[plan_state])
+            self.current_plan_widget = widget
         elif message.kind == "result":
             widget = ResultMessageWidget.from_payload(message.payload)
+        elif message.kind == "forecast_result":
+            widget = ForecastResultMessageWidget(message.payload)
         else:
             widget = NoticeMessageWidget(message.content, error=message.kind == "error")
         self._add_timeline_widget(widget, user_aligned=message.role == "user")

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-DIALOGUE_PROMPT_VERSION = "research-dialogue-v11"
+DIALOGUE_PROMPT_VERSION = "research-dialogue-v12"
 PLANNING_PROMPT_VERSION = "eda-plan-v14"
 
 
@@ -30,6 +30,8 @@ DIALOGUE_SYSTEM_PROMPT = """角色
 - revise_plan：已有 current_plan，用户明确要求改变其目标、函数、变量、滞后或分段。
 - explain_result：用户询问 interaction_context.current_run/evidence 中已有结果说明了什么。
 - execute_plan：已有 current_plan，且用户明确确认执行；疑问、讨论或含糊同意都不算确认。
+- new_forecast_plan：用户要求预测山东次日省级实时电价。只识别意图，不填写地区、日期、锚点、算法或训练参数，这些均由本地程序固定。
+- execute_forecast_plan：已有 forecast 类型方案，且用户明确确认执行。模型不能修改冻结快照或任何预测参数。
 - interaction_context.active_gate 是当前仍待处理的人机门槛。回答追问后仍要回到该门槛，不能把结果限制降级成普通结果对话。
 - active_gate 为 result_limitations 或 result_rejected 且 current_plan 已有 current_run 时：询问原因、产品能力或现有结果使用 discussion/explain_result；明确同意补入待授权方法或要求新增分析使用 revise_plan；不得用 execute_plan 原样重跑已评估方案。
 - current_plan.steps 才是实际可执行范围；objective 或 hypotheses 提到某项分析，不表示相应函数已经进入方案或获得批准。

@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 from app.desktop.report_view import open_report
 from app.research.agent.schemas import AgentRunResult, EDAPlan
 from app.research.data.sources.summary import DataSummary, parse_summary
+from app.research.forecasting.contracts import ForecastPlan
 
 STATUS_MARK = {
     "running": "◐",
@@ -459,6 +460,147 @@ class DataPlanMessageWidget(QFrame):
     def _show_actions(self, visible: bool) -> None:
         for button in (self.run_button, self.revise_button, self.reject_button):
             button.setVisible(visible)
+
+
+class ForecastPlanMessageWidget(QFrame):
+    """Explicit approval card for the fixed, read-only Shandong P3 forecast."""
+
+    run_requested = Signal(object)
+    reject_requested = Signal()
+
+    def __init__(self, plan: ForecastPlan) -> None:
+        super().__init__()
+        self.setObjectName("planMessage")
+        self.setMinimumWidth(560)
+        self.setMaximumWidth(720)
+        self.plan = plan
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        title = QLabel("开始预测之前，跟你确认一下")
+        title.setObjectName("planTitle")
+        header.addWidget(title)
+        header.addStretch(1)
+        self.status_label = QLabel("等待你确认")
+        self.status_label.setObjectName("planStatus")
+        header.addWidget(self.status_label)
+        layout.addLayout(header)
+
+        rows = [
+            ("目标", "山东省级实时电价"),
+            ("预测范围", f"{plan.forecast_start:%Y-%m-%d 00:00} — 23:45（96点）"),
+            ("算法", f"CTM-Base + 多因素相似日（{plan.algorithm_version}）"),
+            (
+                "历史回测",
+                "、".join(f"{item.target_start:%Y-%m-%d}" for item in plan.snapshots if item.role == "backtest"),
+            ),
+            ("运行方式", "CPU确定性训练；3折完成后预测次日"),
+        ]
+        for key, value in rows:
+            row = QLabel(f"{key}　{value}")
+            row.setObjectName("planStep")
+            row.setWordWrap(True)
+            layout.addWidget(row)
+        hint = QLabel("只读取已冻结的4份输入数据，不写业务数据库；此方案不会自动开始。")
+        hint.setObjectName("planHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        self.reject_button = QPushButton("先不预测")
+        self.reject_button.clicked.connect(self.reject_requested)
+        actions.addWidget(self.reject_button)
+        self.run_button = QPushButton("确认并开始")
+        self.run_button.setObjectName("primaryButton")
+        self.run_button.clicked.connect(lambda: self.run_requested.emit(self.plan))
+        actions.addWidget(self.run_button)
+        layout.addLayout(actions)
+
+    def set_explicit_approval(self) -> None:
+        self.status_label.setText("等待你确认")
+
+    def set_feedback_paused(self, text: str = "等待你确认") -> None:
+        self.status_label.setText(text)
+
+    def set_running(self) -> None:
+        self.status_label.setText("执行中")
+        self.run_button.hide()
+        self.reject_button.hide()
+
+    def set_finished(self, status: str = "已完成") -> None:
+        self.status_label.setText(status)
+        self.run_button.hide()
+        self.reject_button.hide()
+
+
+class ForecastResultMessageWidget(QFrame):
+    """Compact metrics and artifact links for one completed forecast run."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__()
+        self.setObjectName("resultMessage")
+        self.setMinimumWidth(560)
+        self.setMaximumWidth(720)
+        aggregate = payload.get("aggregate") or {}
+        model = aggregate.get("model") or {}
+        persistence = aggregate.get("persistence") or {}
+        day = aggregate.get("day_naive") or {}
+        week = aggregate.get("week_naive") or {}
+        warnings = [str(item) for item in payload.get("warnings", [])]
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+        title = QLabel("山东次日实时电价预测完成")
+        title.setObjectName("resultTitle")
+        layout.addWidget(title)
+        metrics = QLabel(
+            "三折 MAE："
+            f"模型 {float(model.get('mae', 0)):.2f}；"
+            f"持续法 {float(persistence.get('mae', 0)):.2f}；"
+            f"前一日同刻 {float(day.get('mae', 0)):.2f}；"
+            f"周前朴素 {float(week.get('mae', 0)):.2f}"
+        )
+        metrics.setObjectName("resultSummary")
+        metrics.setWordWrap(True)
+        layout.addWidget(metrics)
+        diagnostics = payload.get("diagnostics") or {}
+        if diagnostics.get("leakage_gate") == "passed":
+            diagnostic_label = QLabel("✓ 防泄漏门禁通过；业务数据库保持只读")
+            diagnostic_label.setObjectName("resultMeta")
+            layout.addWidget(diagnostic_label)
+        for warning in warnings:
+            label = QLabel(f"! {warning}")
+            label.setObjectName("resultWarning")
+            label.setWordWrap(True)
+            layout.addWidget(label)
+        if not warnings:
+            label = QLabel("✓ 三折聚合结果优于日/周朴素基线")
+            label.setObjectName("resultMeta")
+            layout.addWidget(label)
+        actions = QHBoxLayout()
+        figure_paths = payload.get("figure_paths") or {}
+        for title_text, path, primary in (
+            ("查看完整报告", str(payload.get("report_path", "")), True),
+            ("查看预测曲线", str(figure_paths.get("forecast", "")), False),
+            ("打开预测 CSV", str(payload.get("prediction_path", "")), False),
+            ("打开结果文件夹", str(payload.get("artifact_directory", "")), False),
+        ):
+            button = QPushButton(title_text)
+            if primary:
+                button.setObjectName("primaryButton")
+            button.setEnabled(bool(path))
+            if title_text == "查看完整报告":
+                button.clicked.connect(lambda _checked=False, value=path: open_report(value, self))
+            else:
+                button.clicked.connect(
+                    lambda _checked=False, value=path: QDesktopServices.openUrl(QUrl.fromLocalFile(value))
+                )
+            actions.addWidget(button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
 
 
 class DataDetailsDialog(QDialog):

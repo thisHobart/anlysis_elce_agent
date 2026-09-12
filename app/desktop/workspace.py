@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from math import ceil
@@ -54,6 +55,9 @@ from app.research.data.sources.summary import (
     parse_summary,
     summary_payload,
 )
+from app.research.forecasting.contracts import ForecastPlan, ForecastRunResult
+from app.research.forecasting.data import prepare_forecast_plan
+from app.research.forecasting.workflow import execute_forecast_workflow
 from app.research.graph.contracts import ApprovalState, EpisodeSummary, ResearchLoopSnapshot
 from app.research.graph.narration import (
     STAGE_LABELS,
@@ -92,6 +96,15 @@ def _known_so_far(config: StudyConfig | None) -> DataSummary | None:
 
 
 DATA_CHANGED_NOTICE = "数据换了，之前的分析方案已经作废。重新问一次，我按新数据给方案。"
+
+
+def _is_forecast_request(question: str) -> bool:
+    compact = "".join(question.lower().split())
+    return (
+        any(word in compact for word in ("预测", "预报"))
+        and any(word in compact for word in ("电价", "价格"))
+        and any(word in compact for word in ("明天", "明日", "次日", "未来24", "未来一天"))
+    )
 
 
 class ResearchWorkspace(QSplitter):
@@ -655,7 +668,12 @@ class ResearchWorkspace(QSplitter):
         """
 
         session = self.current_session
-        anchor = (session.current_plan or {}).get("data_fingerprint") or session.dataset_fingerprint
+        current_plan = session.current_plan or {}
+        anchor = (
+            current_plan.get("source_data_fingerprint")
+            if current_plan.get("plan_kind") == "forecast"
+            else current_plan.get("data_fingerprint")
+        ) or session.dataset_fingerprint
         session.dataset_fingerprint = fingerprint
         if fingerprint is not None and anchor is not None and fingerprint == anchor:
             return False
@@ -723,7 +741,15 @@ class ResearchWorkspace(QSplitter):
     def submit_question(self, question: str) -> None:
         if self.is_busy:
             return
+        if _is_forecast_request(question):
+            self._submit_forecast_request(question)
+            return
         session = self.current_session
+        if (session.current_plan or {}).get("plan_kind") == "forecast":
+            session.current_plan = None
+            session.plan_stale = False
+            if self.agent.has_thread(session.session_id):
+                self.agent.delete_thread(session.session_id)
         try:
             time_request = parse_chat_time_range(question)
         except ValueError as exc:
@@ -801,6 +827,94 @@ class ResearchWorkspace(QSplitter):
             success_handler=self._loop_completed,
         )
         self.conversation.scroll_to_bottom()
+
+    def _submit_forecast_request(self, question: str) -> None:
+        """Prepare the fixed P3 plan without allowing chat text to alter its parameters."""
+
+        session = self.current_session
+        self._cancel_plan_feedback_window()
+        if session.current_plan is not None:
+            self._set_plan_message_state("stale")
+            session.current_plan = None
+        if self.agent.has_thread(session.session_id):
+            self.agent.delete_thread(session.session_id)
+        session.derive_title(question)
+        self._append_message(
+            SessionMessage(role="user", kind="text", content=question, turn_id=uuid4().hex)
+        )
+        self._add_trace("user", "提交山东实时电价预测", "completed", question)
+        if session.source_kind != "database":
+            self._fail_before_task("P3最小预测不读取本地任意文件；请先在右侧选择山东并完成取数。")
+            return
+        if not session.region_id:
+            self._fail_before_task("还没有选择地区。请先在右侧选择山东并完成取数。")
+            return
+        if session.region_id != "shandong":
+            self._fail_before_task("P3最小预测当前只支持山东省级实时电价；四川暂不进入预测分支。")
+            return
+        if session.data_state != "ready" or not session.inputs["target"].path:
+            self._fail_before_task("山东数据还没有准备好。请先完成取数，再发起次日预测。")
+            return
+        profile = self.region_profiles.get("shandong")
+        if profile is None:
+            self._fail_before_task("当前安装中缺少山东数据配置，无法固定预测输入。")
+            return
+        session.status = "inspecting_data"
+        self._start_thinking("setup", "准备预测输入", "选择3个历史锚点并固定4份只读数据")
+        self._start_worker(
+            kind="forecast_prepare",
+            operation=lambda progress: prepare_forecast_plan(
+                question=question,
+                profile=profile,
+                target_path=session.inputs["target"].path,
+                actuals_path=session.inputs["actuals"].path or None,
+                forecasts_path=session.inputs["forecasts"].path or None,
+                output_directory=self.research_output_directory / "forecasting",
+                source_data_fingerprint=session.dataset_fingerprint,
+                progress=progress,
+                snapshot_fetcher=self.region_fetcher,
+            ),
+            success_handler=self._forecast_plan_completed,
+            failure_handler=self._forecast_prepare_failed,
+        )
+
+    def _forecast_prepare_failed(self, detail: str) -> None:
+        headline = detail.strip().splitlines()[-1] if detail.strip() else "预测输入检查失败"
+        if "ForecastDataError" in detail:
+            headline = headline.removeprefix("app.research.forecasting.data.ForecastDataError: ")
+        session = self.current_session
+        session.status = "failed"
+        self._close_latest_running_trace("failed")
+        self._set_active_tool_status("failed", headline)
+        self._append_message(
+            SessionMessage(role="assistant", kind="error", content=f"预测方案没有生成：{headline}")
+        )
+        self._add_trace("error", "预测输入检查未通过", "failed", headline)
+        self._persist_and_render(keep_timeline=True)
+
+    def _forecast_plan_completed(self, plan: ForecastPlan) -> None:
+        session = self.current_session
+        self._complete_active_tool("4份预测输入已冻结")
+        session.current_plan = plan.model_dump(mode="json")
+        session.plan_stale = False
+        session.status = "awaiting_plan_approval"
+        self._append_message(
+            SessionMessage(
+                role="assistant",
+                kind="forecast_plan",
+                content="山东次日实时电价预测方案等待确认",
+                payload={"plan": plan.model_dump(mode="json"), "state": "awaiting"},
+            )
+        )
+        if self.conversation.current_plan_widget is not None:
+            self.conversation.current_plan_widget.set_explicit_approval()
+        self._add_trace(
+            "plan",
+            "生成山东实时电价预测方案",
+            "completed",
+            "3个历史回测锚点、1份次日数据；必须显式确认",
+        )
+        self._persist_and_render(keep_timeline=True)
 
     def _legacy_graph_import(self, session: ResearchSession) -> dict[str, Any]:
         latest_run = None
@@ -1350,9 +1464,13 @@ class ResearchWorkspace(QSplitter):
             session.inputs[role].status = "warning" if any(item.status == "warning" for item in evidence) else "ready"
             session.inputs[role].detail = f"{len(evidence)} 个变量已校验"
 
-    def run_plan(self, approved_plan: EDAPlan) -> None:
+    def run_plan(self, approved_plan: object) -> None:
         if self.is_busy:
             return
+        if isinstance(approved_plan, ForecastPlan):
+            self._run_forecast_plan(approved_plan)
+            return
+        approved_plan = EDAPlan.model_validate(approved_plan)
         self._cancel_plan_feedback_window()
         session = self.current_session
         session.current_plan = approved_plan.model_dump(mode="json")
@@ -1404,10 +1522,121 @@ class ResearchWorkspace(QSplitter):
         )
         self.conversation.scroll_to_bottom()
 
+    def _run_forecast_plan(self, approved_plan: ForecastPlan) -> None:
+        """Run only the four immutable files accepted in the forecast card."""
+
+        self._cancel_plan_feedback_window()
+        session = self.current_session
+        session.current_plan = approved_plan.model_dump(mode="json")
+        session.status = "running"
+        self._set_plan_message_state("running", plan=approved_plan)
+        if self.conversation.current_plan_widget is not None:
+            self.conversation.current_plan_widget.set_running()
+        self._append_message(
+            SessionMessage(
+                role="assistant",
+                kind="text",
+                content="好的，开始做3个历史锚点回测，然后生成次日96点预测。训练只使用CPU和已固定数据。",
+            )
+        )
+        self._start_thinking("compute", "启动山东电价预测", "回测 1/3 即将开始")
+        self._add_trace("plan", "预测方案已确认", "completed", "只读运行，不写业务数据库")
+        self._start_worker(
+            kind="forecast_execute",
+            operation=lambda progress: execute_forecast_workflow(
+                approved_plan,
+                progress=progress,
+            ),
+            success_handler=self._forecast_run_completed,
+        )
+        self.conversation.scroll_to_bottom()
+
+    def _forecast_run_completed(self, result: ForecastRunResult) -> None:
+        session = self.current_session
+        self._complete_active_tool("3折回测和次日96点预测已完成")
+        aggregate = {
+            name: metrics.model_dump(mode="json") for name, metrics in result.aggregate.items()
+        }
+        self._append_message(
+            SessionMessage(
+                role="assistant",
+                kind="forecast_result",
+                content="山东次日实时电价预测完成",
+                payload={
+                    "run_id": result.run_id,
+                    "aggregate": aggregate,
+                    "diagnostics": result.diagnostics,
+                    "warnings": result.warnings,
+                    "prediction_path": str(result.prediction_path),
+                    "backtest_path": str(result.backtest_path),
+                    "metrics_path": str(result.metrics_path),
+                    "report_path": str(result.report_path),
+                    "artifact_directory": str(result.artifact_directory),
+                    "figure_paths": {
+                        name: str(path) for name, path in result.figure_paths.items()
+                    },
+                    "output_hash": result.output_hash,
+                },
+            )
+        )
+        session.run_id = result.run_id
+        session.artifact_directory = str(result.artifact_directory)
+        session.report_path = str(result.report_path)
+        session.runs.append(
+            SessionRunRecord(
+                run_id=result.run_id,
+                run_kind="forecast",
+                plan_id=result.plan.plan_id,
+                parent_run_id=session.runs[-1].run_id if session.runs else None,
+                question=result.plan.question,
+                artifact_directory=str(result.artifact_directory),
+                report_path=str(result.report_path),
+                evaluation={
+                    "decision": "accept" if result.baseline_verified else "need_user",
+                    "summary": (
+                        "三折已验证出预测增益"
+                        if result.baseline_verified
+                        else "未验证出预测增益"
+                    ),
+                    "warnings": result.warnings,
+                    "aggregate": aggregate,
+                },
+                data_fingerprint=result.plan.data_fingerprint,
+                study_name="山东省级实时电价次日预测",
+                target_name="rt_price",
+                study_start_time=result.plan.forecast_start.isoformat(),
+                study_end_time=result.plan.forecast_end.isoformat(),
+            )
+        )
+        session.status = "completed"
+        self._set_plan_message_state("completed")
+        self._add_trace(
+            "artifact",
+            "生成预测研究包",
+            "completed",
+            f"CSV、报告、回测逐点结果和2张SVG；哈希 {result.output_hash[:12]}",
+        )
+        self._persist_and_render(keep_timeline=True)
+
     def reject_plan(self) -> None:
         """Reject the plan through the typed Graph command instead of chat text."""
 
-        if self.is_busy or not self.agent.has_thread(self.current_session.session_id):
+        if self.is_busy:
+            return
+        if (self.current_session.current_plan or {}).get("plan_kind") == "forecast":
+            self._cancel_plan_feedback_window()
+            self._set_plan_message_state("stopped")
+            if self.conversation.current_plan_widget is not None:
+                self.conversation.current_plan_widget.set_finished("已拒绝")
+            self.current_session.current_plan = None
+            self.current_session.status = "stopped"
+            self._append_message(
+                SessionMessage(role="system", kind="notice", content="已取消这次预测，没有启动训练。")
+            )
+            self._add_trace("plan", "预测方案被拒绝", "stopped", "未启动训练")
+            self._persist_and_render(keep_timeline=True)
+            return
+        if not self.agent.has_thread(self.current_session.session_id):
             return
         self._cancel_plan_feedback_window()
         self._set_plan_message_state("stopped")
@@ -1466,6 +1695,7 @@ class ResearchWorkspace(QSplitter):
     def _task_cancelled(self) -> None:
         self._pending_execute_plan = None
         session = self.current_session
+        self._record_forecast_terminal("cancelled", "用户取消运行")
         if self.agent.has_thread(session.session_id):
             self.agent.cancel(session.session_id)
         session.status = "stopped"
@@ -1479,6 +1709,7 @@ class ResearchWorkspace(QSplitter):
     def _task_failed(self, detail: str) -> None:
         self._pending_execute_plan = None
         session = self.current_session
+        self._record_forecast_terminal("failed", detail)
         session.status = "failed"
         self._close_latest_running_trace("failed")
         self._set_plan_message_state("failed")
@@ -1487,6 +1718,35 @@ class ResearchWorkspace(QSplitter):
         self._append_message(SessionMessage(role="assistant", kind="error", content=f"这一步没能完成：{headline}"))
         self._add_trace("error", "本轮研究未完成", "failed", headline)
         self._persist_and_render(keep_timeline=True)
+
+    def _record_forecast_terminal(self, status: str, detail: str) -> None:
+        """Keep failed and cancelled forecast experiments beside their frozen inputs."""
+
+        if self._task_kind not in {"forecast_prepare", "forecast_execute"}:
+            return
+        value = self.current_session.current_plan or {}
+        if value.get("plan_kind") != "forecast":
+            return
+        try:
+            plan = ForecastPlan.model_validate(value)
+            root = next(item.path.parent.parent for item in plan.snapshots if item.role == "future")
+            destination = root / "provenance" / "run_status.json"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(
+                json.dumps(
+                    {
+                        "plan_id": plan.plan_id,
+                        "status": status,
+                        "recorded_at": datetime.now(UTC).isoformat(),
+                        "detail": detail.strip().splitlines()[-1] if detail.strip() else "",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except (OSError, StopIteration, ValueError):
+            return
 
     def _fail_before_task(self, message: str) -> None:
         self.current_session.status = "failed"
@@ -1541,7 +1801,10 @@ class ResearchWorkspace(QSplitter):
             "review": "evaluating",
             "answer": "evaluating",
             "issue": "understanding",
-        }.get(step.stage, "running" if self._task_kind == "execute" else "understanding")  # type: ignore[assignment]
+        }.get(
+            step.stage,
+            "running" if self._task_kind in {"execute", "forecast_execute"} else "understanding",
+        )  # type: ignore[assignment]
         if message != self._last_progress_message:
             self._append_thinking_step(step.stage, step.title, step.detail, step.function_name)
             self._close_latest_running_trace("completed")
@@ -1679,9 +1942,18 @@ class ResearchWorkspace(QSplitter):
             event.status = status  # type: ignore[assignment]
             self.context.trace.set_events(self.current_session.trace)
 
-    def _set_plan_message_state(self, state: str, *, plan: EDAPlan | None = None) -> None:
+    def _set_plan_message_state(
+        self,
+        state: str,
+        *,
+        plan: EDAPlan | ForecastPlan | None = None,
+    ) -> None:
         message = next(
-            (item for item in reversed(self.current_session.messages) if item.kind in {"plan", "data_plan"}),
+            (
+                item
+                for item in reversed(self.current_session.messages)
+                if item.kind in {"plan", "data_plan", "forecast_plan"}
+            ),
             None,
         )
         if message is None:

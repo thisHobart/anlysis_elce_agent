@@ -296,6 +296,27 @@ class RegionPriceFetch:
         }
 
 
+@dataclass(frozen=True)
+class RegionalSnapshot:
+    """Immutable, read-only point-in-time view used by forecasting workflows."""
+
+    profile: RegionProfile
+    as_of: datetime
+    path: Path
+    actuals_path: Path | None
+    forecasts_path: Path | None
+    source: RegionPriceFetch = field(repr=False)
+
+    def read_target(self) -> pd.DataFrame:
+        return pd.read_parquet(self.path)
+
+    def read_actuals(self) -> pd.DataFrame:
+        return pd.read_parquet(self.actuals_path) if self.actuals_path else pd.DataFrame()
+
+    def read_forecasts(self) -> pd.DataFrame:
+        return pd.read_parquet(self.forecasts_path) if self.forecasts_path else pd.DataFrame()
+
+
 def region_catalog_path() -> Path | None:
     """Locate the non-secret catalog in a checkout, bundle, or operator override."""
 
@@ -1407,4 +1428,31 @@ def fetch_region_price(
         query_start_at=query_start,
         query_metrics=tuple(metrics),
         cache_generation=generation,
+    )
+
+
+def fetch_regional_snapshot(
+    profile: RegionProfile,
+    *,
+    as_of: datetime,
+    output_directory: str | Path,
+    progress: Callable[[int, str], None] | None = None,
+    connection_factory: Callable[[DatabaseCredentials], Any] = _connect,
+) -> RegionalSnapshot:
+    """Freeze a historical database view without mutating the desktop cache pointer."""
+
+    fetched = fetch_region_price(
+        profile,
+        output_directory=output_directory,
+        progress=progress,
+        now=as_of,
+        connection_factory=connection_factory,
+    )
+    return RegionalSnapshot(
+        profile=profile,
+        as_of=as_of,
+        path=fetched.path,
+        actuals_path=fetched.actuals_path,
+        forecasts_path=fetched.forecasts_path,
+        source=fetched,
     )

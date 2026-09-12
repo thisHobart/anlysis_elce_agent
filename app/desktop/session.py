@@ -33,7 +33,18 @@ InputRole = Literal["target", "actuals", "forecasts"]
 InputStatus = Literal["empty", "selected", "loading", "ready", "warning", "failed", "changed"]
 DataPanelState = Literal["empty", "exploring", "ready", "unavailable"]
 DataSourceKind = Literal["database", "file"]
-MessageKind = Literal["text", "notice", "thinking", "tool", "plan", "data_plan", "result", "error"]
+MessageKind = Literal[
+    "text",
+    "notice",
+    "thinking",
+    "tool",
+    "plan",
+    "data_plan",
+    "forecast_plan",
+    "result",
+    "forecast_result",
+    "error",
+]
 TraceCategory = Literal["session", "user", "agent", "input", "plan", "tool", "evaluation", "artifact", "error"]
 
 
@@ -119,6 +130,7 @@ class SessionRunRecord(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     run_id: str
+    run_kind: Literal["eda", "forecast"] = "eda"
     episode_id: str | None = None
     plan_id: str
     parent_run_id: str | None = None
@@ -137,7 +149,7 @@ class SessionRunRecord(BaseModel):
     memory_status: Literal["active", "stale"] = "active"
 
 
-SESSION_SCHEMA_VERSION = 14
+SESSION_SCHEMA_VERSION = 15
 """Projection schema written by this build; bump it whenever stored sessions change shape."""
 
 
@@ -223,7 +235,8 @@ def _stored_plans(session: ResearchSession) -> list[dict[str, Any]]:
     plans.extend(
         message.payload["plan"]
         for message in session.messages
-        if message.kind in {"plan", "data_plan"} and isinstance(message.payload.get("plan"), dict)
+        if message.kind in {"plan", "data_plan", "forecast_plan"}
+        and isinstance(message.payload.get("plan"), dict)
     )
     return plans
 
@@ -267,6 +280,10 @@ def _migrate_13_to_14(session: ResearchSession) -> None:
     """Persist an optional chat-selected analysis time range."""
 
 
+def _migrate_14_to_15(session: ResearchSession) -> None:
+    """Distinguish legacy EDA runs from P3 forecast runs."""
+
+
 SESSION_MIGRATIONS: dict[int, Callable[[ResearchSession], None]] = {
     **{version: _carry_forward for version in range(1, 7)},
     7: _migrate_7_to_8,
@@ -276,6 +293,7 @@ SESSION_MIGRATIONS: dict[int, Callable[[ResearchSession], None]] = {
     11: _migrate_11_to_12,
     12: _migrate_12_to_13,
     13: _migrate_13_to_14,
+    14: _migrate_14_to_15,
 }
 
 
@@ -295,7 +313,11 @@ def _apply_session_invariants(
         session.plan_stale = True
         session.status = "idle"
     for message in session.messages:
-        stored_plan = message.payload.get("plan") if message.kind in {"plan", "data_plan"} else None
+        stored_plan = (
+            message.payload.get("plan")
+            if message.kind in {"plan", "data_plan", "forecast_plan"}
+            else None
+        )
         if isinstance(stored_plan, dict) and not plan_is_executable(stored_plan, skill_versions):
             message.kind = "notice"
             message.content = STALE_PLAN_NOTICE
@@ -309,6 +331,14 @@ def plan_is_executable(plan: dict[str, Any], skill_versions: dict[str, str] | No
     ``skill_versions`` is injected because the Skill registry lives outside this projection.
     """
 
+    if plan.get("plan_kind") == "forecast":
+        try:
+            from app.research.forecasting.contracts import ForecastPlan
+
+            forecast = ForecastPlan.model_validate(plan)
+        except (ImportError, ValueError):
+            return False
+        return all(item.path.is_file() for item in forecast.snapshots)
     if plan.get("planner") != "llm" or not plan.get("skill_name") or not plan.get("skill_version"):
         return False
     if skill_versions is not None:

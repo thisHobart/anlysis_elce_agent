@@ -95,6 +95,9 @@ def validate_built_executable(executable: Path, *, build_root: Path) -> dict[str
             raise SystemExit(f"Built EXE smoke result is incomplete: {payload}")
         if payload.get("function_count") != 30 or not payload.get("window_constructed"):
             raise SystemExit(f"Built EXE did not load the complete Phase 1 runtime: {payload}")
+        forecast_runtime = payload.get("forecast_runtime") or {}
+        if forecast_runtime.get("device") != "cpu" or not forecast_runtime.get("torch_available"):
+            raise SystemExit(f"Built EXE did not load the P3 CPU forecast runtime: {payload}")
         expected_app_data = (temporary / "app-data").resolve()
         expected_research = (temporary / "research").resolve()
         session_store = Path(str(payload.get("session_store_path", ""))).resolve()
@@ -123,11 +126,8 @@ def main(argv: list[str] | None = None) -> int:
         "qdrant_client",
         "sentence_transformers",
         "transformers",
-        "torch",
         "torchvision",
         "torchaudio",
-        "sklearn",
-        "sympy",
         "pypdf",
         "pytest",
         "IPython",
@@ -180,6 +180,10 @@ def main(argv: list[str] | None = None) -> int:
                 "--hidden-import=pyarrow",
                 "--hidden-import=pyarrow.parquet",
                 "--hidden-import=pymysql",
+                # P3 imports the model only after explicit approval, so keep
+                # the lazily reached CPU runtime visible to PyInstaller.
+                "--hidden-import=torch",
+                "--hidden-import=sklearn.preprocessing",
                 *skill_args,
                 word_list_arg,
                 region_catalog_arg,

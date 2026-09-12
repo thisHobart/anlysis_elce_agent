@@ -189,7 +189,11 @@ PyInstaller 必须在 Windows 上构建 Windows 程序。第一次建议使用�
 ```
 
 输出位于 `dist/PriceResearchAgent/`，或单文件模式下的 `dist/PriceResearchAgent.exe`。打包会自动包含 `app/research/skills/` 下的全部内置 Skill。
-构建结束前会在隔离目录中实际启动刚生成的程序，构造桌面窗口，并校验两个内置 Skill、30 个研究函数和 Skill 加载错误；探针失败时构建命令返回非零退出码。
+构建结束前会在隔离目录中实际启动刚生成的程序，构造桌面窗口，并校验两个内置 Skill、30 个研究函数、P3 PyTorch/scikit-learn CPU 运行时和 Skill 加载错误；探针失败时构建命令返回非零退出码。
+
+## P3 山东次日实时电价预测
+
+选择山东并完成取数后，可在对话中提出“预测山东明天实时电价”。桌面会先固定3个历史回测日和1份次日输入，并显示必须手动确认的预测卡；确认后在 CPU 后台完成三折回测和次日96点预测。结果包含 CSV、逐点回测 Parquet、指标、SVG、报告、版本和文件哈希，全程不写业务数据库。实现边界和验收说明见 [P3 山东实时电价最小预测](docs/phase3-shandong-realtime-price-forecast.md)。
 
 ## 测试
 

@@ -622,7 +622,11 @@ def build_research_workflow(
                 ),
             }
         update = {
-            "phase": "planning" if decision.intent in {"new_plan", "revise_plan"} else "understanding",
+            "phase": (
+                "planning"
+                if decision.intent in {"new_plan", "revise_plan", "new_forecast_plan"}
+                else "understanding"
+            ),
             "control": decision.intent if decision.intent != "discussion" else "reply",
             "decision": decision.model_dump(mode="json"),
             "events": _event(
@@ -638,6 +642,8 @@ def build_research_workflow(
 
     def route_main(state: ResearchLoopState) -> Literal["new_plan", "revise_plan", "execute_plan", "reply", "need_user"]:
         control = state.get("control", "reply")
+        if control in {"new_forecast_plan", "execute_forecast_plan"}:
+            return "reply"
         if control == "execute_plan" and _plan(state) is None:
             return "reply"
         return control if control in {"new_plan", "revise_plan", "execute_plan", "need_user"} else "reply"  # type: ignore[return-value]

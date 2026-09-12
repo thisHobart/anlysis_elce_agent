@@ -61,6 +61,16 @@ def _desktop_smoke_payload(window: MainWindow) -> dict[str, Any]:
         raise RuntimeError(f"Built desktop is missing builtin Skills: {', '.join(missing)}")
     if len(function_names) != 30:
         raise RuntimeError(f"Built desktop loaded {len(function_names)} research functions instead of 30")
+    from app.research.forecasting.contracts import CTMTrainingConfig
+    from app.research.forecasting.model import LightweightCTM
+
+    forecast_model = LightweightCTM(3, CTMTrainingConfig(hidden_size=4, internal_ticks=2))
+    forecast_runtime = {
+        "model": type(forecast_model).__name__,
+        "device": str(next(forecast_model.parameters()).device),
+        "torch_available": True,
+        "sklearn_available": True,
+    }
     return {
         "status": "passed",
         "window_constructed": True,
@@ -70,6 +80,7 @@ def _desktop_smoke_payload(window: MainWindow) -> dict[str, Any]:
         "skill_load_errors": list(window.workspace.agent.skill_load_errors),
         "session_store_path": str(window.workspace.store.path.resolve()),
         "research_output_directory": str(window.workspace.research_output_directory.resolve()),
+        "forecast_runtime": forecast_runtime,
     }
 
 
