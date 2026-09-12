@@ -407,6 +407,36 @@ def variables_markup(variables: list[VariableLabel]) -> str:
     )
 
 
+def factor_kind(variable: VariableLabel) -> str:
+    """Classify old and new summaries without guessing when source metadata exists."""
+
+    if variable.kind in {"actual", "forecast"}:
+        return variable.kind
+    folded = variable.display.casefold()
+    forecast_markers = ("预测", "forecast", "fcst", "prediction", "predicted")
+    return "forecast" if any(marker in folded for marker in forecast_markers) else "actual"
+
+
+def factor_groups(variables: list[VariableLabel]) -> tuple[list[VariableLabel], list[VariableLabel]]:
+    """Return actual and forecast factors in their original, reproducible order."""
+
+    actual = [item for item in variables if factor_kind(item) == "actual"]
+    forecast = [item for item in variables if factor_kind(item) == "forecast"]
+    return actual, forecast
+
+
+def variables_summary_markup(variables: list[VariableLabel]) -> str:
+    """Compact factor content for the narrow context panel."""
+
+    actual, forecast = factor_groups(variables)
+    parts = []
+    if actual:
+        parts.append(f"实际值 {len(actual)} 项")
+    if forecast:
+        parts.append(f"预测值 {len(forecast)} 项")
+    return "、".join(parts)
+
+
 class DataRow(QWidget):
     """One field of the dataset description: its name, its value, and how settled it is."""
 
@@ -482,6 +512,7 @@ class DataCard(QFrame):
         *,
         exploring: bool = False,
         max_variables: int | None = None,
+        summarize_variables: bool = False,
     ) -> None:
         """Fill the card from the one description the UI is allowed to read."""
 
@@ -496,13 +527,16 @@ class DataCard(QFrame):
         if shown_variables and exploring:
             markup = "正在核对：" + "、".join(escape(item.display) for item in shown_variables)
             state = "pending"
+        elif variables and summarize_variables:
+            markup = variables_summary_markup(variables)
+            state = "settled"
         else:
             markup = variables_markup(shown_variables)
             state = "settled" if variables else unsettled
-        if max_variables and len(variables) > max_variables:
+        if not summarize_variables and max_variables and len(variables) > max_variables:
             markup = f"{markup}…（共 {len(variables)} 项）"
         tooltip_parts = []
-        if len(shown_variables) < len(variables):
+        if summarize_variables or len(shown_variables) < len(variables):
             tooltip_parts.append("、".join(item.display for item in variables))
         if any(not item.resolved for item in variables):
             tooltip_parts.append("这项数据还没配中文名")
@@ -549,10 +583,8 @@ class FactorListDialog(QDialog):
         layout.addWidget(self.tree, 1)
 
         self._groups: list[QTreeWidgetItem] = []
-        grouped = (
-            ("实际值", [item for item in variables if "预测" not in item.display]),
-            ("预测值", [item for item in variables if "预测" in item.display]),
-        )
+        actual, forecast = factor_groups(variables)
+        grouped = (("实际值", actual), ("预测值", forecast))
         for title, items in grouped:
             if not items:
                 continue
@@ -627,7 +659,7 @@ class DataPanel(QFrame):
         header.addStretch(1)
         self.region_button = QPushButton("地区：待选择")
         self.region_button.setObjectName("quietButton")
-        self.region_button.setToolTip("选择本次会话使用的地区并取数")
+        self.region_button.setToolTip("选择本次会话使用的地区；同一地区已有数据时直接复用，更新请点“取最新的”")
         self.region_menu = QMenu(self.region_button)
         self.region_button.setMenu(self.region_menu)
         header.addWidget(self.region_button)
@@ -790,7 +822,7 @@ class DataPanel(QFrame):
         else:
             self._spinner.stop()
         if state == "ready":
-            self.ready_card.apply(summary, max_variables=4)
+            self.ready_card.apply(summary, summarize_variables=True)
             self._apply_variables_menu(summary)
             self.fetched_label.setText(f"数据取自{summary.fetched_at_text}" if summary else "")
         if state == "unavailable":
@@ -846,8 +878,8 @@ class DataPanel(QFrame):
         """Expose long factor lists without making the context panel excessively tall."""
 
         variables = summary.variables if summary else []
-        self.variables_button.setVisible(len(variables) > 4)
-        if len(variables) <= 4:
+        self.variables_button.setVisible(bool(variables))
+        if not variables:
             return
         self.variables_button.setText(f"查看全部 {len(variables)} 项影响因素")
 

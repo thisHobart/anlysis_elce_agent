@@ -8,13 +8,18 @@ fingerprint, and immutable-snapshot boundaries stay unchanged.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
+import shutil
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from time import perf_counter
 from typing import Any
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -28,6 +33,9 @@ from app.runtime_paths import application_data_directory, source_worktree
 REGION_CATALOG_FILENAME = "region_databases.yaml"
 REGION_CATALOG_ENVIRONMENT_VARIABLE = "PRICE_RESEARCH_REGION_DATABASES"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+REGION_CACHE_FORMAT_VERSION = 1
+REGION_CACHE_POINTER = "current.json"
+REGION_FETCH_MANIFEST = "fetch.json"
 
 
 class RegionSourceError(RuntimeError):
@@ -62,6 +70,8 @@ class RegionProfile:
     credential_prefix: str
     price_table: str
     price_label: str
+    history_start_date: date = date(1970, 1, 1)
+    refresh_lookback_days: int = 30
     analytics_credential_prefix: str | None = None
     weather_actual_table: str | None = None
     weather_forecast_table: str | None = None
@@ -81,6 +91,17 @@ class RegionProfile:
     available_at_column: str = "create_time"
 
     def __post_init__(self) -> None:
+        if isinstance(self.history_start_date, str):
+            object.__setattr__(self, "history_start_date", date.fromisoformat(self.history_start_date))
+        if not isinstance(self.history_start_date, date):
+            raise TypeError(f"invalid history start date in region {self.region_id}")
+        try:
+            lookback_days = int(self.refresh_lookback_days)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid refresh lookback in region {self.region_id}") from exc
+        object.__setattr__(self, "refresh_lookback_days", lookback_days)
+        if lookback_days < 1:
+            raise ValueError(f"refresh lookback must be positive in region {self.region_id}")
         object.__setattr__(self, "weather_columns", tuple(self.weather_columns))
         for field_name in ("actual_series", "forecast_series"):
             raw_series = getattr(self, field_name)
@@ -161,11 +182,19 @@ class RegionPriceFetch:
     forecast_variable_names: tuple[str, ...] = ()
     series_details: dict[str, Any] = field(default_factory=dict)
     weather_details: dict[str, Any] = field(default_factory=dict)
+    fetch_mode: str = "full"
+    query_start_at: datetime | None = None
+    query_metrics: tuple[dict[str, Any], ...] = ()
+    cache_generation: str = ""
 
     def summary(self) -> DataSummary:
         table_names = {self.profile.target_name: self.profile.price_table}
         table_names.update({item.name: item.table for item in self.profile.actual_series})
         table_names.update({item.name: item.table for item in self.profile.forecast_series})
+        variable_kinds = {
+            **{name: "actual" for name in self.actual_variable_names},
+            **{name: "forecast" for name in self.forecast_variable_names},
+        }
         return build_summary(
             market=self.profile.market,
             target_name=self.profile.target_name,
@@ -175,6 +204,7 @@ class RegionPriceFetch:
             frequency=self.profile.frequency,
             fetched_at=self.fetched_at,
             table_names=table_names,
+            variable_kinds=variable_kinds,
         )
 
     def safe_details(self) -> dict[str, Any]:
@@ -196,6 +226,10 @@ class RegionPriceFetch:
             "invalid_rows": self.invalid_rows,
             "series": self.series_details,
             "weather": self.weather_details,
+            "fetch_mode": self.fetch_mode,
+            "query_start_at": self.query_start_at.isoformat() if self.query_start_at else "",
+            "query_metrics": list(self.query_metrics),
+            "cache_generation": self.cache_generation,
         }
 
 
@@ -339,10 +373,66 @@ def _price_query(profile: RegionProfile, table: str | None = None) -> str:
     return (
         f"SELECT {columns} FROM {quote(table or profile.price_table)} "
         f"WHERE {quote(profile.province_column)}=%s AND {quote(profile.type_column)}=%s "
-        f"AND {quote(profile.available_at_column)}<=%s AND {business_time}<=%s "
+        f"AND {quote(profile.date_column)}>=%s AND {quote(profile.date_column)}<=%s "
+        f"AND {quote(profile.available_at_column)}<=%s "
+        f"AND {business_time}>=%s AND {business_time}<=%s "
         f"ORDER BY {quote(profile.date_column)},{quote(profile.hour_column)},{quote(profile.minute_column)},"
         f"{quote(profile.available_at_column)}"
     )
+
+
+def _price_parameters(
+    profile: RegionProfile,
+    *,
+    start: datetime,
+    cutoff: datetime,
+) -> tuple[Any, ...]:
+    return (
+        profile.province_value,
+        profile.type_value,
+        start.date(),
+        cutoff.date(),
+        cutoff,
+        start,
+        cutoff,
+    )
+
+
+def _series_group_query(
+    profile: RegionProfile,
+    series_group: tuple[RegionalSeries, ...],
+    *,
+    future: bool,
+    start: datetime,
+    cutoff: datetime,
+) -> tuple[str, tuple[Any, ...]]:
+    first = series_group[0]
+    type_values = tuple(item.type_value for item in series_group if item.type_value is not None)
+    type_filter = ""
+    selected_type = ""
+    if type_values:
+        placeholders = ",".join("%s" for _value in type_values)
+        type_filter = f" AND `{profile.type_column}` IN ({placeholders})"
+        selected_type = f",`{profile.type_column}`"
+    upper_date_filter = "" if future else f" AND `{profile.date_column}`<=%s"
+    upper_time_filter = "" if future else f" AND {_business_time_sql(profile)}<=%s"
+    sql = (
+        f"SELECT `{profile.date_column}`,`{profile.hour_column}`,`{profile.minute_column}`,"
+        f"`{first.value_column}`,`{profile.available_at_column}`{selected_type} FROM `{first.table}` "
+        f"WHERE `{profile.province_column}`=%s{type_filter} "
+        f"AND `{profile.date_column}`>=%s{upper_date_filter} "
+        f"AND `{profile.available_at_column}`<=%s "
+        f"AND {_business_time_sql(profile)}>=%s{upper_time_filter} "
+        f"ORDER BY `{profile.date_column}`,`{profile.hour_column}`,`{profile.minute_column}`,"
+        f"`{profile.available_at_column}`"
+    )
+    parameters: list[Any] = [profile.province_value, *type_values, start.date()]
+    if not future:
+        parameters.append(cutoff.date())
+    parameters.extend((cutoff, start))
+    if not future:
+        parameters.append(cutoff)
+    return sql, tuple(parameters)
 
 
 def _series_query(
@@ -351,24 +441,17 @@ def _series_query(
     *,
     future: bool,
     cutoff: datetime,
+    start: datetime | None = None,
 ) -> tuple[str, tuple[Any, ...]]:
-    type_filter = "" if series.type_value is None else f" AND `{profile.type_column}`=%s"
-    future_filter = "" if future else f" AND {_business_time_sql(profile)}<=%s"
-    sql = (
-        f"SELECT `{profile.date_column}`,`{profile.hour_column}`,`{profile.minute_column}`,"
-        f"`{series.value_column}`,`{profile.available_at_column}` FROM `{series.table}` "
-        f"WHERE `{profile.province_column}`=%s{type_filter} "
-        f"AND `{profile.available_at_column}`<=%s{future_filter} "
-        f"ORDER BY `{profile.date_column}`,`{profile.hour_column}`,`{profile.minute_column}`,"
-        f"`{profile.available_at_column}`"
+    """Compatibility wrapper for callers that need a single configured series."""
+
+    return _series_group_query(
+        profile,
+        (series,),
+        future=future,
+        start=start or datetime.combine(profile.history_start_date, time.min),
+        cutoff=cutoff,
     )
-    parameters: list[Any] = [profile.province_value]
-    if series.type_value is not None:
-        parameters.append(series.type_value)
-    parameters.append(cutoff)
-    if not future:
-        parameters.append(cutoff)
-    return sql, tuple(parameters)
 
 
 def _normalize_business_series(
@@ -444,19 +527,31 @@ def _weather_query(profile: RegionProfile, table: str, *, future: bool) -> str:
     future_limit = "" if future else " AND `forecast_time`<=%s"
     return (
         f"SELECT `forecast_time`,{columns},`create_time` FROM `{table}` "
-        f"WHERE `province_name`=%s AND `create_time`<=%s{future_limit} "
+        f"WHERE `province_name`=%s AND `forecast_time`>=%s "
+        f"AND `create_time`<=%s{future_limit} "
         "ORDER BY `forecast_time`,`create_time`"
     )
 
 
-def _daily_weather_profile(connection: Any, profile: RegionProfile, cutoff: datetime) -> dict[str, Any]:
+def _daily_weather_profile(
+    connection: Any,
+    profile: RegionProfile,
+    start: datetime,
+    cutoff: datetime,
+    metrics: list[dict[str, Any]],
+) -> dict[str, Any]:
     if profile.weather_daily_table is None:
         return {}
-    frame = _query_frame(
+    frame = _timed_query(
         connection,
-        f"SELECT COUNT(*) rows_total,MIN(`forecast_date`) start_date,MAX(`forecast_date`) end_date "
-        f"FROM `{profile.weather_daily_table}` WHERE `province_name`=%s AND `create_time`<=%s",
-        (profile.province_value, cutoff),
+        label=f"weather_daily:{profile.weather_daily_table}",
+        sql=(
+            f"SELECT COUNT(*) rows_total,MIN(`forecast_date`) start_date,MAX(`forecast_date`) end_date "
+            f"FROM `{profile.weather_daily_table}` WHERE `province_name`=%s "
+            "AND `forecast_date`>=%s AND `create_time`<=%s"
+        ),
+        parameters=(profile.province_value, start.date(), cutoff),
+        metrics=metrics,
     )
     if frame.empty:
         return {"table": profile.weather_daily_table, "rows": 0}
@@ -550,6 +645,152 @@ def _write_parquet_atomic(frame: pd.DataFrame, destination: Path) -> None:
             temporary.unlink()
 
 
+def _write_json_atomic(payload: dict[str, Any], destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2, default=str),
+            encoding="utf-8",
+        )
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _profile_cache_key(profile: RegionProfile) -> str:
+    encoded = json.dumps(asdict(profile), sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class _CachedRegionData:
+    generation: str
+    cutoff: datetime
+    target_path: Path
+    actuals_path: Path | None
+    forecasts_path: Path | None
+    actual_names: tuple[str, ...]
+    forecast_names: tuple[str, ...]
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _load_cached_region(root: Path, profile: RegionProfile) -> _CachedRegionData | None:
+    pointer = _read_json(root / REGION_CACHE_POINTER)
+    if pointer is None or pointer.get("format_version") != REGION_CACHE_FORMAT_VERSION:
+        return None
+    generation = str(pointer.get("generation") or "")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", generation):
+        return None
+    directory = root / "generations" / generation
+    manifest = _read_json(directory / REGION_FETCH_MANIFEST)
+    if (
+        manifest is None
+        or manifest.get("format_version") != REGION_CACHE_FORMAT_VERSION
+        or manifest.get("profile_key") != _profile_cache_key(profile)
+    ):
+        return None
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        return None
+
+    def resolved(name: str) -> Path | None:
+        filename = files.get(name)
+        if not filename:
+            return None
+        if filename not in {
+            "actual-realtime-price.parquet",
+            "actual-factors.parquet",
+            "forecast-factors.parquet",
+        }:
+            return None
+        path = directory / filename
+        try:
+            return path if path.is_file() and path.stat().st_size > 0 else None
+        except OSError:
+            return None
+
+    target_path = resolved("target")
+    actuals_path = resolved("actuals")
+    forecasts_path = resolved("forecasts")
+    if target_path is None:
+        return None
+    if files.get("actuals") and actuals_path is None:
+        return None
+    if files.get("forecasts") and forecasts_path is None:
+        return None
+    try:
+        cutoff = datetime.fromisoformat(str(manifest["cutoff"]))
+    except (KeyError, ValueError):
+        return None
+    return _CachedRegionData(
+        generation=generation,
+        cutoff=cutoff,
+        target_path=target_path,
+        actuals_path=actuals_path,
+        forecasts_path=forecasts_path,
+        actual_names=tuple(str(value) for value in manifest.get("actual_names", [])),
+        forecast_names=tuple(str(value) for value in manifest.get("forecast_names", [])),
+    )
+
+
+def _merge_incremental(existing: pd.DataFrame | None, refreshed: pd.DataFrame) -> pd.DataFrame:
+    if existing is None or existing.empty:
+        return refreshed.sort_values("timestamp", kind="stable").reset_index(drop=True)
+    if refreshed.empty:
+        return existing.sort_values("timestamp", kind="stable").reset_index(drop=True)
+    old = existing.set_index("timestamp")
+    new = refreshed.set_index("timestamp")
+    combined = new.combine_first(old)
+    if "available_at" in old or "available_at" in new:
+        availability = pd.concat(
+            [
+                frame["available_at"]
+                for frame in (old, new)
+                if "available_at" in frame
+            ],
+            axis=1,
+        ).max(axis=1)
+        combined["available_at"] = availability
+    return combined.sort_index().rename_axis("timestamp").reset_index()
+
+
+def _series_groups(series: tuple[RegionalSeries, ...]) -> list[tuple[RegionalSeries, ...]]:
+    grouped: dict[tuple[str, str, bool], list[RegionalSeries]] = {}
+    for item in series:
+        key = (item.table, item.value_column, item.type_value is None)
+        grouped.setdefault(key, []).append(item)
+    return [tuple(items) for items in grouped.values()]
+
+
+def _timed_query(
+    connection: Any,
+    *,
+    label: str,
+    sql: str,
+    parameters: tuple[Any, ...],
+    metrics: list[dict[str, Any]],
+) -> pd.DataFrame:
+    started = perf_counter()
+    frame = _query_frame(connection, sql, parameters)
+    metrics.append(
+        {
+            "label": label,
+            "duration_ms": round((perf_counter() - started) * 1000, 1),
+            "rows": len(frame),
+        }
+    )
+    return frame
+
+
 def fetch_region_price(
     profile: RegionProfile,
     *,
@@ -558,39 +799,91 @@ def fetch_region_price(
     now: datetime | None = None,
     connection_factory: Callable[[DatabaseCredentials], Any] = _connect,
 ) -> RegionPriceFetch:
-    """Fetch one region's price target and configured exogenous factors atomically."""
+    """Fetch one full or incremental regional generation and publish it atomically."""
 
     fetched_at = now or datetime.now(UTC).astimezone()
     if fetched_at.tzinfo is None or fetched_at.utcoffset() is None:
         raise RegionSourceError("取数时间必须包含时区")
     local_cutoff = fetched_at.astimezone(ZoneInfo(profile.timezone)).replace(tzinfo=None)
+    history_start = datetime.combine(profile.history_start_date, time.min)
+    base = Path(output_directory) if output_directory is not None else application_data_directory() / "region-data"
+    root = (base / profile.region_id).resolve()
+    cached = _load_cached_region(root, profile)
+    old_target: pd.DataFrame | None = None
+    old_actuals: pd.DataFrame | None = None
+    old_forecasts: pd.DataFrame | None = None
+    if cached is not None:
+        try:
+            old_target = pd.read_parquet(cached.target_path)
+            old_actuals = pd.read_parquet(cached.actuals_path) if cached.actuals_path else None
+            old_forecasts = pd.read_parquet(cached.forecasts_path) if cached.forecasts_path else None
+        except (OSError, ValueError, ImportError):
+            cached = None
+            old_target = old_actuals = old_forecasts = None
+    fetch_mode = "incremental" if cached is not None else "full"
+    query_start = (
+        max(history_start, cached.cutoff - timedelta(days=profile.refresh_lookback_days))
+        if cached is not None
+        else history_start
+    )
+    metrics: list[dict[str, Any]] = []
     credentials = credentials_for(profile)
     if progress:
-        progress(10, "正在连接所选地区的数据")
+        progress(10, "正在增量更新所选地区的数据" if cached else "正在连接所选地区的数据")
     connection = connection_factory(credentials)
     try:
-        raw = _query_frame(
+        raw = _timed_query(
             connection,
-            _price_query(profile),
-            (profile.province_value, profile.type_value, local_cutoff, local_cutoff),
+            label=f"price:{profile.price_table}",
+            sql=_price_query(profile),
+            parameters=_price_parameters(profile, start=query_start, cutoff=local_cutoff),
+            metrics=metrics,
         )
         history_raw = (
-            _query_frame(
+            _timed_query(
                 connection,
-                _price_query(profile, profile.price_history_table),
-                (profile.province_value, profile.type_value, local_cutoff, local_cutoff),
+                label=f"price_history:{profile.price_history_table}",
+                sql=_price_query(profile, profile.price_history_table),
+                parameters=_price_parameters(profile, start=query_start, cutoff=local_cutoff),
+                metrics=metrics,
             )
             if profile.price_history_table
             else pd.DataFrame()
         )
-        actual_raw: list[tuple[RegionalSeries, pd.DataFrame]] = []
-        forecast_raw: list[tuple[RegionalSeries, pd.DataFrame]] = []
-        for series in profile.actual_series:
-            query, parameters = _series_query(profile, series, future=False, cutoff=local_cutoff)
-            actual_raw.append((series, _query_frame(connection, query, parameters)))
-        for series in profile.forecast_series:
-            query, parameters = _series_query(profile, series, future=True, cutoff=local_cutoff)
-            forecast_raw.append((series, _query_frame(connection, query, parameters)))
+        grouped_rows: dict[str, list[tuple[RegionalSeries, pd.DataFrame]]] = {
+            "actual": [],
+            "forecast": [],
+        }
+        for group_name, configured, future in (
+            ("actual", profile.actual_series, False),
+            ("forecast", profile.forecast_series, True),
+        ):
+            for series_group in _series_groups(configured):
+                query, parameters = _series_group_query(
+                    profile,
+                    series_group,
+                    future=future,
+                    start=query_start,
+                    cutoff=local_cutoff,
+                )
+                first = series_group[0]
+                type_values = [item.type_value for item in series_group if item.type_value is not None]
+                label_types = ",".join(str(value) for value in type_values) or "all"
+                group_raw = _timed_query(
+                    connection,
+                    label=f"{group_name}:{first.table}:{label_types}",
+                    sql=query,
+                    parameters=parameters,
+                    metrics=metrics,
+                )
+                for series in series_group:
+                    if series.type_value is None:
+                        series_raw = group_raw
+                    else:
+                        series_raw = group_raw.loc[
+                            group_raw[profile.type_column] == series.type_value
+                        ].copy()
+                    grouped_rows[group_name].append((series, series_raw))
     except Exception as exc:
         raise RegionSourceError(f"{profile.label}电价或影响因素读取失败：{exc}") from exc
     finally:
@@ -598,17 +891,14 @@ def fetch_region_price(
             connection.rollback()
         finally:
             connection.close()
+
     if progress:
         progress(45, "正在整理电价时间点")
-    if raw.empty:
-        raise RegionSourceError(f"{profile.label}当前没有可用的实际电价")
     normalized, duplicate_rows, invalid_rows = _normalize_business_series(
         raw,
         profile,
         name=profile.target_name,
     )
-    if normalized.empty:
-        raise RegionSourceError(f"{profile.label}实际电价没有有效时间点或数值")
     if not history_raw.empty:
         history, history_duplicates, history_invalid = _normalize_business_series(
             history_raw,
@@ -622,30 +912,23 @@ def fetch_region_price(
                 history.set_index("timestamp"),
                 profile.frequency,
             ).set_index("timestamp")
-            normalized = (
-                normalized.set_index("timestamp")
-                .combine_first(expanded_history)
-                .reset_index()
-            )
-            normalized = normalized.loc[normalized["timestamp"] <= local_cutoff]
-            normalized = normalized.sort_values("timestamp", kind="stable").reset_index(drop=True)
-    root = Path(output_directory) if output_directory is not None else application_data_directory() / "region-data"
-    destination = (root / profile.region_id / "actual-realtime-price.parquet").resolve()
-    _write_parquet_atomic(normalized, destination)
+            normalized = normalized.set_index("timestamp").combine_first(expanded_history).reset_index()
+    normalized = _merge_incremental(old_target, normalized)
+    normalized = normalized.loc[
+        (normalized["timestamp"] >= history_start) & (normalized["timestamp"] <= local_cutoff)
+    ].sort_values("timestamp", kind="stable").reset_index(drop=True)
+    if normalized.empty:
+        raise RegionSourceError(f"{profile.label}当前没有可用的实际电价")
 
-    actuals_path: Path | None = None
-    forecasts_path: Path | None = None
-    actual_names: tuple[str, ...] = ()
-    forecast_names: tuple[str, ...] = ()
     weather_details: dict[str, Any] = {}
     series_details: dict[str, Any] = {"actual": {}, "forecast": {}}
     actual_frames: list[pd.DataFrame] = []
     forecast_frames: list[pd.DataFrame] = []
-    for group, rows, destination_frames in (
-        ("actual", actual_raw, actual_frames),
-        ("forecast", forecast_raw, forecast_frames),
+    for group_name, destination_frames in (
+        ("actual", actual_frames),
+        ("forecast", forecast_frames),
     ):
-        for series, series_raw in rows:
+        for series, series_raw in grouped_rows[group_name]:
             frame, duplicates, invalid = _normalize_business_series(
                 series_raw,
                 profile,
@@ -653,7 +936,7 @@ def fetch_region_price(
             )
             if not frame.empty:
                 destination_frames.append(frame)
-            series_details[group][series.name] = {
+            series_details[group_name][series.name] = {
                 "table": series.table,
                 "source_rows": len(series_raw),
                 "usable_rows": len(frame),
@@ -662,6 +945,7 @@ def fetch_region_price(
                 "duplicate_timestamp_rows": duplicates,
                 "invalid_rows": invalid,
             }
+
     weather_ready = all(
         (
             profile.analytics_credential_prefix,
@@ -676,17 +960,27 @@ def fetch_region_price(
         analytics_credentials = credentials_for(profile, profile.analytics_credential_prefix)
         analytics_connection = connection_factory(analytics_credentials)
         try:
-            era5 = _query_frame(
+            era5 = _timed_query(
                 analytics_connection,
-                _weather_query(profile, str(profile.weather_actual_table), future=False),
-                (profile.province_value, local_cutoff, local_cutoff),
+                label=f"weather_actual:{profile.weather_actual_table}",
+                sql=_weather_query(profile, str(profile.weather_actual_table), future=False),
+                parameters=(profile.province_value, query_start, local_cutoff, local_cutoff),
+                metrics=metrics,
             )
-            gfs = _query_frame(
+            gfs = _timed_query(
                 analytics_connection,
-                _weather_query(profile, str(profile.weather_forecast_table), future=True),
-                (profile.province_value, local_cutoff),
+                label=f"weather_forecast:{profile.weather_forecast_table}",
+                sql=_weather_query(profile, str(profile.weather_forecast_table), future=True),
+                parameters=(profile.province_value, query_start, local_cutoff),
+                metrics=metrics,
             )
-            daily_profile = _daily_weather_profile(analytics_connection, profile, local_cutoff)
+            daily_profile = _daily_weather_profile(
+                analytics_connection,
+                profile,
+                query_start,
+                local_cutoff,
+                metrics,
+            )
         except Exception as exc:
             raise RegionSourceError(f"{profile.label}影响因素读取失败：{exc}") from exc
         finally:
@@ -704,10 +998,6 @@ def fetch_region_price(
         forecast_source_names = tuple(
             column for column in profile.weather_columns if forecast_weather[column].notna().any()
         )
-        weather_forecast_names = tuple(
-            f"forecast_{column}" if column in weather_actual_names else column
-            for column in forecast_source_names
-        )
         if weather_actual_names:
             actual_frames.append(actual_weather[["timestamp", *weather_actual_names, "available_at"]])
         if forecast_source_names:
@@ -724,11 +1014,17 @@ def fetch_region_price(
             "forecast_15_minute_rows": len(forecast_weather),
             "gfs_history_fill_hours": gfs_fill_times,
             "actual_variables": list(weather_actual_names),
-            "forecast_variables": list(weather_forecast_names),
+            "forecast_variables": [
+                f"forecast_{column}" if column in weather_actual_names else column
+                for column in forecast_source_names
+            ],
             "daily_forecast": daily_profile,
         }
-    combined_actuals = _combine_series_frames(actual_frames)
-    combined_forecasts = _combine_series_frames(forecast_frames)
+
+    combined_actuals = _merge_incremental(old_actuals, _combine_series_frames(actual_frames))
+    combined_forecasts = _merge_incremental(old_forecasts, _combine_series_frames(forecast_frames))
+    combined_actuals = combined_actuals.loc[combined_actuals["timestamp"] >= history_start]
+    combined_forecasts = combined_forecasts.loc[combined_forecasts["timestamp"] >= history_start]
     actual_names = tuple(
         column for column in combined_actuals if column not in {"timestamp", "available_at"}
     )
@@ -739,17 +1035,57 @@ def fetch_region_price(
         f"forecast_{column}" if column in actual_names else column
         for column in forecast_source_names
     )
-    if actual_names:
-        actuals_path = (root / profile.region_id / "actual-factors.parquet").resolve()
-        _write_parquet_atomic(combined_actuals, actuals_path)
-    if forecast_source_names:
-        forecasts_path = (root / profile.region_id / "forecast-factors.parquet").resolve()
-        _write_parquet_atomic(combined_forecasts, forecasts_path)
+
+    generation = f"{local_cutoff:%Y%m%dT%H%M%S}-{uuid4().hex[:8]}"
+    generations = root / "generations"
+    staging = generations / f".staging-{uuid4().hex}"
+    final = generations / generation
+    files: dict[str, str | None] = {
+        "target": "actual-realtime-price.parquet",
+        "actuals": "actual-factors.parquet" if actual_names else None,
+        "forecasts": "forecast-factors.parquet" if forecast_source_names else None,
+    }
+    try:
+        staging.mkdir(parents=True, exist_ok=False)
+        _write_parquet_atomic(normalized, staging / str(files["target"]))
+        if files["actuals"]:
+            _write_parquet_atomic(combined_actuals, staging / str(files["actuals"]))
+        if files["forecasts"]:
+            _write_parquet_atomic(combined_forecasts, staging / str(files["forecasts"]))
+        _write_json_atomic(
+            {
+                "format_version": REGION_CACHE_FORMAT_VERSION,
+                "profile_key": _profile_cache_key(profile),
+                "generation": generation,
+                "fetched_at": fetched_at.isoformat(),
+                "cutoff": local_cutoff.isoformat(),
+                "query_start_at": query_start.isoformat(),
+                "fetch_mode": fetch_mode,
+                "files": files,
+                "actual_names": list(actual_names),
+                "forecast_names": list(forecast_names),
+                "query_metrics": metrics,
+            },
+            staging / REGION_FETCH_MANIFEST,
+        )
+        generations.mkdir(parents=True, exist_ok=True)
+        os.replace(staging, final)
+        _write_json_atomic(
+            {"format_version": REGION_CACHE_FORMAT_VERSION, "generation": generation},
+            root / REGION_CACHE_POINTER,
+        )
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    target_path = final / str(files["target"])
+    actuals_path = final / str(files["actuals"]) if files["actuals"] else None
+    forecasts_path = final / str(files["forecasts"]) if files["forecasts"] else None
     if progress:
-        progress(100, "所选地区的电价和影响因素已经就绪")
+        progress(100, "所选地区的数据已经增量更新" if cached else "所选地区的数据已经就绪")
     return RegionPriceFetch(
         profile=profile,
-        path=destination,
+        path=target_path,
         fetched_at=fetched_at,
         row_count=len(normalized),
         start_at=normalized["timestamp"].iloc[0],
@@ -763,4 +1099,8 @@ def fetch_region_price(
         forecast_variable_names=forecast_names,
         series_details=series_details,
         weather_details=weather_details,
+        fetch_mode=fetch_mode,
+        query_start_at=query_start,
+        query_metrics=tuple(metrics),
+        cache_generation=generation,
     )

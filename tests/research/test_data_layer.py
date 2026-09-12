@@ -10,7 +10,7 @@ from app.research.application.planning import prepare_research_data
 from app.research.data.alignment import align_loaded_series
 from app.research.data.loader import load_series
 from app.research.data.quality import build_quality_report
-from app.research.data.snapshot import input_file_manifest
+from app.research.data.snapshot import input_file_manifest, study_fingerprint
 from app.research.schemas.study import SeriesSpec, StudyConfig, StudyDefinition, load_study_config
 
 
@@ -62,6 +62,48 @@ def test_input_manifest_hashes_each_shared_file_once(synthetic_study: Path):
     shared = next(item for item in manifest if item["path"].endswith("features.csv"))
     assert shared["series"] == ["load", "wind"]
     assert len(shared["sha256"]) == 64
+
+
+def test_data_preparation_reads_each_shared_file_once(monkeypatch, synthetic_study: Path):
+    from app.research.application import planning
+
+    reads = []
+    original = planning._read_frame
+
+    def counted(spec):
+        reads.append(spec.path)
+        return original(spec)
+
+    monkeypatch.setattr(planning, "_read_frame", counted)
+
+    prepared = prepare_research_data(load_study_config(synthetic_study))
+
+    assert len(prepared.exogenous) == 3
+    assert len(reads) == len(set(reads)) == 3
+
+
+def test_study_fingerprint_ignores_physical_cache_directory(synthetic_study: Path, tmp_path: Path):
+    config = load_study_config(synthetic_study)
+    copied_paths = {}
+    for spec in (config.target, *config.exogenous):
+        copied = tmp_path / spec.path.name
+        if spec.path not in copied_paths:
+            copied.write_bytes(spec.path.read_bytes())
+            copied_paths[spec.path] = copied
+    moved = config.model_copy(
+        update={
+            "target": config.target.model_copy(update={"path": copied_paths[config.target.path]}),
+            "exogenous": [
+                spec.model_copy(update={"path": copied_paths[spec.path]})
+                for spec in config.exogenous
+            ],
+        }
+    )
+
+    original = study_fingerprint(config, input_file_manifest(config))
+    relocated = study_fingerprint(moved, input_file_manifest(moved))
+
+    assert relocated == original
 
 
 def test_sum_aggregation_keeps_empty_intervals_missing(tmp_path: Path):

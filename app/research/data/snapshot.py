@@ -41,9 +41,17 @@ def input_file_manifest(config: StudyConfig) -> list[dict[str, Any]]:
 def study_fingerprint(config: StudyConfig, inputs: list[dict[str, Any]]) -> str:
     """Create a stable short identifier from configuration and input hashes."""
 
+    config_payload = config.model_dump(mode="json", exclude={"analysis": {"output_directory"}})
+    config_payload["target"]["path"] = f"target:{config.target.name}"
+    for item, spec in zip(config_payload["exogenous"], config.exogenous, strict=True):
+        item["path"] = f"exogenous:{spec.name}"
+    fingerprint_inputs = [
+        {key: value for key, value in item.items() if key != "path"}
+        for item in inputs
+    ]
     payload = {
-        "config": config.model_dump(mode="json", exclude={"analysis": {"output_directory"}}),
-        "inputs": inputs,
+        "config": config_payload,
+        "inputs": fingerprint_inputs,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:12]

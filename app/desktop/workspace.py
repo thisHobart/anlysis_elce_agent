@@ -76,6 +76,18 @@ def _known_so_far(config: StudyConfig | None) -> DataSummary | None:
         target_name=config.target.name,
         exogenous_names=[spec.name for spec in config.exogenous],
         frequency=config.study.frequency,
+        variable_kinds={
+            spec.name: (
+                "forecast"
+                if spec.availability_type == "forecast"
+                else (
+                    "actual"
+                    if spec.availability_type in {"known_at_timestamp", "observed_only"}
+                    else "unknown"
+                )
+            )
+            for spec in config.exogenous
+        },
     )
 
 
@@ -414,7 +426,7 @@ class ResearchWorkspace(QSplitter):
             return
         session = self.current_session
         if session.source_kind == "database":
-            self.select_region(session.region_id)
+            self.select_region(session.region_id, force_refresh=True)
             return
         fingerprint = self._current_dataset_fingerprint()
         changed = self._invalidate_plan_for_data_change(fingerprint)
@@ -442,7 +454,7 @@ class ResearchWorkspace(QSplitter):
             return
         session = self.current_session
         if session.source_kind == "database":
-            self.select_region(session.region_id)
+            self.select_region(session.region_id, force_refresh=True)
             return
         if session.can_analyze:
             self._add_trace("input", "重新连接数据", "completed", "已改用本地数据")
@@ -452,8 +464,28 @@ class ResearchWorkspace(QSplitter):
             self._set_data_state("unavailable", session.data_summary)
         self._persist_and_render(keep_timeline=True)
 
-    def select_region(self, region_id: str) -> None:
-        """Select and fetch the regional actual-price source for this conversation."""
+    @staticmethod
+    def _has_local_region_data(session: ResearchSession) -> bool:
+        """Reuse only a completed fetch whose local input files still exist."""
+
+        if (
+            session.data_state != "ready"
+            or session.data_summary is None
+            or not session.database_fetch_details
+            or not session.inputs["target"].path
+        ):
+            return False
+        try:
+            return all(
+                Path(item.path).is_file() and Path(item.path).stat().st_size > 0
+                for item in session.inputs.values()
+                if item.path
+            )
+        except OSError:
+            return False
+
+    def select_region(self, region_id: str, *, force_refresh: bool = False) -> None:
+        """Reuse this conversation's regional data unless a refresh is requested."""
 
         if self.is_busy:
             return
@@ -463,6 +495,15 @@ class ResearchWorkspace(QSplitter):
             return
         session = self.current_session
         changed_source = session.source_kind != "database" or session.region_id != profile.region_id
+        if not changed_source and not force_refresh and self._has_local_region_data(session):
+            self._add_trace(
+                "input",
+                f"复用{profile.label}数据",
+                "completed",
+                "继续使用本次会话已保存的数据；需要更新时点击“取最新的”。",
+            )
+            self._persist_and_render(keep_timeline=True)
+            return
         previous_summary = session.data_summary
         failure_summary = None if changed_source else previous_summary
         self._region_failure_summary = failure_summary
@@ -495,6 +536,10 @@ class ResearchWorkspace(QSplitter):
             exogenous_names=[*actual_candidates, *forecast_candidates],
             frequency=profile.frequency,
             table_names=table_names,
+            variable_kinds={
+                **{name: "actual" for name in actual_candidates},
+                **{name: "forecast" for name in forecast_candidates},
+            },
         )
         self._set_data_state("exploring", partial)
         self._add_trace("input", f"选择{profile.label}数据", "running", "正在取得实际电价")

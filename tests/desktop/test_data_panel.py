@@ -14,13 +14,19 @@ from PySide6.QtWidgets import QApplication, QLabel
 from app.desktop.input_config import build_runtime_study
 from app.desktop.main_window import MainWindow
 from app.desktop.message_widgets import DataPlanMessageWidget, summary_fields
-from app.desktop.panes import DataPanel, FactorListDialog
+from app.desktop.panes import DataPanel, FactorListDialog, variables_summary_markup
 from app.desktop.session import SESSION_SCHEMA_VERSION, ResearchSession, SessionStore
 from app.research.application.coordinator import ResearchCoordinator
 from app.research.data.sources import naming
 from app.research.data.sources.materialize import snapshot_path
 from app.research.data.sources.regions import RegionPriceFetch, RegionProfile, RegionSourceError
-from app.research.data.sources.summary import DataSummary, VariableLabel, build_summary
+from app.research.data.sources.summary import (
+    DataSummary,
+    VariableLabel,
+    build_summary,
+    parse_summary,
+    summary_payload,
+)
 from tests.desktop.test_desktop import select_desktop_data, wait_until
 
 # Database and programming words the panel must never show. The one screen that
@@ -100,12 +106,13 @@ def test_ready_panel_compacts_and_exposes_all_factors(qt_app: QApplication):
     summary = DataSummary(
         price_label="山东电网 实时电价",
         variables=[
-            VariableLabel("统调负荷"),
-            VariableLabel("发电总出力"),
-            VariableLabel("风电出力"),
-            VariableLabel("水电出力"),
-            VariableLabel("光伏出力"),
-            VariableLabel("负荷预测"),
+            VariableLabel("统调负荷", kind="actual"),
+            VariableLabel("发电总出力", kind="actual"),
+            VariableLabel("风电出力", kind="actual"),
+            VariableLabel("水电出力", kind="actual"),
+            VariableLabel("光伏出力", kind="actual"),
+            # The source kind, not a Chinese naming convention, determines grouping.
+            VariableLabel("未来负荷", kind="forecast"),
         ],
         start_date="2025年11月1日",
         end_date="2026年9月11日",
@@ -117,9 +124,8 @@ def test_ready_panel_compacts_and_exposes_all_factors(qt_app: QApplication):
         qt_app.processEvents()
 
         compact = panel.ready_card.rows["影响因素"].value_label.text()
-        assert "统调负荷、发电总出力、风电出力、水电出力" in compact
-        assert "共 6 项" in compact
-        assert "光伏出力" not in compact
+        assert compact == "实际值 5 项、预测值 1 项"
+        assert "统调负荷" in panel.ready_card.rows["影响因素"].value_label.toolTip()
         assert panel.variables_button.isVisibleTo(panel)
         assert panel.variables_button.text() == "查看全部 6 项影响因素"
 
@@ -141,9 +147,28 @@ def test_ready_panel_compacts_and_exposes_all_factors(qt_app: QApplication):
         panel.close()
 
 
+def test_factor_source_kind_survives_session_serialization_and_old_sessions_still_open():
+    summary = DataSummary(
+        variables=[
+            VariableLabel("实际负荷", kind="actual"),
+            VariableLabel("未来负荷", kind="forecast"),
+        ]
+    )
+
+    assert parse_summary(summary_payload(summary)).variables == summary.variables
+    legacy = parse_summary({"variables": [{"display": "负荷预测", "resolved": True}]})
+    assert legacy.variables == [VariableLabel("负荷预测", kind="unknown")]
+    assert variables_summary_markup(legacy.variables) == "预测值 1 项"
+
+
+@pytest.mark.parametrize(
+    "next_action",
+    ["repeat", "reopen", "refresh", "retry", "missing_target", "missing_actuals", "missing_forecasts", "new_session"],
+)
 def test_region_button_fetches_shandong_for_only_the_current_session(
     qt_app: QApplication,
     tmp_path: Path,
+    next_action: str,
 ):
     profile = RegionProfile(
         region_id="shandong",
@@ -157,11 +182,14 @@ def test_region_button_fetches_shandong_for_only_the_current_session(
         price_label="实时省级出清电价",
     )
 
+    fetch_calls = []
+
     def fetcher(selected, *, output_directory, progress):
+        fetch_calls.append(selected.region_id)
         assert selected is profile
         progress(20, "正在取数")
         path = Path(output_directory) / "shandong" / "actual-realtime-price.parquet"
-        path.parent.mkdir(parents=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(
             {
                 "timestamp": pd.date_range("2026-09-01", periods=8, freq="15min"),
@@ -225,10 +253,48 @@ def test_region_button_fetches_shandong_for_only_the_current_session(
         assert [item.display for item in session.data_summary.variables] == ["气温", "气温预测"]
         assert session.database_fetch_details["rows"] == 8
         assert panel.ready_card.rows["电价"].value_label.text() == "山东电网 实时电价"
-        assert panel.ready_card.rows["影响因素"].value_label.text() == "气温、气温预测"
+        assert panel.ready_card.rows["影响因素"].value_label.text() == "实际值 1 项、预测值 1 项"
+        assert panel.variables_button.isVisibleTo(panel)
         config = build_runtime_study(session)
         assert [item.name for item in config.exogenous] == ["temperature", "forecast_temperature"]
         assert all(item.available_at_column == "available_at" for item in config.exogenous)
+        assert fetch_calls == ["shandong"]
+        original_summary = session.data_summary
+        original_fingerprint = session.dataset_fingerprint
+        if next_action == "reopen":
+            window.close()
+            window = MainWindow(
+                session_store=SessionStore(tmp_path / "sessions.json"),
+                region_profiles={"shandong": profile},
+                region_fetcher=fetcher,
+            )
+            workspace = window.workspace
+            workspace.select_session(original_session_id)
+            assert workspace.current_session.session_id == original_session_id
+        elif next_action.startswith("missing_"):
+            role = next_action.removeprefix("missing_")
+            Path(session.inputs[role].path).unlink()
+        elif next_action == "new_session":
+            workspace.create_session()
+
+        if next_action == "refresh":
+            workspace.refetch_dataset()
+        elif next_action == "retry":
+            # A failed refresh can still leave files, but retry must reach the source.
+            workspace._set_data_state("unavailable", original_summary)
+            workspace.retry_dataset()
+        else:
+            workspace.context.data_panel.region_menu.actions()[0].trigger()
+        wait_until(qt_app, lambda: not workspace.is_busy)
+
+        if next_action in {"repeat", "reopen"}:
+            assert fetch_calls == ["shandong"]
+            assert workspace.current_session.data_summary == original_summary
+            assert workspace.current_session.dataset_fingerprint == original_fingerprint
+            assert workspace.current_session.trace[-1].name == "复用山东数据"
+        else:
+            assert fetch_calls == ["shandong", "shandong"]
+        assert workspace.current_session.data_state == "ready"
     finally:
         window.close()
 
@@ -384,11 +450,10 @@ def test_ready_panel_reads_only_the_prepared_summary(qt_app: QApplication, tmp_p
 
         rows = panel.ready_card.rows
         assert rows["电价"].value_label.text() == "山东电网 实时电价"
-        assert "风电出力、" in rows["影响因素"].value_label.text()
-        # An unnamed column keeps its stored name rather than becoming 「变量 1」.
-        assert "p001" in rows["影响因素"].value_label.text()
-        assert "#B45309" in rows["影响因素"].value_label.text()
-        assert rows["影响因素"].value_label.toolTip() == "这项数据还没配中文名"
+        assert rows["影响因素"].value_label.text() == "实际值 2 项"
+        # An unnamed column remains discoverable rather than becoming 「变量 1」.
+        assert "p001" in rows["影响因素"].value_label.toolTip()
+        assert "这项数据还没配中文名" in rows["影响因素"].value_label.toolTip()
         assert rows["时间范围"].value_label.text() == "2026年1月1日 — 2026年9月9日"
         assert rows["时间范围"].sub_label.text() == "每 15 分钟一个点，缺 47 个点"
         assert panel.fetched_label.text() == "数据取自今天 15:32"
@@ -470,7 +535,12 @@ def test_confirmation_card_and_panel_word_the_dataset_identically(
 
         panel = workspace.context.data_panel
         for key, value, sub in summary_fields(session.data_summary):
-            assert panel.ready_card.rows[key].value_label.text() == value
+            if key == "影响因素":
+                assert panel.ready_card.rows[key].value_label.text() == variables_summary_markup(
+                    session.data_summary.variables
+                )
+            else:
+                assert panel.ready_card.rows[key].value_label.text() == value
             assert panel.ready_card.rows[key].sub_label.text() == sub
     finally:
         window.close()

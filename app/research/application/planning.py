@@ -12,7 +12,7 @@ from app.research.agent.context import compact_episode_context
 from app.research.agent.schemas import ConversationMessage, EDAPlan, ResearchDataProfile, ResearchProposal
 from app.research.agent.subagents.eda import EDASubagent
 from app.research.data.alignment import AlignmentResult, align_loaded_series
-from app.research.data.loader import LoadedSeries, load_series
+from app.research.data.loader import LoadedSeries, _read_frame, load_series_from_frame
 from app.research.data.quality import build_quality_report
 from app.research.data.snapshot import input_file_manifest, study_fingerprint
 from app.research.data.sources.materialize import (
@@ -61,18 +61,25 @@ def assemble_research_data(
 
 
 def prepare_research_data(config: StudyConfig) -> PreparedResearchData:
-    """Load all configured series and create the canonical analysis frame."""
+    """Read each unique source file once and create the canonical analysis frame."""
 
     options = {
         "study_timezone": config.study.timezone,
         "start_time": config.study.start_time,
         "end_time": config.study.end_time,
     }
-    target = load_series(config.target, **options)
+    frames = {}
+    for spec in (config.target, *config.exogenous):
+        if spec.path not in frames:
+            frames[spec.path] = _read_frame(spec)
+    target = load_series_from_frame(config.target, frames[config.target.path], **options)
     # A chat-selected short window may predate a recently introduced factor.
     # Preserve it as an all-missing quality finding instead of rejecting the
     # whole price study; deterministic screening will keep it out of analysis.
-    exogenous = [load_series(spec, **options, allow_empty=True) for spec in config.exogenous]
+    exogenous = [
+        load_series_from_frame(spec, frames[spec.path], **options, allow_empty=True)
+        for spec in config.exogenous
+    ]
     return assemble_research_data(config, target, exogenous)
 
 

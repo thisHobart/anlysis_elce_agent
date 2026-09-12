@@ -17,7 +17,7 @@ import yaml
 from app.runtime_paths import source_worktree
 
 if TYPE_CHECKING:  # A runtime import would make the two modules import each other.
-    from app.research.data.sources.summary import VariableLabel
+    from app.research.data.sources.summary import VariableKind, VariableLabel
 
 WORD_LIST_FILENAME = "variable_names.yaml"
 WORD_LIST_ENVIRONMENT_VARIABLE = "PRICE_RESEARCH_VARIABLE_NAMES"
@@ -76,7 +76,12 @@ def normalize(name: str) -> str:
     return "".join(character for character in str(name).lower() if character.isalnum())
 
 
-def label_variable(column: str, *, table: str | None = None) -> VariableLabel:
+def label_variable(
+    column: str,
+    *,
+    table: str | None = None,
+    kind: VariableKind = "unknown",
+) -> VariableLabel:
     """Resolve one column name, falling back to the column itself when unknown.
 
     Showing ``p001`` is deliberate: an analyst can ask an operator what it means,
@@ -89,17 +94,17 @@ def label_variable(column: str, *, table: str | None = None) -> VariableLabel:
     if table:
         exact = entries.get(f"{table}.{column}")
         if exact:
-            return VariableLabel(display=exact, resolved=True)
+            return VariableLabel(display=exact, resolved=True, kind=kind)
     exact = entries.get(str(column))
     if exact:
-        return VariableLabel(display=exact, resolved=True)
+        return VariableLabel(display=exact, resolved=True, kind=kind)
     wanted = normalize(column)
     for key, display in entries.items():
         if "." in key:
             continue
         if normalize(key) == wanted:
-            return VariableLabel(display=display, resolved=True)
-    return VariableLabel(display=str(column), resolved=False)
+            return VariableLabel(display=display, resolved=True, kind=kind)
+    return VariableLabel(display=str(column), resolved=False, kind=kind)
 
 
 def reload_word_list() -> None:

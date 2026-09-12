@@ -78,6 +78,27 @@ def load_series(
     """Read one source and normalize timestamps/numbers without hiding bad rows."""
 
     raw = _read_frame(spec)
+    return load_series_from_frame(
+        spec,
+        raw,
+        study_timezone=study_timezone,
+        start_time=start_time,
+        end_time=end_time,
+        allow_empty=allow_empty,
+    )
+
+
+def load_series_from_frame(
+    spec: SeriesSpec,
+    raw: pd.DataFrame,
+    *,
+    study_timezone: str,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    allow_empty: bool = False,
+) -> LoadedSeries:
+    """Normalize one series from a frame already read for its source file."""
+
     required = {spec.timestamp_column, spec.value_column}
     if spec.available_at_column:
         required.add(spec.available_at_column)

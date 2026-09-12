@@ -7,11 +7,14 @@ surfaces cannot drift apart and the same dataset always reads the same way.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import Any, Literal
 
 from app.research.data.sources.naming import label_variable
+
+VariableKind = Literal["actual", "forecast", "unknown"]
 
 
 @dataclass(frozen=True)
@@ -20,6 +23,7 @@ class VariableLabel:
 
     display: str
     resolved: bool = True
+    kind: VariableKind = "unknown"
 
 
 @dataclass(frozen=True)
@@ -105,6 +109,7 @@ def build_partial_summary(
     exogenous_names: list[str],
     frequency: str = "",
     table_names: dict[str, str] | None = None,
+    variable_kinds: Mapping[str, VariableKind] | None = None,
 ) -> DataSummary:
     """Name what is already known before the data itself has been read.
 
@@ -113,12 +118,16 @@ def build_partial_summary(
     """
 
     lookup = table_names or {}
+    kinds = variable_kinds or {}
     price_label = label_variable(target_name, table=lookup.get(target_name)).display
     if market and market not in {"unspecified", "unknown"}:
         price_label = f"{market} {price_label}"
     return DataSummary(
         price_label=price_label,
-        variables=[label_variable(name, table=lookup.get(name)) for name in exogenous_names],
+        variables=[
+            label_variable(name, table=lookup.get(name), kind=kinds.get(name, "unknown"))
+            for name in exogenous_names
+        ],
         granularity_text=format_granularity(frequency) if frequency else "",
     )
 
@@ -134,6 +143,7 @@ def build_summary(
     missing_points: int = 0,
     fetched_at: Any = None,
     table_names: dict[str, str] | None = None,
+    variable_kinds: Mapping[str, VariableKind] | None = None,
 ) -> DataSummary:
     """Assemble the display summary deterministically, so it never varies per run.
 
@@ -147,6 +157,7 @@ def build_summary(
         exogenous_names=exogenous_names,
         frequency=frequency,
         table_names=table_names,
+        variable_kinds=variable_kinds,
     )
     return replace(
         known,
@@ -164,7 +175,10 @@ def summary_payload(summary: DataSummary | None) -> dict[str, Any] | None:
         return None
     return {
         "price_label": summary.price_label,
-        "variables": [{"display": item.display, "resolved": item.resolved} for item in summary.variables],
+        "variables": [
+            {"display": item.display, "resolved": item.resolved, "kind": item.kind}
+            for item in summary.variables
+        ],
         "start_date": summary.start_date,
         "end_date": summary.end_date,
         "granularity_text": summary.granularity_text,
@@ -186,7 +200,15 @@ def parse_summary(value: Any) -> DataSummary:
         return DataSummary()
     raw_variables = value.get("variables")
     variables = [
-        VariableLabel(display=str(item.get("display", "")), resolved=bool(item.get("resolved", True)))
+        VariableLabel(
+            display=str(item.get("display", "")),
+            resolved=bool(item.get("resolved", True)),
+            kind=(
+                item.get("kind")
+                if item.get("kind") in {"actual", "forecast", "unknown"}
+                else "unknown"
+            ),
+        )
         for item in (raw_variables if isinstance(raw_variables, list) else [])
         if isinstance(item, dict)
     ]

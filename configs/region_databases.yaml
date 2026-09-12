@@ -6,6 +6,8 @@ regions:
     province_value: 山东省
     timezone: Asia/Shanghai
     frequency: 15min
+    history_start_date: 2025-11-01
+    refresh_lookback_days: 30
     credential_prefix: VPP_SHANDONG_DB_FEATURE
     price_table: t_data_province_real_time_cleared_price
     price_history_table: t_data_province_real_time_cleared_price_hour

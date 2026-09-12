@@ -117,6 +117,18 @@ def materialize_dataset(
         frequency=config.study.frequency,
         missing_points=max(0, quality.alignment.expected_rows - quality.alignment.complete_case_rows),
         fetched_at=moment,
+        variable_kinds={
+            spec.name: (
+                "forecast"
+                if spec.availability_type == "forecast"
+                else (
+                    "actual"
+                    if spec.availability_type in {"known_at_timestamp", "observed_only"}
+                    else "unknown"
+                )
+            )
+            for spec in config.exogenous
+        },
     )
     series = [("target", target), *(("exogenous", item) for item in exogenous)]
     entries: list[dict[str, Any]] = []
