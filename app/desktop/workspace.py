@@ -238,14 +238,6 @@ class ResearchWorkspace(QSplitter):
 
     def _new_session(self) -> ResearchSession:
         session = ResearchSession()
-        profile = self.region_profiles.get(session.region_id)
-        if profile is None and self.region_profiles:
-            profile = next(iter(self.region_profiles.values()))
-        if profile is not None:
-            session.region_id = profile.region_id
-            session.region_label = profile.label
-            session.region_market = profile.market
-            session.region_timezone = profile.timezone
         session.messages.append(
             SessionMessage(
                 role="assistant",

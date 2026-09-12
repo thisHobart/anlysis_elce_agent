@@ -19,7 +19,12 @@ from app.desktop.session import SESSION_SCHEMA_VERSION, ResearchSession, Session
 from app.research.application.coordinator import ResearchCoordinator
 from app.research.data.sources import naming
 from app.research.data.sources.materialize import snapshot_path
-from app.research.data.sources.regions import RegionPriceFetch, RegionProfile, RegionSourceError
+from app.research.data.sources.regions import (
+    RegionPriceFetch,
+    RegionProfile,
+    RegionSourceError,
+    load_region_profiles,
+)
 from app.research.data.sources.summary import (
     DataSummary,
     VariableLabel,
@@ -99,6 +104,21 @@ def test_empty_panel_offers_nothing_to_click(qt_app: QApplication, tmp_path: Pat
             assert not view.isVisibleTo(panel)
     finally:
         window.close()
+
+
+def test_builtin_region_menu_offers_sichuan(qt_app: QApplication):
+    panel = DataPanel()
+    profiles = load_region_profiles()
+    try:
+        panel.set_regions(
+            [(profile.region_id, profile.label) for profile in profiles.values()],
+            "sichuan",
+        )
+
+        assert panel.region_button.text() == "地区：四川 ▾"
+        assert [action.text() for action in panel.region_menu.actions()] == ["山东", "四川"]
+    finally:
+        panel.close()
 
 
 def test_ready_panel_compacts_and_exposes_all_factors(qt_app: QApplication):
@@ -238,7 +258,9 @@ def test_region_button_fetches_shandong_for_only_the_current_session(
         workspace = window.workspace
         original_session_id = workspace.current_session.session_id
         panel = workspace.context.data_panel
-        assert panel.region_button.text() == "地区：山东 ▾"
+        assert panel.region_button.text() == "地区：待选择 ▾"
+        assert workspace.current_session.region_id == ""
+        assert not any(action.isChecked() for action in panel.region_menu.actions())
         panel.region_menu.actions()[0].trigger()
         wait_until(qt_app, lambda: not workspace.is_busy)
 
@@ -276,6 +298,11 @@ def test_region_button_fetches_shandong_for_only_the_current_session(
             Path(session.inputs[role].path).unlink()
         elif next_action == "new_session":
             workspace.create_session()
+            assert workspace.current_session.region_id == ""
+            assert workspace.context.data_panel.region_button.text() == "地区：待选择 ▾"
+            assert not any(
+                action.isChecked() for action in workspace.context.data_panel.region_menu.actions()
+            )
 
         if next_action == "refresh":
             workspace.refetch_dataset()

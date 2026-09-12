@@ -524,6 +524,11 @@ def test_main_window_uses_one_three_pane_workspace(qt_app: QApplication, tmp_pat
         panel = window.workspace.context.data_panel
         assert panel.title_label.text() == "数据"
         assert not hasattr(window.workspace.conversation, "config_label")
+        assert window.workspace.current_session.region_id == ""
+        assert window.workspace.current_session.region_label == ""
+        assert window.workspace.current_session.region_market == ""
+        assert panel.region_button.text() == "地区：待选择 ▾"
+        assert not any(action.isChecked() for action in panel.region_menu.actions())
         assert panel.state == "empty"
         assert panel.empty_label.text() == "还没取数。请从上方选择地区；也可以直接提问讨论研究方法。"
         assert panel.empty_view.isVisibleTo(panel)

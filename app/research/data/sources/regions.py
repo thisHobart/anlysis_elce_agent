@@ -58,6 +58,35 @@ class RegionalSeries:
 
 
 @dataclass(frozen=True)
+class RegionalTimePointSeries:
+    """One categorical series stored as date + HH:mm text."""
+
+    name: str
+    table: str
+    category_value: str
+    category_column: str = "lx"
+    date_column: str = "trade_date"
+    time_column: str = "time_point"
+    value_column: str = "quantity"
+    available_at_column: str | None = "create_time"
+
+    def __post_init__(self) -> None:
+        for value in (
+            self.name,
+            self.table,
+            self.category_column,
+            self.date_column,
+            self.time_column,
+            self.value_column,
+            *(value for value in (self.available_at_column,) if value is not None),
+        ):
+            if not _IDENTIFIER.fullmatch(value):
+                raise ValueError(f"unsafe regional time-point series identifier: {value}")
+        if not self.category_value.strip():
+            raise ValueError("regional time-point category value cannot be empty")
+
+
+@dataclass(frozen=True)
 class RegionProfile:
     """Non-secret contract for one regional actual-price source."""
 
@@ -78,8 +107,11 @@ class RegionProfile:
     weather_daily_table: str | None = None
     weather_columns: tuple[str, ...] = ()
     price_history_table: str | None = None
+    price_credential_prefix: str | None = None
+    market_credential_prefix: str | None = None
     actual_series: tuple[RegionalSeries, ...] = ()
     forecast_series: tuple[RegionalSeries, ...] = ()
+    market_series: tuple[RegionalTimePointSeries, ...] = ()
     target_name: str = "rt_price"
     province_column: str = "province"
     type_column: str = "type"
@@ -89,6 +121,13 @@ class RegionProfile:
     minute_column: str = "min"
     value_column: str = "quantity"
     available_at_column: str = "create_time"
+    price_layout: str = "business_clock"
+    price_date_column: str = "trade_date"
+    price_time_column: str = "time_point"
+    price_value_column: str = "price"
+    price_available_at_column: str | None = "create_time"
+    price_filter_province: bool = True
+    price_filter_type: bool = True
 
     def __post_init__(self) -> None:
         if isinstance(self.history_start_date, str):
@@ -110,8 +149,18 @@ class RegionProfile:
                 for item in raw_series
             )
             object.__setattr__(self, field_name, converted)
+        object.__setattr__(
+            self,
+            "market_series",
+            tuple(
+                item if isinstance(item, RegionalTimePointSeries) else RegionalTimePointSeries(**item)
+                for item in self.market_series
+            ),
+        )
         if not re.fullmatch(r"[a-z][a-z0-9_-]*", self.region_id):
             raise ValueError(f"invalid region id: {self.region_id}")
+        if self.price_layout not in {"business_clock", "time_point"}:
+            raise ValueError(f"invalid price layout in region {self.region_id}: {self.price_layout}")
         ZoneInfo(self.timezone)
         for value in (
             self.price_table,
@@ -123,6 +172,10 @@ class RegionProfile:
             self.minute_column,
             self.value_column,
             self.available_at_column,
+            self.price_date_column,
+            self.price_time_column,
+            self.price_value_column,
+            *(value for value in (self.price_available_at_column,) if value is not None),
             *(value for value in self.weather_columns),
             *(
                 value
@@ -147,7 +200,13 @@ class RegionProfile:
             raise ValueError(f"incomplete weather source in region {self.region_id}")
         if self.analytics_credential_prefix and not _IDENTIFIER.fullmatch(self.analytics_credential_prefix):
             raise ValueError(f"unsafe credential prefix in region {self.region_id}")
-        names = [item.name for item in (*self.actual_series, *self.forecast_series)]
+        for prefix in (self.price_credential_prefix, self.market_credential_prefix):
+            if prefix and not _IDENTIFIER.fullmatch(prefix):
+                raise ValueError(f"unsafe credential prefix in region {self.region_id}")
+        names = [
+            item.name
+            for item in (*self.actual_series, *self.forecast_series, *self.market_series)
+        ]
         if len(names) != len(set(names)):
             raise ValueError(f"duplicate regional series name in region {self.region_id}")
 
@@ -191,6 +250,7 @@ class RegionPriceFetch:
         table_names = {self.profile.target_name: self.profile.price_table}
         table_names.update({item.name: item.table for item in self.profile.actual_series})
         table_names.update({item.name: item.table for item in self.profile.forecast_series})
+        table_names.update({item.name: item.table for item in self.profile.market_series})
         variable_kinds = {
             **{name: "actual" for name in self.actual_variable_names},
             **{name: "forecast" for name in self.forecast_variable_names},
@@ -217,6 +277,9 @@ class RegionPriceFetch:
             "database": self.database_name,
             "table": self.profile.price_table,
             "price_kind": self.profile.price_label,
+            "price_availability": (
+                self.profile.price_available_at_column or "business_timestamp_assumption"
+            ),
             "frequency": self.profile.frequency,
             "fetched_at": self.fetched_at.isoformat(),
             "rows": self.row_count,
@@ -355,9 +418,52 @@ def _business_time_sql(profile: RegionProfile) -> str:
     )
 
 
+def _text_time_sql(date_column: str, time_column: str) -> str:
+    """Build a timestamp expression that also accepts the market value 24:00."""
+
+    return (
+        f"TIMESTAMP(DATE_ADD(`{date_column}`, INTERVAL ("
+        f"CAST(SUBSTRING_INDEX(`{time_column}`, ':', 1) AS UNSIGNED)*60+"
+        f"CAST(SUBSTRING_INDEX(`{time_column}`, ':', -1) AS UNSIGNED)) MINUTE))"
+    )
+
+
 def _price_query(profile: RegionProfile, table: str | None = None) -> str:
     def quote(value: str) -> str:
         return f"`{value}`"
+
+    if profile.price_layout == "time_point":
+        market_time = _text_time_sql(profile.price_date_column, profile.price_time_column)
+        price_columns = [
+            profile.price_date_column,
+            profile.price_time_column,
+            profile.price_value_column,
+        ]
+        if profile.price_available_at_column:
+            price_columns.append(profile.price_available_at_column)
+        columns = ",".join(quote(value) for value in price_columns)
+        filters: list[str] = []
+        if profile.price_filter_province:
+            filters.append(f"{quote(profile.province_column)}=%s")
+        if profile.price_filter_type:
+            filters.append(f"{quote(profile.type_column)}=%s")
+        filters.extend(
+            (
+                f"{quote(profile.price_date_column)}>=%s",
+                f"{quote(profile.price_date_column)}<=%s",
+            )
+        )
+        if profile.price_available_at_column:
+            filters.append(f"{quote(profile.price_available_at_column)}<=%s")
+        filters.extend((f"{market_time}>=%s", f"{market_time}<=%s"))
+        order_columns = [profile.price_date_column, profile.price_time_column]
+        if profile.price_available_at_column:
+            order_columns.append(profile.price_available_at_column)
+        return (
+            f"SELECT {columns} FROM {quote(table or profile.price_table)} "
+            f"WHERE {' AND '.join(filters)} "
+            f"ORDER BY {','.join(quote(value) for value in order_columns)}"
+        )
 
     business_time = _business_time_sql(profile)
     columns = ",".join(
@@ -387,6 +493,17 @@ def _price_parameters(
     start: datetime,
     cutoff: datetime,
 ) -> tuple[Any, ...]:
+    if profile.price_layout == "time_point":
+        parameters: list[Any] = []
+        if profile.price_filter_province:
+            parameters.append(profile.province_value)
+        if profile.price_filter_type:
+            parameters.append(profile.type_value)
+        parameters.extend((start.date(), cutoff.date()))
+        if profile.price_available_at_column:
+            parameters.append(cutoff)
+        parameters.extend((start, cutoff))
+        return tuple(parameters)
     return (
         profile.province_value,
         profile.type_value,
@@ -454,6 +571,70 @@ def _series_query(
     )
 
 
+def _market_series_groups(
+    series: tuple[RegionalTimePointSeries, ...],
+) -> list[tuple[RegionalTimePointSeries, ...]]:
+    grouped: dict[
+        tuple[str, str, str, str, str, str | None],
+        list[RegionalTimePointSeries],
+    ] = {}
+    for item in series:
+        key = (
+            item.table,
+            item.category_column,
+            item.date_column,
+            item.time_column,
+            item.value_column,
+            item.available_at_column,
+        )
+        grouped.setdefault(key, []).append(item)
+    return [tuple(items) for items in grouped.values()]
+
+
+def _market_series_group_query(
+    series_group: tuple[RegionalTimePointSeries, ...],
+    *,
+    start: datetime,
+    cutoff: datetime,
+) -> tuple[str, tuple[Any, ...]]:
+    first = series_group[0]
+    placeholders = ",".join("%s" for _item in series_group)
+    market_time = _text_time_sql(first.date_column, first.time_column)
+    selected_columns = [
+        first.date_column,
+        first.time_column,
+        first.value_column,
+        first.category_column,
+    ]
+    if first.available_at_column:
+        selected_columns.insert(3, first.available_at_column)
+    filters = [
+        f"`{first.category_column}` IN ({placeholders})",
+        f"`{first.date_column}`>=%s",
+        f"`{first.date_column}`<=%s",
+    ]
+    if first.available_at_column:
+        filters.append(f"`{first.available_at_column}`<=%s")
+    filters.extend((f"{market_time}>=%s", f"{market_time}<=%s"))
+    order_columns = [first.date_column, first.time_column]
+    if first.available_at_column:
+        order_columns.append(first.available_at_column)
+    sql = (
+        f"SELECT {','.join(f'`{value}`' for value in selected_columns)} "
+        f"FROM `{first.table}` WHERE {' AND '.join(filters)} "
+        f"ORDER BY {','.join(f'`{value}`' for value in order_columns)}"
+    )
+    parameters: tuple[Any, ...] = (
+        *(item.category_value for item in series_group),
+        start.date(),
+        cutoff.date(),
+    )
+    if first.available_at_column:
+        parameters = (*parameters, cutoff)
+    parameters = (*parameters, start, cutoff)
+    return sql, parameters
+
+
 def _normalize_business_series(
     raw: pd.DataFrame,
     profile: RegionProfile,
@@ -491,6 +672,62 @@ def _normalize_business_series(
     return normalized, duplicates, invalid
 
 
+def _normalize_time_point_series(
+    raw: pd.DataFrame,
+    *,
+    name: str,
+    date_column: str,
+    time_column: str,
+    value_column: str,
+    available_at_column: str | None,
+) -> tuple[pd.DataFrame, int, int]:
+    timestamps: list[datetime | None] = []
+    for day_value, time_value in zip(raw.get(date_column, ()), raw.get(time_column, ()), strict=False):
+        try:
+            hour_text, minute_text = str(time_value).strip().split(":", 1)
+            timestamps.append(_business_timestamp(day_value, hour_text, minute_text))
+        except (AttributeError, TypeError, ValueError):
+            timestamps.append(None)
+    availability = (
+        pd.to_datetime(raw.get(available_at_column), errors="coerce")
+        if available_at_column
+        else pd.to_datetime(timestamps, errors="coerce")
+    )
+    normalized = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            name: pd.to_numeric(raw.get(value_column), errors="coerce"),
+            "available_at": availability,
+        }
+    )
+    invalid = int(normalized[["timestamp", name, "available_at"]].isna().any(axis=1).sum())
+    normalized = normalized.dropna(subset=["timestamp", name, "available_at"])
+    duplicates = int(normalized.duplicated("timestamp", keep=False).sum())
+    normalized = (
+        normalized.sort_values(["timestamp", "available_at"], kind="stable")
+        .drop_duplicates("timestamp", keep="last")
+        .sort_values("timestamp", kind="stable")
+        .reset_index(drop=True)
+    )
+    return normalized, duplicates, invalid
+
+
+def _normalize_price_series(
+    raw: pd.DataFrame,
+    profile: RegionProfile,
+) -> tuple[pd.DataFrame, int, int]:
+    if profile.price_layout == "time_point":
+        return _normalize_time_point_series(
+            raw,
+            name=profile.target_name,
+            date_column=profile.price_date_column,
+            time_column=profile.price_time_column,
+            value_column=profile.price_value_column,
+            available_at_column=profile.price_available_at_column,
+        )
+    return _normalize_business_series(raw, profile, name=profile.target_name)
+
+
 def _combine_series_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
     """Outer-join named series and retain the most conservative row availability."""
 
@@ -508,7 +745,10 @@ def _combine_series_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
         combined = prepared if combined is None else combined.merge(prepared, on="timestamp", how="outer")
     if combined is None:
         return pd.DataFrame(columns=["timestamp", "available_at"])
-    combined["available_at"] = combined[availability_columns].max(axis=1)
+    availability = combined[availability_columns].apply(
+        lambda column: pd.to_datetime(column, errors="coerce")
+    )
+    combined["available_at"] = availability.max(axis=1)
     return combined.drop(columns=availability_columns).sort_values("timestamp", kind="stable").reset_index(drop=True)
 
 
@@ -567,7 +807,10 @@ def _daily_weather_profile(
 
 def _normalize_weather(frame: pd.DataFrame, profile: RegionProfile) -> pd.DataFrame:
     if frame.empty:
-        return pd.DataFrame(columns=["timestamp", *profile.weather_columns, "available_at"])
+        return pd.DataFrame(
+            columns=[*profile.weather_columns, "available_at"],
+            index=pd.DatetimeIndex([], name="timestamp"),
+        )
     normalized = pd.DataFrame(
         {
             "timestamp": pd.to_datetime(frame["forecast_time"], errors="coerce"),
@@ -827,13 +1070,28 @@ def fetch_region_price(
         else history_start
     )
     metrics: list[dict[str, Any]] = []
-    credentials = credentials_for(profile)
+    source_credentials: dict[str, DatabaseCredentials] = {}
+    source_connections: dict[str, Any] = {}
+
+    def connection_for(prefix: str) -> tuple[DatabaseCredentials, Any]:
+        credentials = source_credentials.get(prefix)
+        if credentials is None:
+            credentials = credentials_for(profile, prefix)
+            source_credentials[prefix] = credentials
+        connection = source_connections.get(prefix)
+        if connection is None:
+            connection = connection_factory(credentials)
+            source_connections[prefix] = connection
+        return credentials, connection
+
+    price_prefix = profile.price_credential_prefix or profile.credential_prefix
+    market_prefix = profile.market_credential_prefix or price_prefix
+    price_credentials, price_connection = connection_for(price_prefix)
     if progress:
         progress(10, "正在增量更新所选地区的数据" if cached else "正在连接所选地区的数据")
-    connection = connection_factory(credentials)
     try:
         raw = _timed_query(
-            connection,
+            price_connection,
             label=f"price:{profile.price_table}",
             sql=_price_query(profile),
             parameters=_price_parameters(profile, start=query_start, cutoff=local_cutoff),
@@ -841,7 +1099,7 @@ def fetch_region_price(
         )
         history_raw = (
             _timed_query(
-                connection,
+                price_connection,
                 label=f"price_history:{profile.price_history_table}",
                 sql=_price_query(profile, profile.price_history_table),
                 parameters=_price_parameters(profile, start=query_start, cutoff=local_cutoff),
@@ -854,6 +1112,9 @@ def fetch_region_price(
             "actual": [],
             "forecast": [],
         }
+        feature_connection = None
+        if profile.actual_series or profile.forecast_series:
+            _feature_credentials, feature_connection = connection_for(profile.credential_prefix)
         for group_name, configured, future in (
             ("actual", profile.actual_series, False),
             ("forecast", profile.forecast_series, True),
@@ -870,7 +1131,7 @@ def fetch_region_price(
                 type_values = [item.type_value for item in series_group if item.type_value is not None]
                 label_types = ",".join(str(value) for value in type_values) or "all"
                 group_raw = _timed_query(
-                    connection,
+                    feature_connection,
                     label=f"{group_name}:{first.table}:{label_types}",
                     sql=query,
                     parameters=parameters,
@@ -884,27 +1145,47 @@ def fetch_region_price(
                             group_raw[profile.type_column] == series.type_value
                         ].copy()
                     grouped_rows[group_name].append((series, series_raw))
+
+        market_rows: list[tuple[RegionalTimePointSeries, pd.DataFrame]] = []
+        if profile.market_series:
+            _market_credentials, market_connection = connection_for(market_prefix)
+            for market_group in _market_series_groups(profile.market_series):
+                query, parameters = _market_series_group_query(
+                    market_group,
+                    start=query_start,
+                    cutoff=local_cutoff,
+                )
+                first = market_group[0]
+                market_raw = _timed_query(
+                    market_connection,
+                    label=f"market:{first.table}",
+                    sql=query,
+                    parameters=parameters,
+                    metrics=metrics,
+                )
+                for series in market_group:
+                    market_rows.append(
+                        (
+                            series,
+                            market_raw.loc[
+                                market_raw[series.category_column] == series.category_value
+                            ].copy(),
+                        )
+                    )
     except Exception as exc:
         raise RegionSourceError(f"{profile.label}电价或影响因素读取失败：{exc}") from exc
     finally:
-        try:
-            connection.rollback()
-        finally:
-            connection.close()
+        for connection in source_connections.values():
+            try:
+                connection.rollback()
+            finally:
+                connection.close()
 
     if progress:
         progress(45, "正在整理电价时间点")
-    normalized, duplicate_rows, invalid_rows = _normalize_business_series(
-        raw,
-        profile,
-        name=profile.target_name,
-    )
+    normalized, duplicate_rows, invalid_rows = _normalize_price_series(raw, profile)
     if not history_raw.empty:
-        history, history_duplicates, history_invalid = _normalize_business_series(
-            history_raw,
-            profile,
-            name=profile.target_name,
-        )
+        history, history_duplicates, history_invalid = _normalize_price_series(history_raw, profile)
         duplicate_rows += history_duplicates
         invalid_rows += history_invalid
         if not history.empty:
@@ -945,6 +1226,29 @@ def fetch_region_price(
                 "duplicate_timestamp_rows": duplicates,
                 "invalid_rows": invalid,
             }
+
+    for series, series_raw in market_rows:
+        frame, duplicates, invalid = _normalize_time_point_series(
+            series_raw,
+            name=series.name,
+            date_column=series.date_column,
+            time_column=series.time_column,
+            value_column=series.value_column,
+            available_at_column=series.available_at_column,
+        )
+        if not frame.empty:
+            actual_frames.append(frame)
+        series_details["actual"][series.name] = {
+            "table": series.table,
+            "source_rows": len(series_raw),
+            "usable_rows": len(frame),
+            "start_at": frame["timestamp"].iloc[0].isoformat() if not frame.empty else "",
+            "end_at": frame["timestamp"].iloc[-1].isoformat() if not frame.empty else "",
+            "duplicate_timestamp_rows": duplicates,
+            "invalid_rows": invalid,
+            "category": series.category_value,
+            "availability": series.available_at_column or "business_timestamp_assumption",
+        }
 
     weather_ready = all(
         (
@@ -1092,7 +1396,7 @@ def fetch_region_price(
         end_at=normalized["timestamp"].iloc[-1],
         duplicate_timestamp_rows=duplicate_rows,
         invalid_rows=invalid_rows,
-        database_name=credentials.database,
+        database_name=price_credentials.database,
         actuals_path=actuals_path,
         forecasts_path=forecasts_path,
         actual_variable_names=actual_names,

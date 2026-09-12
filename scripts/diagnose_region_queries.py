@@ -13,6 +13,8 @@ from app.research.data.sources.regions import (
     RegionProfile,
     RegionSourceError,
     _connect,
+    _market_series_group_query,
+    _market_series_groups,
     _price_parameters,
     _price_query,
     _series_group_query,
@@ -41,21 +43,7 @@ def _feature_queries(
     start: datetime,
     cutoff: datetime,
 ) -> list[tuple[str, str, tuple[Any, ...]]]:
-    queries = [
-        (
-            f"price:{profile.price_table}",
-            _price_query(profile),
-            _price_parameters(profile, start=start, cutoff=cutoff),
-        )
-    ]
-    if profile.price_history_table:
-        queries.append(
-            (
-                f"price_history:{profile.price_history_table}",
-                _price_query(profile, profile.price_history_table),
-                _price_parameters(profile, start=start, cutoff=cutoff),
-            )
-        )
+    queries = []
     for group_name, configured, future in (
         ("actual", profile.actual_series, False),
         ("forecast", profile.forecast_series, True),
@@ -73,16 +61,64 @@ def _feature_queries(
     return queries
 
 
+def _price_queries(
+    profile: RegionProfile,
+    start: datetime,
+    cutoff: datetime,
+) -> list[tuple[str, str, tuple[Any, ...]]]:
+    queries = [
+        (
+            f"price:{profile.price_table}",
+            _price_query(profile),
+            _price_parameters(profile, start=start, cutoff=cutoff),
+        )
+    ]
+    if profile.price_history_table:
+        queries.append(
+            (
+                f"price_history:{profile.price_history_table}",
+                _price_query(profile, profile.price_history_table),
+                _price_parameters(profile, start=start, cutoff=cutoff),
+            )
+        )
+    return queries
+
+
+def _market_queries(
+    profile: RegionProfile,
+    start: datetime,
+    cutoff: datetime,
+) -> list[tuple[str, str, tuple[Any, ...]]]:
+    queries = []
+    for group in _market_series_groups(profile.market_series):
+        sql, parameters = _market_series_group_query(group, start=start, cutoff=cutoff)
+        queries.append((f"market:{group[0].table}", sql, parameters))
+    return queries
+
+
 def _index_suggestions(profile: RegionProfile) -> list[dict[str, Any]]:
     suggestions: dict[str, list[str]] = {}
-    suggestions[profile.price_table] = [
-        profile.province_column,
-        profile.type_column,
-        profile.date_column,
-        profile.hour_column,
-        profile.minute_column,
-        profile.available_at_column,
-    ]
+    if profile.price_layout == "time_point":
+        price_columns = [
+            profile.price_date_column,
+            profile.price_time_column,
+        ]
+        if profile.price_available_at_column:
+            price_columns.append(profile.price_available_at_column)
+        if profile.price_filter_province:
+            price_columns.insert(0, profile.province_column)
+        if profile.price_filter_type:
+            price_columns.insert(0, profile.type_column)
+        suggestions[profile.price_table] = price_columns
+    else:
+        suggestions[profile.price_table] = [
+            profile.province_column,
+            profile.type_column,
+            profile.date_column,
+            profile.hour_column,
+            profile.minute_column,
+            profile.available_at_column,
+        ]
     if profile.price_history_table:
         suggestions[profile.price_history_table] = list(suggestions[profile.price_table])
     for series in (*profile.actual_series, *profile.forecast_series):
@@ -98,6 +134,11 @@ def _index_suggestions(profile: RegionProfile) -> list[dict[str, Any]]:
             )
         )
         suggestions.setdefault(series.table, columns)
+    for series in profile.market_series:
+        columns = [series.category_column, series.date_column, series.time_column]
+        if series.available_at_column:
+            columns.append(series.available_at_column)
+        suggestions.setdefault(series.table, columns)
     for table in (profile.weather_actual_table, profile.weather_forecast_table):
         if table:
             suggestions[table] = ["province_name", "forecast_time", "create_time"]
@@ -109,17 +150,34 @@ def _index_suggestions(profile: RegionProfile) -> list[dict[str, Any]]:
 def diagnose(profile: RegionProfile) -> dict[str, Any]:
     cutoff = datetime.now(UTC).astimezone(ZoneInfo(profile.timezone)).replace(tzinfo=None)
     start = datetime.combine(profile.history_start_date, time.min)
-    feature_connection = _connect(credentials_for(profile))
-    try:
-        plans = [
-            _explain(feature_connection, label, sql, parameters)
-            for label, sql, parameters in _feature_queries(profile, start, cutoff)
-        ]
-    finally:
+    plans = []
+    source_groups = [
+        (
+            profile.price_credential_prefix or profile.credential_prefix,
+            _price_queries(profile, start, cutoff),
+        ),
+        (profile.credential_prefix, _feature_queries(profile, start, cutoff)),
+        (
+            profile.market_credential_prefix
+            or profile.price_credential_prefix
+            or profile.credential_prefix,
+            _market_queries(profile, start, cutoff),
+        ),
+    ]
+    for prefix, queries in source_groups:
+        if not queries:
+            continue
+        connection = _connect(credentials_for(profile, prefix))
         try:
-            feature_connection.rollback()
+            plans.extend(
+                _explain(connection, label, sql, parameters)
+                for label, sql, parameters in queries
+            )
         finally:
-            feature_connection.close()
+            try:
+                connection.rollback()
+            finally:
+                connection.close()
     if profile.analytics_credential_prefix and profile.weather_actual_table and profile.weather_forecast_table:
         analytics_connection = _connect(credentials_for(profile, profile.analytics_credential_prefix))
         try:

@@ -14,8 +14,13 @@ from app.research.data.sources.regions import (
     RegionalSeries,
     RegionProfile,
     RegionSourceError,
+    _combine_series_frames,
     _expand_hour_ending_series,
+    _market_series_group_query,
     _merge_actual_weather,
+    _normalize_price_series,
+    _price_parameters,
+    _price_query,
     _series_group_query,
     _series_groups,
     credentials_for,
@@ -97,7 +102,7 @@ def _configure(monkeypatch) -> None:
 
 def test_builtin_catalog_contains_shandong() -> None:
     profiles = load_region_profiles()
-    assert list(profiles) == ["shandong"]
+    assert list(profiles) == ["shandong", "sichuan"]
     profile = profiles["shandong"]
     assert profile.market == "山东电网"
     assert profile.price_history_table == "t_data_province_real_time_cleared_price_hour"
@@ -124,6 +129,85 @@ def test_builtin_catalog_contains_shandong() -> None:
     ]
     assert len(_series_groups(profile.actual_series)) == 5
     assert len(_series_groups(profile.forecast_series)) == 4
+
+
+def test_builtin_catalog_contains_sichuan_sources() -> None:
+    profile = load_region_profiles()["sichuan"]
+
+    assert profile.market == "四川电网"
+    assert profile.price_credential_prefix == "VPP_SICHUAN_DB_PRICE"
+    assert profile.market_credential_prefix == "VPP_SICHUAN_DB_PRICE"
+    assert profile.analytics_credential_prefix == "VPP_SICHUAN_DB_ANALYTICS"
+    assert profile.price_layout == "time_point"
+    assert profile.price_table == "t_api_real_time_cleared_price"
+    assert profile.price_filter_province is False
+    assert profile.price_filter_type is False
+    assert [item.name for item in profile.actual_series] == [
+        "actual_load",
+        "total_generation",
+        "non_market_output",
+        "renewable_output",
+        "actual_wind",
+        "actual_hydro",
+        "actual_solar",
+    ]
+    assert [item.name for item in profile.forecast_series] == [
+        "forecast_load",
+        "forecast_generation",
+        "forecast_wind",
+        "forecast_solar",
+        "forecast_hydro",
+    ]
+    assert len(profile.market_series) == 6
+
+
+def test_time_point_price_query_and_normalization_support_24_hour() -> None:
+    profile = load_region_profiles()["sichuan"]
+    start = datetime.fromisoformat("2026-09-01T00:00:00")
+    cutoff = datetime.fromisoformat("2026-09-10T12:00:00")
+
+    sql = _price_query(profile)
+    parameters = _price_parameters(profile, start=start, cutoff=cutoff)
+    assert "`trade_date`,`time_point`,`price`" in sql
+    assert "SUBSTRING_INDEX(`time_point`" in sql
+    assert "`province`" not in sql and "`type`" not in sql
+    assert "`create_time`" not in sql
+    assert parameters == (start.date(), cutoff.date(), start, cutoff)
+
+    raw = pd.DataFrame(
+        {
+            "trade_date": [date(2026, 9, 9), date(2026, 9, 9)],
+            "time_point": ["23:45", "24:00"],
+            "price": [Decimal("321.5"), Decimal("330.0")],
+            "create_time": ["2026-09-09T23:50:00", "2026-09-10T00:05:00"],
+        }
+    )
+    normalized, duplicates, invalid = _normalize_price_series(raw, profile)
+
+    assert normalized["timestamp"].tolist() == [
+        pd.Timestamp("2026-09-09T23:45:00"),
+        pd.Timestamp("2026-09-10T00:00:00"),
+    ]
+    assert normalized["rt_price"].tolist() == [321.5, 330.0]
+    assert duplicates == 0 and invalid == 0
+
+
+def test_market_series_query_reads_all_cleared_quantity_categories_once() -> None:
+    profile = load_region_profiles()["sichuan"]
+    start = datetime.fromisoformat("2026-09-01T00:00:00")
+    cutoff = datetime.fromisoformat("2026-09-10T12:00:00")
+
+    sql, parameters = _market_series_group_query(
+        profile.market_series,
+        start=start,
+        cutoff=cutoff,
+    )
+
+    assert "FROM `t_api_intraday_cleared_quantity`" in sql
+    assert "`lx` IN (%s,%s,%s,%s,%s,%s)" in sql
+    assert "SUBSTRING_INDEX(`time_point`" in sql
+    assert "`create_time`" not in sql
+    assert parameters[:6] == tuple(item.category_value for item in profile.market_series)
 
 
 def test_same_table_types_share_one_bounded_query() -> None:
@@ -269,6 +353,62 @@ def test_actual_weather_prefers_era5_and_uses_gfs_for_missing_hours() -> None:
     assert fill_hours == 1
     assert len(merged) == 8
     assert merged["temperature"].tolist() == [20] * 4 + [21] * 4
+
+
+def test_actual_weather_can_fall_back_to_gfs_when_era5_window_is_empty() -> None:
+    profile = RegionProfile(
+        region_id="sichuan",
+        label="四川",
+        market="四川电网",
+        province_value="四川省",
+        timezone="Asia/Shanghai",
+        frequency="15min",
+        credential_prefix="VPP_SICHUAN_DB_FEATURE",
+        price_table="t_price",
+        price_label="实时电价",
+        analytics_credential_prefix="VPP_SICHUAN_DB_ANALYTICS",
+        weather_actual_table="t_weather_actual",
+        weather_forecast_table="t_weather_forecast",
+        weather_columns=("temperature",),
+    )
+    empty_era5 = pd.DataFrame(columns=["forecast_time", "temperature", "create_time"])
+    gfs = pd.DataFrame(
+        {
+            "forecast_time": ["2026-09-10T00:00:00"],
+            "temperature": [21],
+            "create_time": ["2026-09-09T20:00:00"],
+        }
+    )
+
+    merged, fill_hours = _merge_actual_weather(empty_era5, gfs, profile)
+
+    assert fill_hours == 1
+    assert len(merged) == 4
+    assert merged["temperature"].tolist() == [21] * 4
+
+
+def test_combining_sparse_sources_normalizes_availability_timestamps() -> None:
+    first = pd.DataFrame(
+        {
+            "timestamp": [pd.Timestamp("2026-09-10T00:00:00")],
+            "actual_load": [100.0],
+            "available_at": [pd.Timestamp("2026-09-10T00:05:00")],
+        }
+    )
+    second = pd.DataFrame(
+        {
+            "timestamp": [pd.Timestamp("2026-09-10T00:15:00")],
+            "intraday_total_cleared_quantity": [200.0],
+            "available_at": [pd.Timestamp("2026-09-10T00:15:00")],
+        }
+    )
+
+    combined = _combine_series_frames([first, second])
+
+    assert combined["available_at"].tolist() == [
+        pd.Timestamp("2026-09-10T00:05:00"),
+        pd.Timestamp("2026-09-10T00:15:00"),
+    ]
 
 
 class _DynamicCursor:

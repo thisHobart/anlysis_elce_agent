@@ -177,9 +177,9 @@ class ResearchSession(BaseModel):
     data_state: DataPanelState = "empty"
     data_summary: DataSummary | None = None
     dataset_fingerprint: str | None = None
-    region_id: str = "shandong"
-    region_label: str = "山东"
-    region_market: str = "山东电网"
+    region_id: str = ""
+    region_label: str = ""
+    region_market: str = ""
     region_timezone: str = "Asia/Shanghai"
     database_fetch_details: dict[str, Any] = Field(default_factory=dict)
     analysis_start_time: str | None = None

@@ -19,6 +19,14 @@ columns:
   clearing_price: 出清电价
   price: 电价
 
+  # 市场出清电量
+  intraday_total_cleared_quantity: 日内总出清电量
+  intraday_wind_cleared_quantity: 日内风电出清电量
+  intraday_solar_cleared_quantity: 日内光伏出清电量
+  intraday_hydro_cleared_quantity: 日内水电出清电量
+  intraday_thermal_cleared_quantity: 日内火电出清电量
+  intraday_storage_cleared_quantity: 日内储能出清电量
+
   # 负荷
   actual_load: 统调负荷
   system_load: 统调负荷

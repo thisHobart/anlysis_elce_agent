@@ -68,3 +68,96 @@ regions:
       - cloud_cover
       - solar_radiation
       - hour_precipitation
+  - region_id: sichuan
+    label: 四川
+    market: 四川电网
+    province_value: 四川省
+    timezone: Asia/Shanghai
+    frequency: 15min
+    history_start_date: 2025-09-11
+    refresh_lookback_days: 30
+    credential_prefix: VPP_SICHUAN_DB_FEATURE
+    price_credential_prefix: VPP_SICHUAN_DB_PRICE
+    price_table: t_api_real_time_cleared_price
+    price_label: 实时出清电价
+    target_name: rt_price
+    price_layout: time_point
+    price_date_column: trade_date
+    price_time_column: time_point
+    price_value_column: price
+    # The API tables currently leave create_time null, so availability falls
+    # back to the business timestamp and is recorded as an assumption.
+    price_available_at_column:
+    price_filter_province: false
+    price_filter_type: false
+    actual_series:
+      - name: actual_load
+        table: t_data_dr_province_actual_load
+        type_value: 8
+      - name: total_generation
+        table: t_data_dr_province_total_electricity
+      - name: non_market_output
+        table: t_data_dr_province_power_generation
+        type_value: 1
+      - name: renewable_output
+        table: t_data_dr_province_actual_new_energy_exert
+        type_value: 0
+      - name: actual_wind
+        table: t_data_dr_province_actual_new_energy_exert
+        type_value: 4
+      - name: actual_hydro
+        table: t_data_dr_province_actual_new_energy_exert
+        type_value: 2
+      - name: actual_solar
+        table: t_data_dr_province_actual_new_energy_exert
+        type_value: 1
+    forecast_series:
+      - name: forecast_load
+        table: t_data_sdc_province_recently_forecast_load
+        type_value: 8
+      - name: forecast_generation
+        table: t_data_sdc_province_recently_forecast_electricity
+      - name: forecast_wind
+        table: t_data_sdc_province_recently_forecast_electricity_energy
+        type_value: 4
+      - name: forecast_solar
+        table: t_data_sdc_province_recently_forecast_electricity_energy
+        type_value: 1
+      - name: forecast_hydro
+        table: t_data_sdc_province_recently_forecast_electricity_water
+    market_credential_prefix: VPP_SICHUAN_DB_PRICE
+    market_series:
+      - name: intraday_total_cleared_quantity
+        table: t_api_intraday_cleared_quantity
+        category_value: 总出清电量
+        available_at_column:
+      - name: intraday_wind_cleared_quantity
+        table: t_api_intraday_cleared_quantity
+        category_value: 风电
+        available_at_column:
+      - name: intraday_solar_cleared_quantity
+        table: t_api_intraday_cleared_quantity
+        category_value: 光伏
+        available_at_column:
+      - name: intraday_hydro_cleared_quantity
+        table: t_api_intraday_cleared_quantity
+        category_value: 水电
+        available_at_column:
+      - name: intraday_thermal_cleared_quantity
+        table: t_api_intraday_cleared_quantity
+        category_value: 火电
+        available_at_column:
+      - name: intraday_storage_cleared_quantity
+        table: t_api_intraday_cleared_quantity
+        category_value: 储能
+        available_at_column:
+    analytics_credential_prefix: VPP_SICHUAN_DB_ANALYTICS
+    weather_actual_table: t_spo_aiweather_province_hourly_forecast_ERA5
+    weather_forecast_table: t_spo_aiweather_province_hourly_forecast
+    weather_daily_table: t_spo_aiweather_province_daily_forecast
+    weather_columns:
+      - temperature
+      - wind_speed_eighty
+      - cloud_cover
+      - solar_radiation
+      - hour_precipitation
