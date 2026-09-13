@@ -38,7 +38,7 @@ STRUCTURED_OUTPUT_OPTIONS: tuple[tuple[str, str], ...] = (
     ("function_calling", "Function Calling（原生）"),
     ("json_schema", "JSON Schema（原生）"),
     ("json_mode", "JSON Object（仅格式）"),
-    ("prompt_json", "Cherry 兼容 JSON（本地校验）"),
+    ("prompt_json", "Cherry 兼容 JSON/函数选择（本地校验）"),
 )
 
 
@@ -117,7 +117,7 @@ class ModelConfigDialog(QDialog):
             )
         )
         self.structured_method.setToolTip(
-            "Cherry 转发 Gemini 时请选择兼容 JSON；结果仍由本地 schema 严格校验。"
+            "Cherry 不转发 schema 或 tools 时请选择兼容模式；结构化结果、函数白名单和参数仍在本地校验。"
         )
 
         self.base_url = QLineEdit(settings.llm_base_url)
@@ -147,8 +147,8 @@ class ModelConfigDialog(QDialog):
         form.addRow("模型", self.model)
 
         protocol_notice = QLabel(
-            "原生协议优先。Cherry 未转发 Gemini schema 时，可显式选择兼容 JSON；"
-            "程序会把 schema 随提示发送，并在本地严格校验，失败结果不会进入分析。"
+            "原生协议优先。Cherry 未转发 Gemini schema 或 tools 时，可显式选择兼容模式；"
+            "程序会把 schema 和函数白名单随提示发送，并在本地严格校验，失败结果不会进入分析。"
         )
         protocol_notice.setObjectName("modelProtocolNotice")
         protocol_notice.setWordWrap(True)

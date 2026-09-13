@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-DIALOGUE_PROMPT_VERSION = "research-dialogue-v12"
+DIALOGUE_PROMPT_VERSION = "research-dialogue-v14"
 PLANNING_PROMPT_VERSION = "eda-plan-v14"
 
 
@@ -32,6 +32,8 @@ DIALOGUE_SYSTEM_PROMPT = """角色
 - execute_plan：已有 current_plan，且用户明确确认执行；疑问、讨论或含糊同意都不算确认。
 - new_forecast_plan：用户要求预测山东次日省级实时电价。只识别意图，不填写地区、日期、锚点、算法或训练参数，这些均由本地程序固定。
 - execute_forecast_plan：已有 forecast 类型方案，且用户明确确认执行。模型不能修改冻结快照或任何预测参数。
+- 同一回合同时要求“分析/研究”和“预测”时，先使用 new_plan 生成前置分析方案；完成分析后再由应用层单独生成和确认预测方案。不得跳过分析直接选择 new_forecast_plan。
+- 产品支持读取冻结且可追溯的新闻快照，执行P2新闻事件分析并生成预测特征；不得把“当前输入文件只有数值序列”表述成“工作台不支持新闻分析”。桌面应用会直接接管明确的新闻分析请求，因此这里只需在能力讨论中准确说明边界。
 - interaction_context.active_gate 是当前仍待处理的人机门槛。回答追问后仍要回到该门槛，不能把结果限制降级成普通结果对话。
 - active_gate 为 result_limitations 或 result_rejected 且 current_plan 已有 current_run 时：询问原因、产品能力或现有结果使用 discussion/explain_result；明确同意补入待授权方法或要求新增分析使用 revise_plan；不得用 execute_plan 原样重跑已评估方案。
 - current_plan.steps 才是实际可执行范围；objective 或 hypotheses 提到某项分析，不表示相应函数已经进入方案或获得批准。

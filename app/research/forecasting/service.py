@@ -21,6 +21,7 @@ from app.research.forecasting.artifacts import (
     write_report,
 )
 from app.research.forecasting.contracts import (
+    FORECAST_ALGORITHM_VERSION,
     ForecastFoldResult,
     ForecastMetricSet,
     ForecastPlan,
@@ -151,6 +152,10 @@ def run_forecast_plan(
 
     callback = progress or (lambda _value, _message: None)
     is_cancelled = cancelled or (lambda: False)
+    if plan.algorithm_version != FORECAST_ALGORITHM_VERSION:
+        raise ValueError(
+            f"预测算法版本已变化：方案={plan.algorithm_version}，当前={FORECAST_ALGORITHM_VERSION}；请重新确认新方案"
+        )
     root = next(item.path.parent.parent for item in plan.snapshots if item.role == "future")
     figures = root / "figures"
     provenance = root / "provenance"
@@ -167,6 +172,9 @@ def run_forecast_plan(
             and _sha256(snapshot.truth_path)[:12] != snapshot.truth_fingerprint
         ):
             raise ValueError(f"回测真实值指纹已经变化：{snapshot.truth_path.name}")
+    for source in plan.news_feature_sources:
+        if not source.source_path.is_file() or _sha256(source.source_path) != source.source_sha256:
+            raise ValueError(f"新闻特征来源指纹已经变化：{source.source_path.name}")
     if "future" in completed and stored_result_path.is_file():
         try:
             stored_result = ForecastRunResult.model_validate_json(
@@ -214,6 +222,19 @@ def run_forecast_plan(
             except (OSError, ValueError):
                 completed.discard(work_item)
             else:
+                common_columns = [
+                    "actual_rt_price",
+                    "predicted_rt_price",
+                    "persistence",
+                    "day_naive",
+                    "week_naive",
+                ]
+                result = result.model_copy(
+                    update={
+                        "common_observations": len(points[common_columns].dropna()),
+                        "news_feature_columns": snapshot.news_feature_columns,
+                    }
+                )
                 fold_results.append(result)
                 fold_frames.append(points)
                 callback(5 + number * 22, f"已恢复第 {number}/3 个历史回测")
@@ -272,6 +293,8 @@ def run_forecast_plan(
             week_naive=_metrics(common["actual_rt_price"], common["week_naive"]),
             prediction_path=fold_path,
             snapshot_fingerprint=snapshot.fingerprint,
+            common_observations=len(common),
+            news_feature_columns=snapshot.news_feature_columns,
         )
         fold_results.append(result)
         fold_frames.append(points)
@@ -287,10 +310,10 @@ def run_forecast_plan(
     backtest.to_parquet(backtest_path, index=False)
     aggregate = _aggregate(backtest)
     warnings: list[str] = list(plan.preflight_warnings)
-    enough_comparable_points = aggregate["model"].observations >= 3 * 72
+    enough_comparable_points = all(item.common_observations >= 72 for item in fold_results)
     if not enough_comparable_points:
         warnings.append(
-            "基线可比点不足：模型与三种朴素基线共同有效点少于每折72点，不能验证预测增益"
+            "基线可比点不足：三个回测折未分别达到72个共同有效点，不能验证预测增益"
         )
     if not enough_comparable_points or aggregate["model"].mae >= min(
         aggregate["day_naive"].mae,
@@ -424,6 +447,23 @@ def run_forecast_plan(
             "baseline_verified": aggregate["model"].mae
             < min(aggregate["day_naive"].mae, aggregate["week_naive"].mae)
             and enough_comparable_points,
+            "evaluation_status": (
+                "not_evaluable"
+                if not enough_comparable_points
+                else (
+                    "verified"
+                    if aggregate["model"].mae
+                    < min(aggregate["day_naive"].mae, aggregate["week_naive"].mae)
+                    else "not_verified"
+                )
+            ),
+            "fold_common_observations": [item.common_observations for item in fold_results],
+            "news_feature_columns": sorted(
+                {column for item in plan.snapshots for column in item.news_feature_columns}
+            ),
+            "news_feature_sources": [
+                item.model_dump(mode="json") for item in plan.news_feature_sources
+            ],
         },
         warnings=warnings,
         prediction_path=prediction_path,

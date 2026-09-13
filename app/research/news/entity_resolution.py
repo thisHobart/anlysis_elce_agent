@@ -91,7 +91,7 @@ class EntityResolution(BaseModel):
                 raise ValueError("region key is not supported by its source mentions")
         for entity in self.asset_groups:
             if entity.rule_id != "asset_group" or any(
-                (group_key(mentions[mid].quote) or canonical_asset(mentions[mid].quote)) != entity.key
+                canonical_group_key(mentions[mid].quote) != entity.key
                 for mid in entity.mention_ids
             ):
                 raise ValueError("group key is not supported by its source mentions")
@@ -194,6 +194,22 @@ _EN_SINGLE = re.compile(
     r"(?P<base>.+?(?:Power Station|Power Plant|Plant|Station))\s+(?:Generating\s+)?Unit\s+(?P<id>\d+)", re.IGNORECASE
 )
 _CN_SINGLE = re.compile(r"(?P<base>.+?(?:电厂|电站))\s*(?P<id>\d+)号机组")
+_CN_GROUP_COUNT_PREFIX = re.compile(r"^\s*\d+(?:[.,，]\d+)?\s*(?:座|台|家|个|处|所|套)\s*")
+
+
+def canonical_group_key(value: str) -> str:
+    """Normalize a collection label without erasing its substantive scope.
+
+    A model may quote either ``172座新型储能电站`` or ``新型储能电站``. The
+    leading count describes the size of the same collection, so it must not create
+    a different identity. Modifiers such as ``存量`` and ``新增`` remain because
+    they change which projects a statement applies to.
+    """
+
+    without_count = re.sub(r"^\s*\d+\s+", "", value)
+    without_count = _CN_GROUP_COUNT_PREFIX.sub("", without_count)
+    normalized = canonical_asset(without_count)
+    return _GROUPS.get(normalized, normalized)
 
 
 def group_key(value: str) -> str | None:
@@ -238,8 +254,10 @@ def split_explicit_units(value: str) -> tuple[str, ...] | None:
 
 def _exact(value: str, quote: str):
     # Latin word boundaries prevent Unit 1 matching Unit 10, or AGR matching AGRs.
-    prefix = r"(?<![\w])" if value and value[0].isascii() and value[0].isalnum() else ""
-    suffix = r"(?![\w])" if value and value[-1].isascii() and value[-1].isalnum() else ""
+    # ``\w`` also includes Chinese characters, which incorrectly rejects an ASCII count
+    # immediately after Chinese prose (for example ``省172座新型储能电站``).
+    prefix = r"(?<![A-Za-z0-9_])" if value and value[0].isascii() and value[0].isalnum() else ""
+    suffix = r"(?![A-Za-z0-9_])" if value and value[-1].isascii() and value[-1].isalnum() else ""
     return re.search(prefix + re.escape(value) + suffix, quote, re.IGNORECASE)
 
 
@@ -391,7 +409,7 @@ def resolve_entities(
                             save(
                                 "groups",
                                 match[0],
-                                canonical_asset(value),
+                                canonical_group_key(value),
                                 span,
                                 match.start(),
                                 match.end(),

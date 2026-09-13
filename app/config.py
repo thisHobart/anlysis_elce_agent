@@ -31,7 +31,8 @@ class Settings(BaseSettings):
     """Native structured-output protocol used by OpenAI-compatible adapters.
 
     ``prompt_json`` is an explicit compatibility mode for proxies such as Cherry Studio:
-    the schema is included in a system message and enforced locally after generation.
+    the schema and research-function whitelist are included in a system message and
+    enforced locally after generation. No model proposal executes before normal plan approval.
     The native Gemini adapter always uses Gemini ``json_schema`` and ignores this switch.
     """
     llm_base_url: str = ""
@@ -60,6 +61,8 @@ class Settings(BaseSettings):
     """Approximate recent-message budget, selected as half as many complete turns."""
     llm_retrieved_turns: int = Field(default=3, ge=0, le=10)
     """Earlier related conversation turns retrieved beyond the recent window; 0 disables retrieval."""
+    p2_news_path: str = ""
+    """Optional frozen JSONL corpus used by the desktop P1→P2→P3 workflow."""
     skill_paths: str = ""
     model_config = SettingsConfigDict(
         env_file=str(runtime_env_file()),

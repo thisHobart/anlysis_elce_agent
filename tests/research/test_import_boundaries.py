@@ -101,14 +101,15 @@ def _imported_modules(path: Path) -> list[str]:
 
 
 def test_p1_domain_does_not_import_the_p2_news_domain() -> None:
-    """The boundary must hold in both directions, or the two phases drift into one."""
+    """Domain modules stay separate; the explicit full-flow application service may coordinate both."""
 
     repository_root = Path(__file__).resolve().parents[2]
     research_root = repository_root / "app" / "research"
     violations: list[str] = []
 
     for path in research_root.rglob("*.py"):
-        if "news" in path.relative_to(research_root).parts:
+        parts = path.relative_to(research_root).parts
+        if "news" in parts or "full_flow" in parts:
             continue
         for module_name in _imported_modules(path):
             if module_name.startswith("app.research.news"):

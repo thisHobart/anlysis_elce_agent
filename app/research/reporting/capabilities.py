@@ -48,6 +48,12 @@ def report_capabilities_context() -> dict[str, Any]:
         "figure_format": "SVG",
         "figures_are_derived_from_executed_evidence": True,
         "desktop_report_reader": True,
+        "supported_workflows": {
+            "eda": "电价与数值型外生变量的确定性分析",
+            "news": "读取冻结且可追溯的新闻JSONL，抽取事件、复核时点并生成数值特征",
+            "forecast": "P1初步分析 → P2新闻分析 → P1综合分析 → P3三折回测与山东次日96点预测",
+            "forecast_requires_separate_approval": True,
+        },
         "figure_catalog": [
             {"key": key, **specification}
             for key, specification in FIGURE_CATALOG.items()
@@ -58,6 +64,7 @@ def report_capabilities_context() -> dict[str, Any]:
             "direct_image_generation": False,
         },
         "limitations": [
+            "P2只读取已冻结且带来源与取得时间的新闻快照；没有合格快照时不能声称已经分析新闻。",
             "只为本轮已执行且具有可绘制证据的分析生成图表，不是每个研究函数都有对应图表。",
             "没有完成执行与报告最终化时，只能说明项目支持哪些图，不能声称当前已有图表。",
             "未列入 figure_catalog 的图形不承诺生成；当前月度画像是均值柱状图，不是箱线图。",

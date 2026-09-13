@@ -205,6 +205,7 @@ def test_dialogue_prompt_states_route_contract_and_version(synthetic_study: Path
     assert "task_scope" not in payload
     assert "output_schema" not in payload
     assert payload["output_capabilities"]["desktop_report_reader"] is True
+    assert "news" in payload["output_capabilities"]["supported_workflows"]
     assert payload["interaction_context"]["current_run"]["status"] == "available"
     assert payload["interaction_context"]["current_run"]["figure_count"] == 2
     assert [item["key"] for item in payload["interaction_context"]["current_run"]["figures"]] == [

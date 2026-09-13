@@ -4,6 +4,7 @@ import itertools
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,7 +28,13 @@ from app.research.news.analysis import (
     _control_windows,
     _window_metrics,
 )
-from app.research.news.workspace import CachedNewsExtractor, NewsWorkspace, WorkspaceNewsAdapter, export_study
+from app.research.news.workspace import (
+    CachedNewsExtractor,
+    NewsWorkspace,
+    WorkspaceNewsAdapter,
+    export_study,
+    study_needs_review,
+)
 from scripts.run_news_workbench import main
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "news_price"
@@ -188,6 +195,28 @@ def test_review_is_a_new_visible_revision_and_does_not_rewrite_old_features(tmp_
         as_of=new.as_of,
     )
     assert old_features.rows == new_features.rows
+
+
+def test_explicit_review_of_imprecise_short_term_event_closes_the_review_gate() -> None:
+    event = SimpleNamespace(
+        relevance="short_term",
+        effective_start_at=None,
+        review_status="accepted",
+    )
+    reviewed = SimpleNamespace(
+        result_quality=SimpleNamespace(passed=True),
+        view=SimpleNamespace(events=(event,), quarantined=()),
+    )
+    pending = SimpleNamespace(
+        result_quality=reviewed.result_quality,
+        view=SimpleNamespace(
+            events=(SimpleNamespace(**{**event.__dict__, "review_status": "unreviewed"}),),
+            quarantined=(),
+        ),
+    )
+
+    assert not study_needs_review(reviewed)
+    assert study_needs_review(pending)
 
 
 def test_import_cannot_impersonate_local_review(tmp_path):

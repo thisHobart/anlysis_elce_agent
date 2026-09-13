@@ -40,7 +40,7 @@ def test_model_schema_version_literal_matches_the_published_schema_version():
         }
     )
 
-    assert result.schema_version == "1.3.0"
+    assert result.schema_version == "1.4.0"
 
 
 def _document_payload(messages) -> dict:

@@ -55,7 +55,7 @@
 
 **方案**　由 `MainResearchAgent`（`app/research/agent/orchestrator.py`）判断当前回合属于方法讨论、新建方案、修订方案、结果解释还是执行确认，`EDASubagent`（`app/research/agent/subagents/eda.py`）在当前 Skill 授权范围内选择具体函数并形成结构化计划。结构化计划固定使用 Function Calling 产出，不接受自由文本解析。
 
-**机制**　模型接入集中于 `app/llm`：`ModelGateway`（`gateway.py`）定义 Agent 自有的类型化消息、结构化输出、文本输出与 Function Calling 契约，`ResearchModelGateway`（`openai_compatible.py`）把这些对象交给显式选择的 Chat Completions 或 Responses 适配器，`factory.py` 为主 Agent 与 EDA Subagent 注入同一网关。`tools`、`tool_choice`、消息角色和结构化 schema 属于核心协议，端点拒绝或未返回原生调用时直接报告配置不兼容，不再切换 API，也不解析自由文本或提示词 JSON。`compat.py` 只允许移除温度、Provider 自动添加的推理控制和 `parallel_tool_calls` 等非核心字段，并保留非标准 HTTP 响应信封修复。端点仍返回 `reasoning_content`、reasoning block 或 `<think>` 内容时，默认策略（`VPP_LLM_THINKING_POLICY=strip`）丢弃思考内容后继续，严格策略（`reject`）维持 fail-closed。模型返回无效调用、空回复或未授权内容时流程暂停并提示重试。
+**机制**　模型接入集中于 `app/llm`：`ModelGateway`（`gateway.py`）定义 Agent 自有的类型化消息、结构化输出、文本输出与 Function Calling 契约，`ResearchModelGateway`（`openai_compatible.py`）把这些对象交给显式选择的 Chat Completions 或 Responses 适配器，`factory.py` 为主 Agent 与 EDA Subagent 注入同一网关。原生模式把 `tools`、`tool_choice`、消息角色和结构化 schema 视为核心协议，端点拒绝或未返回原生调用时报告配置不兼容。只有用户显式选择 `prompt_json` 时，兼容路径才把结构化 schema、函数白名单和参数定义放入提示，响应必须通过本地 Pydantic、白名单与计划编译校验；该路径不宣称服务端执行了原生协议。`compat.py` 只允许移除温度、Provider 自动添加的推理控制和 `parallel_tool_calls` 等非核心字段，并保留非标准 HTTP 响应信封修复。端点仍返回 `reasoning_content`、reasoning block 或 `<think>` 内容时，默认策略（`VPP_LLM_THINKING_POLICY=strip`）丢弃思考内容后继续，严格策略（`reject`）维持 fail-closed。模型返回无效调用、空回复或未授权内容时流程暂停并提示重试。
 
 **选型理由** 〔待确认〕　候选方案 A 为提示词约定 JSON 格式并由正则或 JSON 解析器提取，实现成本低，但格式违约率随对话轮次上升，且无法区分模型意图错误与格式错误；候选方案 B 为自定义 DSL，须自行实现解析、校验与错误提示，成本高于直接复用 Function Calling 的参数 schema。选择 Function Calling 的关键收益在于参数 schema 由服务端参与约束，违约在调用侧即被捕获。关闭 thinking 是以推理质量换取输出稳定性与延迟可控的取舍，其前提是复杂判断已由确定性组件承担，模型不需承担长链推理。
 

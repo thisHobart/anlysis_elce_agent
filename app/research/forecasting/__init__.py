@@ -3,6 +3,7 @@
 from app.research.forecasting.contracts import (
     ForecastFoldResult,
     ForecastMetricSet,
+    ForecastNewsFeatureSource,
     ForecastPlan,
     ForecastRunResult,
     ForecastSnapshotSpec,
@@ -11,6 +12,7 @@ from app.research.forecasting.contracts import (
 __all__ = [
     "ForecastFoldResult",
     "ForecastMetricSet",
+    "ForecastNewsFeatureSource",
     "ForecastPlan",
     "ForecastRunResult",
     "ForecastSnapshotSpec",

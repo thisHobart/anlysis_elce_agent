@@ -1,0 +1,11 @@
+{
+  "corpus_id": "shandong-p2-test-news-2026-09-12",
+  "frozen_at": "2026-09-12T19:43:35+08:00",
+  "record_count": 8,
+  "maximum_supplemental_documents": 20,
+  "source_file": "shandong_p2_test_news.jsonl",
+  "source_file_sha256": "33e939e45866671e7a17960f7d6d21eb1a36a064f79a02168bb7e602dd2d22a8",
+  "selection_policy": "Shandong relevance, checkable source and complete publication/collection timing; selected before P2/P3 results",
+  "scope_note": "Frozen extractive excerpts. They support pipeline timing and evidence tests but do not represent a complete news archive.",
+  "browser_mcp_changed": false
+}

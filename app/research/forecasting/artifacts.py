@@ -80,7 +80,8 @@ def write_report(
     warnings: list[str],
     destination: Path,
 ) -> None:
-    verified = aggregate["model"].observations >= 3 * 72 and aggregate["model"].mae < min(
+    enough_points = all(fold.common_observations >= 72 for fold in folds)
+    verified = enough_points and aggregate["model"].mae < min(
         aggregate["day_naive"].mae,
         aggregate["week_naive"].mae,
     )
@@ -119,7 +120,16 @@ def write_report(
         )
     lines.extend(["", "## 回测锚点", ""])
     for fold in folds:
-        lines.append(f"- {fold.anchor.isoformat()}：模型 MAE {fold.model.mae:.2f}")
+        lines.append(
+            f"- {fold.anchor.isoformat()}：模型 MAE {fold.model.mae:.2f}；"
+            f"共同有效点 {fold.common_observations}/96"
+        )
+    lines.extend(["", "## 新闻特征", ""])
+    news_columns = sorted({column for fold in folds for column in fold.news_feature_columns})
+    if news_columns:
+        lines.append("本次模型实际读取的新闻特征：" + "、".join(f"`{name}`" for name in news_columns) + "。")
+    else:
+        lines.append("本次没有新闻特征通过选择与可获得性门禁。")
     lines.extend(["", "## 限制与警告", ""])
     lines.extend(f"- {warning}" for warning in warnings)
     if not warnings:

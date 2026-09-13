@@ -23,6 +23,9 @@ BODY = "8月3日11时06分，辽宁电网最大用电负荷冲至4775万千瓦�
 TIME_TEXT = "8月3日11时06分"
 # No power figures and no operational vocabulary, so a terminal "irrelevant" is believable.
 SOCIAL_BODY = "服务队在37个社区开展爱心服务活动，长期提供管家式陪伴。"
+STORAGE_BODY = BODY + "涉及172座新型储能电站。"
+POLICY_BODY = BODY + "存量新能源项目与新能源项目执行不同规则。"
+VAGUE_TIME_BODY = BODY + "度夏期间晚峰时段持续采取移峰措施。"
 
 
 def _document(body: str = BODY):
@@ -76,6 +79,30 @@ def _event_payload(*, region: str = "辽宁电网", precision: str = "instant") 
             }
         ],
     }
+
+
+def _event_with_group(group: str, body: str) -> dict:
+    payload = _event_payload()
+    event = payload["events"][0]
+    event["asset_groups"] = [group]
+    event["evidence"].append(
+        {"field_name": "asset_groups", "text_field": "body", "quote": body}
+    )
+    for evidence in event["evidence"]:
+        evidence["quote"] = body
+    return payload
+
+
+def _event_with_vague_time(time_text: str) -> dict:
+    payload = _event_payload(precision="vague")
+    event = payload["events"][0]
+    event["time_text"] = time_text
+    event["evidence"].append(
+        {"field_name": "effective_start_at", "text_field": "body", "quote": VAGUE_TIME_BODY}
+    )
+    for evidence in event["evidence"]:
+        evidence["quote"] = VAGUE_TIME_BODY
+    return payload
 
 
 def _irrelevant_payload(body: str = BODY) -> dict:
@@ -133,6 +160,57 @@ def test_wording_drift_between_passes_is_not_treated_as_disagreement() -> None:
 
     assert result.quarantine is None
     assert result.events[0].region_keys == ("CN-LIAONING",)
+
+
+def test_group_count_prefix_drift_is_normalized_before_consensus() -> None:
+    result, _ = _extract(
+        _event_with_group("172座新型储能电站", STORAGE_BODY),
+        _event_with_group("新型储能电站", STORAGE_BODY),
+        _event_with_group("新型储能电站", STORAGE_BODY),
+        passes=3,
+        body=STORAGE_BODY,
+    )
+
+    assert result.quarantine is None
+    assert result.events[0].group_keys == ("新型储能电站",)
+
+
+def test_substantive_group_scope_drift_remains_reviewable_and_names_the_field() -> None:
+    result, _ = _extract(
+        _event_with_group("存量新能源项目", POLICY_BODY),
+        _event_with_group("新能源项目", POLICY_BODY),
+        _event_with_group("存量新能源项目", POLICY_BODY),
+        passes=3,
+        body=POLICY_BODY,
+    )
+
+    assert result.quarantine is not None
+    assert result.quarantine.reason_code == "inconsistent_extraction"
+    assert "asset_groups" in result.quarantine.message
+
+
+def test_nested_vague_time_quotes_do_not_create_a_false_disagreement() -> None:
+    result, _ = _extract(
+        _event_with_vague_time("度夏期间"),
+        _event_with_vague_time("度夏期间晚峰时段"),
+        _event_with_vague_time("度夏期间晚峰时段"),
+        passes=3,
+        body=VAGUE_TIME_BODY,
+    )
+
+    assert result.quarantine is None
+    assert result.events[0].analysis_eligibility == "needs_time_review"
+
+
+def test_unknown_event_type_is_repaired_before_the_pass_is_quarantined() -> None:
+    invalid = _event_payload()
+    invalid["events"][0]["event_type"] = "unknown"
+
+    result, gateway = _extract(invalid, _event_payload(), passes=1)
+
+    assert result.quarantine is None
+    assert result.events[0].event_type == "demand_shock"
+    assert gateway.calls == 2
 
 
 def test_a_pass_that_finds_the_event_and_a_pass_that_does_not_go_to_review() -> None:
@@ -194,6 +272,7 @@ def test_events_that_disagree_on_content_go_to_review() -> None:
 
     assert result.quarantine is not None
     assert result.quarantine.reason_code == "inconsistent_extraction"
+    assert "affected_regions" in result.quarantine.message
 
 
 def test_three_passes_are_the_default_because_a_flag_nobody_sets_protects_nobody() -> None:
@@ -319,6 +398,7 @@ def test_two_votes_for_one_plant_do_not_override_a_different_plant() -> None:
     )
     assert result.quarantine is not None
     assert result.quarantine.reason_code == "inconsistent_extraction"
+    assert "affected_assets" in result.quarantine.message
 
 
 def test_three_different_asset_names_have_no_majority_and_go_to_review() -> None:

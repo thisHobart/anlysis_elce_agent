@@ -126,6 +126,57 @@ def loop_coordinator(**kwargs) -> ResearchCoordinator:
     )
 
 
+def test_forecast_intent_is_handed_off_without_an_unbacked_confirmation(
+    synthetic_study: Path,
+):
+    class ForecastDialogue(LoopDialogue):
+        def decide(self, **_kwargs):
+            return DialogueDecision(
+                intent="new_forecast_plan",
+                response="请确认是否执行该预测方案。",
+            )
+
+    coordinator = ResearchCoordinator(
+        main_agent=MainResearchAgent(model_dialogue=ForecastDialogue()),
+        eda_subagent=EDASubagent(model_planner=LoopPlanner()),
+    )
+    snapshot = coordinator.submit_user_message(
+        session_id="forecast-handoff",
+        message="开始预测一天的电价",
+        study_config=load_study_config(synthetic_study),
+    )
+
+    assert snapshot.interrupt is None
+    assert snapshot.phase == "awaiting_user"
+    assert snapshot.values["control"] == "forecast_plan_request"
+    assert snapshot.values["assistant_message"] == ""
+
+
+def test_combined_analysis_and_forecast_starts_with_an_analysis_plan(
+    synthetic_study: Path,
+):
+    class IncorrectForecastDialogue(LoopDialogue):
+        def decide(self, **_kwargs):
+            return DialogueDecision(
+                intent="new_forecast_plan",
+                response="请确认是否执行该预测方案。",
+            )
+
+    coordinator = ResearchCoordinator(
+        main_agent=MainResearchAgent(model_dialogue=IncorrectForecastDialogue()),
+        eda_subagent=EDASubagent(model_planner=LoopPlanner()),
+    )
+    snapshot = coordinator.submit_user_message(
+        session_id="analysis-before-forecast",
+        message="分析山东电价以及相关数据，开始预测一天的电价",
+        study_config=load_study_config(synthetic_study),
+    )
+
+    assert snapshot.interrupt is not None
+    assert snapshot.interrupt.kind == "plan_approval"
+    assert snapshot.values["current_plan"]["skill_name"] == "price-exogenous-eda"
+
+
 def accepting_evaluation(*, plan, quality, summary):
     del plan, quality, summary
     return AgentEvaluation(

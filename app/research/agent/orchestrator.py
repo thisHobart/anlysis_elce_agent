@@ -44,6 +44,16 @@ DialogueIntent = Literal[
 FUNCTION_METADATA = function_metadata()
 
 
+def requests_analysis_before_forecast(question: str) -> bool:
+    """Return whether one turn explicitly asks for analysis and a forecast."""
+
+    compact = "".join(question.lower().split())
+    return (
+        any(word in compact for word in ("分析", "研究", "诊断"))
+        and any(word in compact for word in ("预测", "预报"))
+    )
+
+
 class DialogueDecision(BaseModel):
     """Validated model decision for one user turn."""
 
@@ -358,7 +368,7 @@ class ModelResearchDialogue:
                 "revise_plan": "按用户反馈生成当前方案的变更",
                 "explain_result": "引用已有结构化证据解释结果",
                 "execute_plan": "用户明确确认运行当前方案",
-                "new_forecast_plan": "用户要求山东次日省级实时电价预测；参数由本地固定",
+                "new_forecast_plan": "用户只要求山东次日省级实时电价预测；参数由本地固定",
                 "execute_forecast_plan": "用户明确确认运行已冻结的预测方案",
             },
             "revision_contract": {

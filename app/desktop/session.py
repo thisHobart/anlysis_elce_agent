@@ -130,7 +130,7 @@ class SessionRunRecord(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     run_id: str
-    run_kind: Literal["eda", "forecast"] = "eda"
+    run_kind: Literal["eda", "news", "forecast", "feedback"] = "eda"
     episode_id: str | None = None
     plan_id: str
     parent_run_id: str | None = None
@@ -149,7 +149,7 @@ class SessionRunRecord(BaseModel):
     memory_status: Literal["active", "stale"] = "active"
 
 
-SESSION_SCHEMA_VERSION = 15
+SESSION_SCHEMA_VERSION = 19
 """Projection schema written by this build; bump it whenever stored sessions change shape."""
 
 
@@ -196,6 +196,12 @@ class ResearchSession(BaseModel):
     database_fetch_details: dict[str, Any] = Field(default_factory=dict)
     analysis_start_time: str | None = None
     analysis_end_time: str | None = None
+    full_flow_state_path: str | None = None
+    full_flow_output_directory: str | None = None
+    news_features_path: str | None = None
+    news_run_id: str | None = None
+    news_p1_run_id: str | None = None
+    pending_forecast_question: str | None = None
 
     @field_validator("inputs", mode="before")
     @classmethod
@@ -284,6 +290,22 @@ def _migrate_14_to_15(session: ResearchSession) -> None:
     """Distinguish legacy EDA runs from P3 forecast runs."""
 
 
+def _migrate_15_to_16(session: ResearchSession) -> None:
+    """Add optional P1/P2/P3 flow references without changing old evidence."""
+
+
+def _migrate_16_to_17(session: ResearchSession) -> None:
+    """Add the resumable full-flow output root beside its state reference."""
+
+
+def _migrate_17_to_18(session: ResearchSession) -> None:
+    """Allow P2 news and P1 feedback runs in the unified session lineage."""
+
+
+def _migrate_18_to_19(session: ResearchSession) -> None:
+    """Persist an optional forecast request waiting for P1 analysis to finish."""
+
+
 SESSION_MIGRATIONS: dict[int, Callable[[ResearchSession], None]] = {
     **{version: _carry_forward for version in range(1, 7)},
     7: _migrate_7_to_8,
@@ -294,6 +316,10 @@ SESSION_MIGRATIONS: dict[int, Callable[[ResearchSession], None]] = {
     12: _migrate_12_to_13,
     13: _migrate_13_to_14,
     14: _migrate_14_to_15,
+    15: _migrate_15_to_16,
+    16: _migrate_16_to_17,
+    17: _migrate_17_to_18,
+    18: _migrate_18_to_19,
 }
 
 
@@ -322,6 +348,22 @@ def _apply_session_invariants(
             message.kind = "notice"
             message.content = STALE_PLAN_NOTICE
             message.payload = {}
+    if (
+        session.status == "running"
+        and isinstance(session.current_plan, dict)
+        and session.current_plan.get("plan_kind") == "forecast"
+    ):
+        session.status = "awaiting_plan_approval"
+        for message in session.messages:
+            if message.kind == "forecast_plan" and message.payload.get("state") == "running":
+                message.payload["state"] = "awaiting"
+        session.messages.append(
+            SessionMessage(
+                role="system",
+                kind="notice",
+                content="上次预测运行已中断。已完成的回测检查点仍保留；请重新确认后继续。",
+            )
+        )
 
 
 def plan_is_executable(plan: dict[str, Any], skill_versions: dict[str, str] | None = None) -> bool:
@@ -333,12 +375,14 @@ def plan_is_executable(plan: dict[str, Any], skill_versions: dict[str, str] | No
 
     if plan.get("plan_kind") == "forecast":
         try:
-            from app.research.forecasting.contracts import ForecastPlan
+            from app.research.forecasting.contracts import FORECAST_ALGORITHM_VERSION, ForecastPlan
 
             forecast = ForecastPlan.model_validate(plan)
         except (ImportError, ValueError):
             return False
-        return all(item.path.is_file() for item in forecast.snapshots)
+        return forecast.algorithm_version == FORECAST_ALGORITHM_VERSION and all(
+            item.path.is_file() for item in forecast.snapshots
+        )
     if plan.get("planner") != "llm" or not plan.get("skill_name") or not plan.get("skill_version"):
         return False
     if skill_versions is not None:

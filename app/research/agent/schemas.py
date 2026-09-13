@@ -101,6 +101,8 @@ class EDAPlan(BaseModel):
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     hypotheses: list[str] = Field(default_factory=list)
     unverifiable_hypotheses: list[str] = Field(default_factory=list)
+    analysis_kind: Literal["research", "descriptive"] = "research"
+    requested_statistics: tuple[Literal["mean", "min", "max"], ...] = ()
     selected_variables: list[str] = Field(default_factory=list)
     variable_selection_mode: VariableSelectionMode = "explicit"
     variable_selection_stage: VariableSelectionStage = "direct"

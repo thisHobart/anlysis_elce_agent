@@ -271,6 +271,82 @@ def test_research_function_calls_are_proposed_without_execution():
     assert model.parallel_tool_calls is True
 
 
+def test_prompt_json_applies_local_schema_and_whitelist_to_research_function_selection():
+    class PromptToolModel(RecordingModel):
+        def with_structured_output(self, schema, *, method, include_raw):
+            self.method = method
+            self.include_raw = include_raw
+
+            class Bound:
+                def invoke(_self, messages):
+                    self.last_messages = messages
+                    return {
+                        "raw": SimpleNamespace(
+                            content=(
+                                '{"calls":[{"name":"price_descriptive_distribution",'
+                                '"arguments":{}}]}'
+                            ),
+                            additional_kwargs={},
+                            tool_calls=[],
+                            response_metadata={},
+                        ),
+                        "parsed": schema.model_validate(
+                            {
+                                "calls": [
+                                    {
+                                        "name": "price_descriptive_distribution",
+                                        "arguments": {},
+                                    }
+                                ]
+                            }
+                        ),
+                        "parsing_error": None,
+                    }
+
+            return Bound()
+
+    gateway = ResearchModelGateway(_settings(llm_structured_output_method="prompt_json"))
+    model = PromptToolModel()
+    gateway._model = model
+
+    calls = gateway.invoke_tool_calls(messages=_messages("分析电价分布"), tools=TOOLS)
+
+    assert [call.name for call in calls] == ["price_descriptive_distribution"]
+    assert calls[0].call_id == "prompt-json-1"
+    assert model.bound_tools is None
+    assert model.method == "json_mode"
+    assert isinstance(model.last_messages[0], SystemMessage)
+    assert "研究函数选择兼容协议" in model.last_messages[0].content
+    assert "price_descriptive_distribution" in model.last_messages[0].content
+
+
+def test_prompt_json_research_function_selection_rejects_names_outside_whitelist():
+    class UnknownPromptToolModel(RecordingModel):
+        def with_structured_output(self, schema, *, method, include_raw):
+            class Bound:
+                def invoke(_self, messages):
+                    return {
+                        "raw": SimpleNamespace(
+                            content='{"calls":[{"name":"delete_database","arguments":{}}]}',
+                            additional_kwargs={},
+                            tool_calls=[],
+                            response_metadata={},
+                        ),
+                        "parsed": schema.model_validate(
+                            {"calls": [{"name": "delete_database", "arguments": {}}]}
+                        ),
+                        "parsing_error": None,
+                    }
+
+            return Bound()
+
+    gateway = ResearchModelGateway(_settings(llm_structured_output_method="prompt_json"))
+    gateway._model = UnknownPromptToolModel()
+
+    with pytest.raises(ModelResponseError, match="未提供的研究函数"):
+        gateway.invoke_tool_calls(messages=_messages("分析电价分布"), tools=TOOLS)
+
+
 def test_custom_endpoint_sends_no_reasoning_control_by_default():
     gateway = ResearchModelGateway(_settings())
 

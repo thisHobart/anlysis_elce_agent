@@ -8,7 +8,11 @@ __pycache__/
 .coverage
 coverage.xml
 htmlcov/
-/data/
+/data/*
+!/data/news/
+/data/news/*
+!/data/news/shandong_p2_test_news.jsonl
+!/data/news/shandong_p2_test_news.manifest.json
 # Virtual environments and packaging artifacts
 .venv/
 venv/
@@ -34,3 +38,4 @@ Thumbs.db
 *.log
 logs/
 artifacts/
+.playwright-mcp/

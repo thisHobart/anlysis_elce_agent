@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication
 
 from app.desktop.main_window import MainWindow
 from app.desktop.theme import APP_STYLE
+from app.runtime_paths import default_p2_news_path
 
 
 def _smoke_result_argument(argv: Sequence[str]) -> tuple[list[str], Path | None]:
@@ -71,6 +72,9 @@ def _desktop_smoke_payload(window: MainWindow) -> dict[str, Any]:
         "torch_available": True,
         "sklearn_available": True,
     }
+    p2_news_path = default_p2_news_path()
+    if p2_news_path is None:
+        raise RuntimeError("Built desktop is missing the audited P2 news corpus")
     return {
         "status": "passed",
         "window_constructed": True,
@@ -81,6 +85,7 @@ def _desktop_smoke_payload(window: MainWindow) -> dict[str, Any]:
         "session_store_path": str(window.workspace.store.path.resolve()),
         "research_output_directory": str(window.workspace.research_output_directory.resolve()),
         "forecast_runtime": forecast_runtime,
+        "p2_news_path": str(p2_news_path),
     }
 
 

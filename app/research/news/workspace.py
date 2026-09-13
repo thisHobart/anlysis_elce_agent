@@ -376,7 +376,9 @@ def study_needs_review(study) -> bool:
         not study.result_quality.passed
         or any(item.review_status == "unreviewed" for item in study.view.quarantined)
         or any(
-            event.relevance == "short_term" and event.effective_start_at is None and event.review_status != "rejected"
+            event.relevance == "short_term"
+            and event.effective_start_at is None
+            and event.review_status == "unreviewed"
             for event in study.view.events
         )
     )

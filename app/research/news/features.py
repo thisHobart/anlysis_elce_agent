@@ -20,7 +20,7 @@ from app.research.news.contracts import (
     MergedEvent,
 )
 
-FEATURE_VERSION = "1.2.0"
+FEATURE_VERSION = "1.4.0"
 CAPACITY_EFFECTS = ("supply_up", "supply_down", "demand_up", "demand_down", "transfer_up", "transfer_down",
                     "mixed", "unknown")
 
@@ -29,14 +29,16 @@ FEATURE_EVENT_TYPES: tuple[str, ...] = (
     "generation_restore",
     "transmission_constraint",
     "demand_shock",
+    "storage_dispatch",
     "renewable_supply_change",
     "fuel_supply_change",
 )
 
-# A restoration is an event impulse, not a state that stays "active" forever. If its
-# source gives no end, it contributes to exactly the settlement interval in which it
-# occurs. Persistent event types retain their open-ended semantics until a later update.
-POINT_EVENT_TYPES = frozenset({"generation_restore"})
+# These event types describe an occurrence rather than an open-ended operating state
+# when the source gives no explicit end.  Treating a load record or one dispatch action
+# as permanently active would turn one historical bulletin into a constant future
+# predictor.  An explicit end still wins and represents a real duration.
+POINT_EVENT_TYPES = frozenset({"generation_restore", "demand_shock", "storage_dispatch"})
 
 
 class EventFeatureError(ValueError):
@@ -115,13 +117,17 @@ def _is_active(
 
     if state.status == "cancelled" or state.effective_start_at is None:
         return False
-    if state.event_type in POINT_EVENT_TYPES:
-        # A point event contributes once, at the first decision interval where it is both
-        # effective and knowable. This preserves a late-arriving restoration without
-        # leaking it into the interval that began before the bulletin arrived.
-        observable_at = max(state.effective_start_at, state_available_at)
-        duration = interval_end - interval_start
-        return observable_at <= interval_start < observable_at + duration
+    if state.event_type in POINT_EVENT_TYPES and state.effective_end_at is None:
+        if state.event_type == "generation_restore":
+            # A late restoration becomes actionable when it is known because it closes
+            # an open outage state at that decision time.
+            observable_at = max(state.effective_start_at, state_available_at)
+            duration = interval_end - interval_start
+            return observable_at <= interval_start < observable_at + duration
+        # A historical demand peak or dispatch action is not moved to publication time.
+        # If it arrived after its settlement interval, the announcement pulse carries
+        # the newly available information while the physical-event feature stays zero.
+        return state_available_at <= interval_start <= state.effective_start_at < interval_end
     if state.effective_start_at >= interval_end:
         return False
     effective_end = state.effective_end_at

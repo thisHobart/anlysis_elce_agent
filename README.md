@@ -1,6 +1,6 @@
 # 电价研究 Agent
 
-P2 新增本地新闻工作台入口，支持批量导入、事件复核、持久化缓存和结果导出，运行方式见 [P2 工作台说明](docs/p2-workbench.md)。分析器已改用完整、匹配且不重叠的对照窗口；旧合成数据的显著性结论不应沿用。
+P2 新增本地新闻工作台入口，支持批量导入、事件复核、持久化缓存和结果导出，运行方式见 [P2 工作台说明](docs/p2-workbench.md)。可选的Playwright浏览器MCP可以读取已批准URL并冻结为同一P2输入契约，见 [P2浏览器MCP说明](docs/browser-mcp-p2.md)。分析器已改用完整、匹配且不重叠的对照窗口；旧合成数据的显著性结论不应沿用。
 
 面向电价预测的研究工作台。最终目标是电价预测；当前阶段先把**外生变量与新闻研究**这一前置研发环节做扎实：确定性算法是计算核心，Agent 是研究闭环的控制器。
 
@@ -22,6 +22,7 @@ P2 新增本地新闻工作台入口，支持批量导入、事件复核、持�
 - 数据库索引诊断可运行 `venv\Scripts\python.exe scripts\diagnose_region_queries.py shandong`。脚本只执行 `EXPLAIN`，输出查询计划和候选索引列，不创建或修改索引。
 - 当前目录只启用山东测试数据源：小时电价将研究轴补至 2025-11-01，并读取负荷、总发电、新能源、风电、水电、光伏、备用及相应预测和气象变量；后续地区通过 `configs/region_databases.yaml` 增加非敏感表映射，并在 `.env` 增加对应凭据组，无需改动界面。
 - 取数后可以直接在聊天框限定当前会话的研究区间，例如“仅分析 2026-01-01 到 2026-03-31”；回复“恢复全部时间范围”可取消限定。区间采用所选市场时区，未写时刻时包含完整的开始日和结束日。
+- 当前会话已有P1结果后，可以直接输入“根据已经分析的数据，开始新闻分析最后电价预测”。桌面会复用P1证据，读取冻结且可追溯的山东新闻快照，依次完成P2新闻分析和P1新闻特征综合，再显示需要单独确认的P3预测方案卡。可用 `VPP_P2_NEWS_PATH` 指定其他符合新闻JSONL契约的冻结快照。
 - 数据获取过程明确显示“正在找数据 / 已就绪 / 取不到”；失败后可以重试或改用本地文件。
 - 本地数据文件仍按角色管理，文件名不受限制：目标电价、实际外生变量、预测外生变量。
 - 实际变量和预测变量可选；程序直接从 CSV/Parquet 自动识别时间列、数值列和频率。
@@ -154,11 +155,11 @@ Vertex AI 使用应用默认凭据（ADC，即 Google SDK 读取的本机/工作
 
 桌面端可以选择 `DeepSeek`、`Qwen`、`Gemini（原生 API）` 或 `Custom`。旧配置按 `custom + chat` 读取，不根据 URL 猜供应商。Gemini 固定使用 Google 原生 `json_schema`（服务商在生成时按数据结构约束输出）；其他端点按配置使用 Chat Completions 或 Responses。
 
-如果 Gemini 只能通过 Cherry Studio API Server 调用，服务商保持 `Custom`，接口填写 Cherry 的 `/v1` 地址，并在“结构化输出”选择“Cherry 兼容 JSON（本地校验）”。该模式把 JSON Schema 放入系统消息，模型响应必须通过本地 Pydantic 校验；失败结果不会进入研究分析。它用于解决 Cherry 未转发原生 schema 的限制，不等同于服务商原生结构化输出。
+如果 Gemini 只能通过 Cherry Studio API Server 调用，服务商保持 `Custom`，接口填写 Cherry 的 `/v1` 地址，并在“结构化输出”选择“Cherry 兼容 JSON/函数选择（本地校验）”。该模式把 JSON Schema 和研究函数白名单放入系统消息，模型响应必须通过本地 Pydantic、函数名白名单和计划编译器校验；失败结果不会进入研究分析。它用于解决 Cherry 未转发原生 schema 或 `tools` 的限制，不等同于服务商原生结构化输出。模型只提出候选调用，用户批准前不会执行。
 
 研究对话、函数提议和方案修订使用大模型。模型未配置、调用失败或返回无效方案时，任务会停止并提示重试，不存在本地关键词规划回退。大模型只承担受限路由和 Function Call 提议；研究阶段、函数顺序、门禁和停止条件来自本地领域协议。响应中的 `reasoning_content`、reasoning 内容块或 `<think>...</think>` 不会进入 LangGraph 状态；默认丢弃，严格策略下拒绝本次响应。
 
-消息由 Agent 内部的类型化角色统一表达，再由所选服务商适配器编码。Gemini 的结构化结果使用原生 JSON Schema，研究函数选择使用 Gemini 原生 Function Calling；OpenAI 兼容端点使用其明确配置的原生结构化协议。若端点拒绝必要协议，系统会报告不兼容，不会从普通文本中猜测或补救 JSON。
+消息由 Agent 内部的类型化角色统一表达，再由所选服务商适配器编码。Gemini 的结构化结果使用原生 JSON Schema，研究函数选择使用 Gemini 原生 Function Calling；OpenAI 兼容端点默认使用明确配置的原生协议。只有显式选择 `prompt_json` 时，系统才接受由提示生成、经本地 Schema 与函数白名单校验的兼容结果；其他模式不会从普通文本猜测或补救 JSON。
 
 大模型只能从 Skill 授权的原子研究函数中选择具体调用。每个函数名唯一对应一种确定性统计过程；本地编译器再按领域协议重排并校验。执行计划保存 Skill、领域协议、函数名、函数版本、参数、输入数据指纹和代码环境，版本不匹配时拒绝执行。
 
@@ -195,17 +196,23 @@ PyInstaller 必须在 Windows 上构建 Windows 程序。第一次建议使用�
 
 选择山东并完成取数后，可在对话中提出“预测山东明天实时电价”。桌面会先固定3个历史回测日和1份次日输入，并显示必须手动确认的预测卡；确认后在 CPU 后台完成三折回测和次日96点预测。结果包含 CSV、逐点回测 Parquet、指标、SVG、报告、版本和文件哈希，全程不写业务数据库。实现边界和验收说明见 [P3 山东实时电价最小预测](docs/phase3-shandong-realtime-price-forecast.md)。
 
+应用层还提供一次有界的 P1—P2—P3 编排：P1 生成新闻请求，P2 交付带时点的数值特征，P1 综合后由用户单独确认 P3；未达标或不可评估时只反馈分析一次。运行记录见 [一轮流程验证](docs/p1-p2-p3-one-round-validation-2026-09-12.md)。
+
 ## 测试
 
 ```powershell
 .\venv\Scripts\python.exe -m ruff check app tests
 $env:QT_QPA_PLATFORM="offscreen"
 .\venv\Scripts\python.exe -m pytest -q
+.\venv\Scripts\python.exe -m pytest -q -m integration
+.\venv\Scripts\python.exe -m pytest -q -m functional
+.\venv\Scripts\python.exe -m pytest -q -m e2e
 .\venv\Scripts\python.exe scripts\validate_phase1.py
 .\venv\Scripts\python.exe scripts\validate_desktop_phase1.py
+.\venv\Scripts\python.exe -m scripts.validate_p1_p2_p3 --synthetic
 ```
 
-两个验证脚本使用真实模型和真实数据；为避免较大的 Function Calling 请求被过短的本地配置误杀，验证进程使用 120 秒请求超时下限，但不会改写 `.env`。`validate_phase1.py` 会分别验证仅目标电价和包含外生变量的两个 Skill 场景。
+真实验证脚本使用真实模型和真实数据；为避免较大的 Function Calling 请求被过短的本地配置误杀，验证进程使用 120 秒请求超时下限，但不会改写 `.env`。`validate_p1_p2_p3 --synthetic` 使用明确标注的合成数据，并通过桌面 P3 确认卡触发预测。`validate_phase1.py` 会分别验证仅目标电价和包含外生变量的两个 Skill 场景。
 
 完整文档入口见 [docs/README.md](docs/README.md)。当前实现说明见
 [docs/phase1-price-exogenous-eda.md](docs/phase1-price-exogenous-eda.md)，循环设计见

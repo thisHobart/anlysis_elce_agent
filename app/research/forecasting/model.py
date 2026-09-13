@@ -71,7 +71,7 @@ def build_feature_frame(frame: pd.DataFrame, train_end: pd.Timestamp) -> pd.Data
     future_columns = [
         column
         for column in data
-        if column.startswith(("fcst_", "wx_"))
+        if column.startswith(("fcst_", "wx_", "news_"))
     ]
     for column in future_columns:
         result[column] = _numeric(data, column)
@@ -82,6 +82,7 @@ def build_feature_frame(frame: pd.DataFrame, train_end: pd.Timestamp) -> pd.Data
         if column not in {"rt_price"}
         and not column.startswith("fcst_")
         and not column.startswith("wx_")
+        and not column.startswith("news_")
         and pd.api.types.is_numeric_dtype(data[column])
     ]
     for column in actual_columns:

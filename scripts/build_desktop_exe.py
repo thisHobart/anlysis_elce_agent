@@ -98,6 +98,8 @@ def validate_built_executable(executable: Path, *, build_root: Path) -> dict[str
         forecast_runtime = payload.get("forecast_runtime") or {}
         if forecast_runtime.get("device") != "cpu" or not forecast_runtime.get("torch_available"):
             raise SystemExit(f"Built EXE did not load the P3 CPU forecast runtime: {payload}")
+        if not Path(str(payload.get("p2_news_path", ""))).is_file():
+            raise SystemExit(f"Built EXE did not load the audited P2 news corpus: {payload}")
         expected_app_data = (temporary / "app-data").resolve()
         expected_research = (temporary / "research").resolve()
         session_store = Path(str(payload.get("session_store_path", ""))).resolve()
@@ -151,6 +153,18 @@ def main(argv: list[str] | None = None) -> int:
     if not region_catalog.is_file():
         raise SystemExit(f"No region database catalog was found at {region_catalog}.")
     region_catalog_arg = f"--add-data={region_catalog};app/research/data/sources"
+    mcp_catalog = root / "configs" / "mcp_servers.yaml"
+    if not mcp_catalog.is_file():
+        raise SystemExit(f"No MCP server catalog was found at {mcp_catalog}.")
+    mcp_catalog_arg = f"--add-data={mcp_catalog};app/integrations/mcp"
+    p2_news = root / "data" / "news" / "shandong_p2_test_news_v2.jsonl"
+    p2_news_manifest = p2_news.with_suffix(".manifest.json")
+    if not p2_news.is_file() or not p2_news_manifest.is_file():
+        raise SystemExit("No audited P2 news snapshot was found to package.")
+    p2_news_args = [
+        f"--add-data={p2_news};app/research/news",
+        f"--add-data={p2_news_manifest};app/research/news",
+    ]
     original_path = os.environ.get("PATH", "")
     os.environ["PATH"] = sanitized_build_path(
         original_path,
@@ -184,9 +198,13 @@ def main(argv: list[str] | None = None) -> int:
                 # the lazily reached CPU runtime visible to PyInstaller.
                 "--hidden-import=torch",
                 "--hidden-import=sklearn.preprocessing",
+                "--collect-submodules=mcp",
+                "--collect-submodules=mcp_types",
                 *skill_args,
                 word_list_arg,
                 region_catalog_arg,
+                mcp_catalog_arg,
+                *p2_news_args,
                 *exclude_args,
             ]
         )

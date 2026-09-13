@@ -13,6 +13,7 @@ from uuid import uuid4
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QSplitter, QWidget
 
+from app.config import get_settings
 from app.desktop.input_config import (
     FILE_FILTERS,
     build_runtime_study,
@@ -33,6 +34,8 @@ from app.desktop.session import (
     default_input_files,
 )
 from app.desktop.worker import FunctionWorker
+from app.llm.factory import build_model_gateway
+from app.research.agent.orchestrator import requests_analysis_before_forecast
 from app.research.agent.schemas import (
     ConversationMessage,
     EDAPlan,
@@ -58,16 +61,21 @@ from app.research.data.sources.summary import (
 from app.research.forecasting.contracts import ForecastPlan, ForecastRunResult
 from app.research.forecasting.data import prepare_forecast_plan
 from app.research.forecasting.workflow import execute_forecast_workflow
+from app.research.full_flow.contracts import FlowRunReference, FullFlowState
+from app.research.full_flow.service import FullFlowStore, FullResearchFlow
 from app.research.graph.contracts import ApprovalState, EpisodeSummary, ResearchLoopSnapshot
 from app.research.graph.narration import (
     STAGE_LABELS,
+    ThinkingStep,
     narrate_event,
+    progress_message,
     split_progress_message,
     trace_category,
 )
+from app.research.news import StructuredNewsEventExtractor
 from app.research.schemas.results import DataQualityReport
 from app.research.schemas.study import StudyConfig
-from app.runtime_paths import default_research_output_directory
+from app.runtime_paths import default_p2_news_path, default_research_output_directory
 
 
 def _known_so_far(config: StudyConfig | None) -> DataSummary | None:
@@ -98,13 +106,53 @@ def _known_so_far(config: StudyConfig | None) -> DataSummary | None:
 DATA_CHANGED_NOTICE = "数据换了，之前的分析方案已经作废。重新问一次，我按新数据给方案。"
 
 
-def _is_forecast_request(question: str) -> bool:
+def _is_forecast_request(question: str, *, has_price_context: bool = False) -> bool:
     compact = "".join(question.lower().split())
+    if any(word in compact for word in ("说明什么", "结果", "回测", "表现", "限制", "解释", "为什么")):
+        return False
+    if requests_analysis_before_forecast(question):
+        return False
     return (
         any(word in compact for word in ("预测", "预报"))
-        and any(word in compact for word in ("电价", "价格"))
-        and any(word in compact for word in ("明天", "明日", "次日", "未来24", "未来一天"))
+        and (has_price_context or any(word in compact for word in ("电价", "价格")))
+        and any(word in compact for word in ("明天", "明日", "次日", "未来24", "未来一天", "预测一天", "预报一天"))
     )
+
+
+def _is_forecast_explanation(question: str) -> bool:
+    compact = "".join(question.lower().split())
+    return any(word in compact for word in ("说明什么", "结果", "回测", "表现", "限制", "解释", "为什么"))
+
+
+def _is_forecast_text_approval(question: str) -> bool:
+    compact = "".join(question.lower().split()).translate(str.maketrans("", "", "，,。！？!?"))
+    return compact in {"确认", "确认执行", "立即执行", "按这个执行", "执行当前方案", "可以开始", "同意", "接受"}
+
+
+def _is_news_analysis_request(question: str) -> bool:
+    """Recognize a request to run P2 instead of sending it back through EDA planning."""
+
+    compact = "".join(question.lower().split())
+    if "新闻" not in compact:
+        return False
+    explicit_actions = (
+        "开始新闻",
+        "进行新闻",
+        "请分析新闻",
+        "分析一下新闻",
+        "分析新闻",
+        "请研究新闻",
+        "研究一下新闻",
+        "研究新闻",
+        "结合新闻",
+        "加入新闻",
+    )
+    return any(phrase in compact for phrase in explicit_actions)
+
+
+def _requests_news_forecast(question: str) -> bool:
+    compact = "".join(question.lower().split())
+    return _is_news_analysis_request(question) and any(word in compact for word in ("预测", "预报"))
 
 
 class ResearchWorkspace(QSplitter):
@@ -178,6 +226,7 @@ class ResearchWorkspace(QSplitter):
         self._active_state_revision: int | None = None
         self._active_interrupt_kind: str | None = None
         self._pending_execute_plan: EDAPlan | None = None
+        self._pending_forecast_request: str | None = None
         self._pre_trace_sizes: list[int] | None = None
         self._plan_feedback_timer = QTimer(self)
         self._plan_feedback_timer.setInterval(250)
@@ -713,6 +762,7 @@ class ResearchWorkspace(QSplitter):
     def _invalidate_plan_for_input_change(self) -> None:
         self._cancel_plan_feedback_window()
         session = self.current_session
+        session.pending_forecast_question = None
         for run in session.runs:
             run.memory_status = "stale"
         if self.agent.has_thread(session.session_id):
@@ -741,15 +791,36 @@ class ResearchWorkspace(QSplitter):
     def submit_question(self, question: str) -> None:
         if self.is_busy:
             return
-        if _is_forecast_request(question):
+        session = self.current_session
+        analysis_then_forecast = requests_analysis_before_forecast(question)
+        current_is_forecast = (session.current_plan or {}).get("plan_kind") == "forecast"
+        if current_is_forecast and session.status == "awaiting_plan_approval" and _is_forecast_text_approval(question):
+            self._append_message(SessionMessage(role="user", kind="text", content=question, turn_id=uuid4().hex))
+            self.run_plan(ForecastPlan.model_validate(session.current_plan))
+            return
+        if any(run.run_kind == "forecast" for run in session.runs) and _is_forecast_explanation(question):
+            self._explain_forecast_result(question)
+            return
+        if _is_news_analysis_request(question):
+            self._submit_news_analysis_request(
+                question,
+                prepare_forecast=_requests_news_forecast(question),
+            )
+            return
+        if _is_forecast_request(question, has_price_context=bool(session.inputs["target"].path)):
             self._submit_forecast_request(question)
             return
-        session = self.current_session
         if (session.current_plan or {}).get("plan_kind") == "forecast":
-            session.current_plan = None
-            session.plan_stale = False
-            if self.agent.has_thread(session.session_id):
-                self.agent.delete_thread(session.session_id)
+            self._append_message(SessionMessage(role="user", kind="text", content=question, turn_id=uuid4().hex))
+            self._append_message(
+                SessionMessage(
+                    role="assistant",
+                    kind="text",
+                    content="当前是固定范围的山东次日预测方案。你可以确认执行、拒绝方案，或询问方案内容。",
+                )
+            )
+            self._persist_and_render(keep_timeline=True)
+            return
         try:
             time_request = parse_chat_time_range(question)
         except ValueError as exc:
@@ -799,10 +870,12 @@ class ResearchWorkspace(QSplitter):
                 self._fail_before_task(str(exc))
                 return
         self._task_previous_status = session.status
+        if analysis_then_forecast:
+            session.pending_forecast_question = question
         session.status = "understanding"
-        if session.can_analyze:
-            # Light up what is already known so the panel fills in as it learns,
-            # rather than sitting blank until the whole answer arrives.
+        if session.can_analyze and session.data_state != "ready":
+            # Only first-time inspection changes the data card. A question about
+            # an existing snapshot keeps its settled source, range and fetch time.
             self._set_data_state("exploring", session.data_summary or _known_so_far(study_config))
         elif session.data_state != "ready":
             # Nothing to read yet: say so plainly and offer the way out of it.
@@ -828,7 +901,163 @@ class ResearchWorkspace(QSplitter):
         )
         self.conversation.scroll_to_bottom()
 
-    def _submit_forecast_request(self, question: str) -> None:
+    def _submit_news_analysis_request(self, question: str, *, prepare_forecast: bool) -> None:
+        """Reuse completed P1 evidence and advance the owned P2/P3 state machine."""
+
+        session = self.current_session
+        self._cancel_plan_feedback_window()
+        self._append_message(SessionMessage(role="user", kind="text", content=question, turn_id=uuid4().hex))
+        if session.region_id != "shandong" or session.source_kind != "database":
+            self._fail_before_task("新闻分析与次日预测流程当前只支持已取数的山东数据库会话。")
+            return
+        profile = self.region_profiles.get("shandong")
+        if profile is None:
+            self._fail_before_task("山东数据源配置当前不可用，无法准备新闻分析与预测。")
+            return
+        p1_record = next((run for run in reversed(session.runs) if run.run_kind == "eda"), None)
+        if p1_record is None or not session.latest_eda_summary:
+            self._fail_before_task("当前会话还没有可复用的P1分析结果；请先完成一次电价分析。")
+            return
+        if not Path(p1_record.report_path).is_file() or not Path(p1_record.artifact_directory).is_dir():
+            self._fail_before_task("当前P1分析产物已经丢失；请重新执行一次电价分析。")
+            return
+        settings = get_settings()
+        news_path = default_p2_news_path(settings.p2_news_path)
+        if news_path is None:
+            self._fail_before_task(
+                "没有找到可审计的P2新闻资料。请通过 VPP_P2_NEWS_PATH 配置冻结的新闻JSONL文件。"
+            )
+            return
+        if not session.inputs["target"].path:
+            self._fail_before_task("当前会话的电价数据不可用；请重新取得山东数据。")
+            return
+
+        request_id = uuid4().hex[:12]
+        flow_root = self.research_output_directory / "full-flow" / request_id
+        flow = FullResearchFlow(
+            store=FullFlowStore(flow_root / "state.json"),
+            output_directory=flow_root / "runs",
+        )
+        session.full_flow_state_path = str(flow.store.path)
+        session.full_flow_output_directory = str(flow.output_directory)
+        session.pending_forecast_question = None
+        session.current_plan = None
+        session.plan_stale = False
+        session.status = "running"
+        session.derive_title(question)
+        self._active_interrupt_id = None
+        self._active_state_revision = None
+        self._active_interrupt_kind = None
+        if self.agent.has_thread(session.session_id):
+            self.agent.delete_thread(session.session_id)
+        self._append_message(
+            SessionMessage(
+                role="assistant",
+                kind="text",
+                content=(
+                    "将复用当前P1结果，分析已冻结且可追溯的山东新闻，生成新闻事件证据与数值特征，"
+                    + ("随后准备P3预测确认卡。" if prepare_forecast else "随后完成P1综合分析。")
+                ),
+            )
+        )
+        self._start_thinking("compute", "启动P2新闻分析", f"新闻来源：{news_path.name}")
+        self._add_trace("plan", "进入P1—P2—P3流程", "completed", "复用当前P1结果；P3仍需单独确认")
+
+        p1_run = FlowRunReference(
+            run_kind="eda",
+            run_id=p1_record.run_id,
+            parent_run_id=p1_record.parent_run_id,
+            artifact_directory=Path(p1_record.artifact_directory),
+            report_path=Path(p1_record.report_path),
+            data_fingerprint=p1_record.data_fingerprint,
+        )
+        eda_summary = dict(session.latest_eda_summary)
+        target_path = str(session.inputs["target"].path)
+        actuals_path = session.inputs["actuals"].path or None
+        forecasts_path = session.inputs["forecasts"].path or None
+        source_fingerprint = session.dataset_fingerprint
+        market_timezone = session.region_timezone or profile.timezone
+
+        def execute(progress: Callable[[int, str], None]) -> FullFlowState:
+            state: FullFlowState | None = None
+            try:
+                state = flow.start(
+                    p1_run=p1_run,
+                    eda_summary=eda_summary,
+                    information_cutoff=datetime.now(UTC),
+                )
+                progress(
+                    10,
+                    progress_message(
+                        ThinkingStep("compute", "分析山东新闻", "抽取事件并核对来源、时间与价格窗口", "running"),
+                        "启动P2新闻分析",
+                    ),
+                )
+                extractor = StructuredNewsEventExtractor(
+                    build_model_gateway(settings),
+                    market_timezone=market_timezone,
+                    extraction_passes=3,
+                )
+                state = flow.run_p2(
+                    state=state,
+                    news_path=news_path,
+                    target_path=target_path,
+                    extractor=extractor,
+                )
+                if state.phase == "p2_needs_review":
+                    return state
+                progress(
+                    55,
+                    progress_message(
+                        ThinkingStep("review", "综合新闻特征", "检查覆盖率、变化次数和关系稳定性", "running"),
+                        "启动P1综合分析",
+                    ),
+                )
+                state = flow.synthesize_p1(state=state)
+                if not prepare_forecast:
+                    return state
+                progress(
+                    70,
+                    progress_message(
+                        ThinkingStep("compute", "冻结P3输入", "准备三折回测与次日96点预测数据", "running"),
+                        "启动P3方案准备",
+                    ),
+                )
+                return flow.prepare_p3(
+                    state=state,
+                    question="预测山东明天实时电价",
+                    profile=profile,
+                    target_path=target_path,
+                    actuals_path=actuals_path,
+                    forecasts_path=forecasts_path,
+                    output_directory=self.research_output_directory / "forecasting",
+                    source_data_fingerprint=source_fingerprint,
+                    snapshot_fetcher=self.region_fetcher,
+                )
+            except Exception as exc:
+                if state is not None:
+                    failed = state.model_copy(
+                        update={
+                            "phase": "failed",
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "stop_reason": "新闻分析、综合分析或P3方案准备失败；已保留完成的阶段产物",
+                        }
+                    )
+                    flow.store.save(failed)
+                raise
+
+        self._start_worker(
+            kind="full_flow_analysis",
+            operation=execute,
+            success_handler=lambda state: self.update_full_flow_state(
+                state,
+                state_path=flow.store.path,
+                output_directory=flow.output_directory,
+            ),
+        )
+        self.conversation.scroll_to_bottom()
+
+    def _submit_forecast_request(self, question: str, *, record_user_message: bool = True) -> None:
         """Prepare the fixed P3 plan without allowing chat text to alter its parameters."""
 
         session = self.current_session
@@ -839,9 +1068,10 @@ class ResearchWorkspace(QSplitter):
         if self.agent.has_thread(session.session_id):
             self.agent.delete_thread(session.session_id)
         session.derive_title(question)
-        self._append_message(
-            SessionMessage(role="user", kind="text", content=question, turn_id=uuid4().hex)
-        )
+        if record_user_message:
+            self._append_message(
+                SessionMessage(role="user", kind="text", content=question, turn_id=uuid4().hex)
+            )
         self._add_trace("user", "提交山东实时电价预测", "completed", question)
         if session.source_kind != "database":
             self._fail_before_task("P3最小预测不读取本地任意文件；请先在右侧选择山东并完成取数。")
@@ -873,10 +1103,143 @@ class ResearchWorkspace(QSplitter):
                 source_data_fingerprint=session.dataset_fingerprint,
                 progress=progress,
                 snapshot_fetcher=self.region_fetcher,
+                news_features_path=session.news_features_path,
+                news_source_run_id=session.news_run_id,
+                news_source_p1_run_id=session.news_p1_run_id,
             ),
             success_handler=self._forecast_plan_completed,
             failure_handler=self._forecast_prepare_failed,
         )
+
+    def update_full_flow_state(
+        self,
+        state: FullFlowState,
+        *,
+        state_path: str | Path,
+        output_directory: str | Path | None = None,
+    ) -> None:
+        """Project the application-level P1/P2/P3 cursor into the desktop session."""
+
+        session = self.current_session
+        session.pending_forecast_question = None
+        session.full_flow_state_path = str(Path(state_path).resolve())
+        if output_directory is not None:
+            session.full_flow_output_directory = str(Path(output_directory).resolve())
+        session.news_features_path = str(state.p2_feature_path) if state.p2_feature_path else None
+        news_run = next((run for run in reversed(state.runs) if run.run_kind == "news"), None)
+        synthesis_run = next(
+            (run for run in reversed(state.runs) if run.run_kind == "eda" and run.parent_run_id == (news_run.run_id if news_run else None)),
+            None,
+        )
+        session.news_run_id = news_run.run_id if news_run else None
+        session.news_p1_run_id = synthesis_run.run_id if synthesis_run else None
+        questions = {
+            "news": "分析本地新闻并生成事件证据与数值特征",
+            "feedback": "诊断P3未达标或不可评估的原因",
+        }
+        for run in state.runs:
+            if any(existing.run_id == run.run_id for existing in session.runs):
+                continue
+            session.runs.append(
+                SessionRunRecord(
+                    run_id=run.run_id,
+                    run_kind=run.run_kind,
+                    plan_id=f"{state.flow_id}:{run.run_kind}",
+                    parent_run_id=run.parent_run_id,
+                    question=questions.get(
+                        run.run_kind,
+                        "综合分析电价、外生变量与新闻证据" if run.parent_run_id else "初步分析电价与外生变量",
+                    ),
+                    artifact_directory=str(run.artifact_directory),
+                    report_path=str(run.report_path),
+                    evaluation={
+                        "decision": "need_user" if run.run_kind in {"news", "feedback"} else "accept",
+                        "summary": f"全流程阶段：{state.phase}",
+                    },
+                    data_fingerprint=run.data_fingerprint,
+                    study_name="P1—P2—P3一轮研究",
+                    target_name="rt_price",
+                    study_start_time=state.p1_request.price_start.isoformat(),
+                    study_end_time=state.p1_request.price_end.isoformat(),
+                )
+            )
+        if state.phase in {"awaiting_forecast_approval", "forecast_running"} and state.forecast_plan:
+            plan = ForecastPlan.model_validate(state.forecast_plan)
+            session.current_plan = plan.model_dump(mode="json")
+            session.plan_stale = False
+            session.status = "awaiting_plan_approval"
+            self._active_interrupt_id = None
+            self._active_state_revision = None
+            self._active_interrupt_kind = None
+            plan_message = next(
+                (
+                    message
+                    for message in reversed(session.messages)
+                    if message.kind == "forecast_plan"
+                    and (message.payload.get("plan") or {}).get("plan_id") == plan.plan_id
+                ),
+                None,
+            )
+            if plan_message is None:
+                self._append_message(
+                    SessionMessage(
+                        role="assistant",
+                        kind="forecast_plan",
+                        content="山东次日实时电价预测方案等待确认",
+                        payload={"plan": plan.model_dump(mode="json"), "state": "awaiting"},
+                    )
+                )
+            else:
+                plan_message.payload["state"] = "awaiting"
+            if self.conversation.current_plan_widget is not None:
+                self.conversation.current_plan_widget.set_explicit_approval()
+        elif state.phase == "p2_needs_review":
+            session.current_plan = None
+            session.plan_stale = False
+            session.status = "awaiting_user"
+        elif state.phase == "p1_synthesis_complete":
+            session.current_plan = None
+            session.plan_stale = False
+            session.status = "completed"
+        elif state.phase in {"forecast_verified", "feedback_complete"}:
+            session.status = "completed"
+        elif state.phase == "failed":
+            session.status = "failed"
+        labels = {
+            "p1_initial_complete": "P1初步分析完成",
+            "p2_ready": "P2新闻证据完成",
+            "p2_needs_review": "P2存在待复核项",
+            "p1_synthesis_complete": "P1综合分析完成，等待准备P3",
+            "awaiting_forecast_approval": "P3方案等待单独确认",
+            "forecast_running": "P3正在运行",
+            "forecast_verified": "P3达到目标，本轮结束",
+            "feedback_complete": "P1反馈分析完成，本轮结束",
+            "failed": "全流程执行失败",
+        }
+        previous = next(
+            (
+                message
+                for message in reversed(session.messages)
+                if message.kind == "notice" and message.payload.get("full_flow_id") == state.flow_id
+            ),
+            None,
+        )
+        if previous is None or previous.payload.get("phase") != state.phase:
+            self._append_message(
+                SessionMessage(
+                    role="system",
+                    kind="notice",
+                    content=labels[state.phase] + (f"：{state.stop_reason}" if state.stop_reason else ""),
+                    payload={
+                        "full_flow_id": state.flow_id,
+                        "phase": state.phase,
+                        "forecast_runs_used": state.forecast_runs_used,
+                        "feedback_runs_used": state.feedback_runs_used,
+                        "state_path": session.full_flow_state_path,
+                    },
+                )
+            )
+        self._persist_and_render(keep_timeline=True)
 
     def _forecast_prepare_failed(self, detail: str) -> None:
         headline = detail.strip().splitlines()[-1] if detail.strip() else "预测输入检查失败"
@@ -898,6 +1261,9 @@ class ResearchWorkspace(QSplitter):
         session.current_plan = plan.model_dump(mode="json")
         session.plan_stale = False
         session.status = "awaiting_plan_approval"
+        self._active_interrupt_id = None
+        self._active_state_revision = None
+        self._active_interrupt_kind = None
         self._append_message(
             SessionMessage(
                 role="assistant",
@@ -916,16 +1282,58 @@ class ResearchWorkspace(QSplitter):
         )
         self._persist_and_render(keep_timeline=True)
 
+    def _explain_forecast_result(self, question: str) -> None:
+        """Explain the latest P3 evidence without preparing or executing a new plan."""
+
+        session = self.current_session
+        self._append_message(SessionMessage(role="user", kind="text", content=question, turn_id=uuid4().hex))
+        message = next((item for item in reversed(session.messages) if item.kind == "forecast_result"), None)
+        if message is None:
+            self._append_message(SessionMessage(role="assistant", kind="error", content="当前会话没有可解释的预测结果。"))
+            self._persist_and_render(keep_timeline=True)
+            return
+        aggregate = message.payload.get("aggregate") or {}
+        model = aggregate.get("model") or {}
+        day = aggregate.get("day_naive") or {}
+        week = aggregate.get("week_naive") or {}
+        diagnostics = message.payload.get("diagnostics") or {}
+        status = diagnostics.get("evaluation_status") or (
+            "verified" if diagnostics.get("baseline_verified") else "not_verified"
+        )
+        label = {
+            "verified": "达到了逐折样本门禁，并优于日前和周前朴素基线",
+            "not_verified": "样本可评估，但没有同时优于日前和周前朴素基线",
+            "not_evaluable": "共同有效点不足，当前不能判断预测增益",
+        }.get(str(status), "当前没有足够证据判断预测增益")
+        answer = (
+            f"本次预测{label}。模型聚合 MAE 为 {float(model.get('mae', float('nan'))):.2f}，"
+            f"日前同刻基线为 {float(day.get('mae', float('nan'))):.2f}，"
+            f"周前同刻基线为 {float(week.get('mae', float('nan'))):.2f}。"
+        )
+        warnings = [str(item) for item in message.payload.get("warnings", [])]
+        if warnings:
+            answer += " 主要限制：" + "；".join(warnings)
+        self._append_message(SessionMessage(role="assistant", kind="text", content=answer))
+        session.status = "completed"
+        self._active_interrupt_kind = None
+        self._persist_and_render(keep_timeline=True)
+
     def _legacy_graph_import(self, session: ResearchSession) -> dict[str, Any]:
+        latest_record = next(
+            (run for run in reversed(session.runs) if not session.run_id or run.run_id == session.run_id),
+            session.runs[-1] if session.runs else None,
+        )
+        latest_evaluation = latest_record.evaluation if latest_record else session.latest_evaluation
+        latest_is_eda = latest_record is None or latest_record.run_kind == "eda"
         latest_run = None
         if session.run_id:
             latest_run = {
                 "run_id": session.run_id,
-                "plan_id": (session.current_plan or {}).get("plan_id"),
+                "plan_id": latest_record.plan_id if latest_record else (session.current_plan or {}).get("plan_id"),
                 "artifact_directory": session.artifact_directory,
                 "report_path": session.report_path,
                 "figure_paths": {},
-                "evaluation": session.latest_evaluation,
+                "evaluation": latest_evaluation,
             }
         episode_summaries = []
         run_history = []
@@ -971,8 +1379,8 @@ class ResearchWorkspace(QSplitter):
             "data_profile": session.data_profile,
             "quality_report": session.quality_report,
             "data_fingerprint": (session.current_plan or {}).get("data_fingerprint"),
-            "eda_summary": session.latest_eda_summary,
-            "evaluation": session.latest_evaluation,
+            "eda_summary": session.latest_eda_summary if latest_is_eda else None,
+            "evaluation": latest_evaluation,
             "latest_run": latest_run,
             "run_history": run_history or ([latest_run] if latest_run else []),
             "episode_summaries": episode_summaries,
@@ -988,6 +1396,25 @@ class ResearchWorkspace(QSplitter):
         self._active_interrupt_kind = snapshot.interrupt.kind if snapshot.interrupt else None
         self.conversation.set_interaction_context(self._active_interrupt_kind)
         self._sync_graph_events(session, snapshot.events)
+        forecast_control = str(values.get("control") or "")
+        if forecast_control == "forecast_plan_request":
+            # The Graph recognizes intent; the desktop owns the fixed forecast
+            # snapshots and must create the card before any approval is accepted.
+            self._pending_forecast_request = str(values.get("latest_turn") or values.get("user_request") or "").strip()
+            session.status = "understanding"
+            self._persist_and_render(keep_timeline=True)
+            return
+        if forecast_control == "forecast_execute_request":
+            self._append_message(
+                SessionMessage(
+                    role="assistant",
+                    kind="error",
+                    content="当前没有可确认的预测方案。请先生成并查看预测方案卡。",
+                )
+            )
+            session.status = "awaiting_user"
+            self._persist_and_render(keep_timeline=True)
+            return
         self._sync_assistant_text(session, values)
         if (
             snapshot.interrupt is None
@@ -1042,7 +1469,12 @@ class ResearchWorkspace(QSplitter):
             return
 
         latest = values.get("latest_run")
-        if latest and latest.get("run_id") and not any(item.run_id == latest["run_id"] for item in session.runs):
+        added_run = bool(
+            latest
+            and latest.get("run_id")
+            and not any(item.run_id == latest["run_id"] for item in session.runs)
+        )
+        if added_run:
             evaluation = latest.get("evaluation") or {}
             self._append_message(
                 SessionMessage(
@@ -1093,6 +1525,15 @@ class ResearchWorkspace(QSplitter):
                 )
             )
             self._set_plan_message_state("completed")
+
+        if (
+            added_run
+            and interrupt_payload is not None
+            and interrupt_payload.kind == "result"
+            and session.pending_forecast_question
+        ):
+            self._pending_forecast_request = session.pending_forecast_question
+            session.pending_forecast_question = None
 
         if interrupt_payload and interrupt_payload.kind in {
             "plan_error",
@@ -1527,6 +1968,21 @@ class ResearchWorkspace(QSplitter):
 
         self._cancel_plan_feedback_window()
         session = self.current_session
+        full_flow = self._full_flow_for_plan(approved_plan)
+        if full_flow is not None and full_flow[1].phase in {"forecast_verified", "feedback_complete", "failed"}:
+            state = full_flow[1]
+            self._append_message(
+                SessionMessage(
+                    role="assistant",
+                    kind="error",
+                    content=(
+                        "本轮P3执行预算已经结束，不能再次执行。"
+                        + (f"停止原因：{state.stop_reason}" if state.stop_reason else "")
+                    ),
+                )
+            )
+            self._persist_and_render(keep_timeline=True)
+            return
         session.current_plan = approved_plan.model_dump(mode="json")
         session.status = "running"
         self._set_plan_message_state("running", plan=approved_plan)
@@ -1541,15 +1997,158 @@ class ResearchWorkspace(QSplitter):
         )
         self._start_thinking("compute", "启动山东电价预测", "回测 1/3 即将开始")
         self._add_trace("plan", "预测方案已确认", "completed", "只读运行，不写业务数据库")
-        self._start_worker(
-            kind="forecast_execute",
-            operation=lambda progress: execute_forecast_workflow(
-                approved_plan,
-                progress=progress,
-            ),
-            success_handler=self._forecast_run_completed,
-        )
+        if full_flow is None:
+            self._start_worker(
+                kind="forecast_execute",
+                operation=lambda progress: execute_forecast_workflow(
+                    approved_plan,
+                    progress=progress,
+                ),
+                success_handler=self._forecast_run_completed,
+            )
+        else:
+            flow, state = full_flow
+            self._start_worker(
+                kind="full_flow_forecast_execute",
+                operation=lambda progress: flow.approve_and_run_p3(
+                    state=state,
+                    plan_id=approved_plan.plan_id,
+                    plan_fingerprint=str(state.forecast_plan_fingerprint),
+                    progress=progress,
+                ),
+                success_handler=self._full_flow_forecast_completed,
+                failure_handler=self._full_flow_forecast_failed,
+            )
         self.conversation.scroll_to_bottom()
+
+    def _full_flow_for_plan(
+        self,
+        plan: ForecastPlan,
+    ) -> tuple[FullResearchFlow, FullFlowState] | None:
+        """Resolve a persisted flow only when it owns the exact desktop plan."""
+
+        session = self.current_session
+        if not session.full_flow_state_path:
+            return None
+        store = FullFlowStore(session.full_flow_state_path)
+        try:
+            state = store.load()
+        except (OSError, ValueError):
+            return None
+        if not state.forecast_plan or state.forecast_plan.get("plan_id") != plan.plan_id:
+            return None
+        output_directory = session.full_flow_output_directory or str(store.path.parent / "full-flow")
+        return FullResearchFlow(store=store, output_directory=output_directory), state
+
+    def _full_flow_forecast_completed(self, state: FullFlowState) -> None:
+        """Render P3 evidence and the one allowed P1 feedback from persisted flow state."""
+
+        session = self.current_session
+        feedback = state.feedback
+        if feedback is None:
+            self._full_flow_forecast_failed("全流程结束但没有生成P3反馈包")
+            return
+        self._complete_active_tool("3折回测、次日96点预测和有界反馈分析已完成")
+        diagnostics = {
+            "evaluation_status": feedback.status,
+            "baseline_verified": feedback.status == "verified",
+            "fold_common_observations": list(feedback.fold_common_observations),
+            "news_feature_columns": list(feedback.used_news_features),
+            "excluded_news_features": feedback.excluded_news_features,
+            "feedback_diagnosis": list(feedback.diagnosis),
+        }
+        self._append_message(
+            SessionMessage(
+                role="assistant",
+                kind="forecast_result",
+                content="山东次日实时电价预测与本轮反馈分析完成",
+                payload={
+                    "run_id": feedback.forecast_run_id,
+                    "aggregate": feedback.aggregate_metrics,
+                    "diagnostics": diagnostics,
+                    "warnings": list(feedback.warnings),
+                    "prediction_path": str(feedback.prediction_path or ""),
+                    "backtest_path": str(feedback.backtest_path or ""),
+                    "metrics_path": str(feedback.metrics_path or ""),
+                    "report_path": str(feedback.report_path or ""),
+                    "artifact_directory": str(feedback.artifact_directory or ""),
+                    "figure_paths": {name: str(path) for name, path in feedback.figure_paths.items()},
+                    "output_hash": feedback.output_hash or "",
+                    "full_flow_id": state.flow_id,
+                    "stop_reason": state.stop_reason,
+                },
+            )
+        )
+        forecast_run = next(
+            (run for run in reversed(state.runs) if run.run_kind == "forecast"),
+            None,
+        )
+        if forecast_run is not None and not any(run.run_id == forecast_run.run_id for run in session.runs):
+            session.runs.append(
+                SessionRunRecord(
+                    run_id=forecast_run.run_id,
+                    run_kind="forecast",
+                    plan_id=feedback.plan_id,
+                    parent_run_id=forecast_run.parent_run_id,
+                    question=(state.forecast_plan or {}).get("question", "预测山东明天实时电价"),
+                    artifact_directory=str(forecast_run.artifact_directory),
+                    report_path=str(forecast_run.report_path),
+                    evaluation={
+                        "decision": "accept" if feedback.status == "verified" else "need_user",
+                        "summary": state.stop_reason or "P3流程已结束",
+                        "warnings": list(feedback.warnings),
+                        "aggregate": feedback.aggregate_metrics,
+                    },
+                    data_fingerprint=forecast_run.data_fingerprint,
+                    study_name="山东省级实时电价次日预测",
+                    target_name="rt_price",
+                    study_start_time=str((state.forecast_plan or {}).get("forecast_start", "")),
+                    study_end_time=str((state.forecast_plan or {}).get("forecast_end", "")),
+                )
+            )
+        session.run_id = feedback.forecast_run_id
+        session.artifact_directory = str(feedback.artifact_directory or (forecast_run.artifact_directory if forecast_run else ""))
+        session.report_path = str(feedback.report_path or (forecast_run.report_path if forecast_run else ""))
+        session.status = "completed"
+        self._set_plan_message_state("completed")
+        self._add_trace(
+            "artifact",
+            "完成P3与一次反馈分析",
+            "completed",
+            state.stop_reason or "全流程已按预算停止",
+        )
+        self.update_full_flow_state(
+            state,
+            state_path=session.full_flow_state_path or "full-flow.json",
+            output_directory=session.full_flow_output_directory,
+        )
+
+    def _full_flow_forecast_failed(self, detail: str) -> None:
+        """Keep the persisted failure and frozen plan visible after a P3 worker error."""
+
+        session = self.current_session
+        state = None
+        if session.full_flow_state_path:
+            try:
+                state = FullFlowStore(session.full_flow_state_path).load()
+            except (OSError, ValueError):
+                state = None
+        headline = detail.strip().splitlines()[-1] if detail.strip() else "全流程P3执行失败"
+        session.status = "failed"
+        self._close_latest_running_trace("failed")
+        self._set_plan_message_state("failed")
+        self._set_active_tool_status("failed", headline)
+        self._append_message(
+            SessionMessage(role="assistant", kind="error", content=f"P3没有完成：{headline}")
+        )
+        if state is not None:
+            self.update_full_flow_state(
+                state,
+                state_path=session.full_flow_state_path or "full-flow.json",
+                output_directory=session.full_flow_output_directory,
+            )
+        else:
+            self._persist_and_render(keep_timeline=True)
 
     def _forecast_run_completed(self, result: ForecastRunResult) -> None:
         session = self.current_session
@@ -1694,7 +2293,9 @@ class ResearchWorkspace(QSplitter):
 
     def _task_cancelled(self) -> None:
         self._pending_execute_plan = None
+        self._pending_forecast_request = None
         session = self.current_session
+        session.pending_forecast_question = None
         self._record_forecast_terminal("cancelled", "用户取消运行")
         if self.agent.has_thread(session.session_id):
             self.agent.cancel(session.session_id)
@@ -1708,7 +2309,9 @@ class ResearchWorkspace(QSplitter):
 
     def _task_failed(self, detail: str) -> None:
         self._pending_execute_plan = None
+        self._pending_forecast_request = None
         session = self.current_session
+        session.pending_forecast_question = None
         self._record_forecast_terminal("failed", detail)
         session.status = "failed"
         self._close_latest_running_trace("failed")
@@ -1722,7 +2325,7 @@ class ResearchWorkspace(QSplitter):
     def _record_forecast_terminal(self, status: str, detail: str) -> None:
         """Keep failed and cancelled forecast experiments beside their frozen inputs."""
 
-        if self._task_kind not in {"forecast_prepare", "forecast_execute"}:
+        if self._task_kind not in {"forecast_prepare", "forecast_execute", "full_flow_forecast_execute"}:
             return
         value = self.current_session.current_plan or {}
         if value.get("plan_kind") != "forecast":
@@ -1832,6 +2435,8 @@ class ResearchWorkspace(QSplitter):
     def _thread_finished(self) -> None:
         pending_plan = self._pending_execute_plan
         self._pending_execute_plan = None
+        pending_forecast = self._pending_forecast_request
+        self._pending_forecast_request = None
         self._thread = None
         self._worker = None
         self._task_kind = None
@@ -1842,6 +2447,14 @@ class ResearchWorkspace(QSplitter):
         self._persist_and_render(keep_timeline=True)
         if pending_plan is not None:
             QTimer.singleShot(0, lambda plan=pending_plan: self.run_plan(plan))
+        elif pending_forecast:
+            QTimer.singleShot(
+                0,
+                lambda question=pending_forecast: self._submit_forecast_request(
+                    question,
+                    record_user_message=False,
+                ),
+            )
 
     def _set_busy(self, busy: bool) -> None:
         self.history.set_busy(busy)

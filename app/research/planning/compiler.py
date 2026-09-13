@@ -80,7 +80,32 @@ FUNCTION_AGENDA_ITEM_IDS: dict[str, str] = {
 }
 
 
-def _agenda_hypotheses(draft: EDAPlanDraft, functions: list[str]) -> tuple[list[str], list[str]]:
+def _requested_statistics(question: str) -> tuple[str, ...]:
+    normalized = question.casefold()
+    mappings = (
+        ("mean", ("均值", "平均值", "mean", "average")),
+        ("min", ("最低", "最小", "minimum", " min")),
+        ("max", ("最高", "最大", "maximum", " max")),
+    )
+    return tuple(name for name, terms in mappings if any(term in normalized for term in terms))
+
+
+def _is_statistic_deliverable(hypothesis: str, requested: tuple[str, ...]) -> bool:
+    terms = {
+        "mean": ("均值", "平均值", "mean", "average"),
+        "min": ("最低", "最小", "minimum"),
+        "max": ("最高", "最大", "maximum"),
+    }
+    normalized = hypothesis.casefold()
+    return bool(requested) and all(any(term in normalized for term in terms[name]) for name in requested)
+
+
+def _agenda_hypotheses(
+    draft: EDAPlanDraft,
+    functions: list[str],
+    *,
+    requested_statistics: tuple[str, ...] = (),
+) -> tuple[list[str], list[str]]:
     """Build the agenda from the selected functions, keeping one hypothesis per item.
 
     The planner's own wording is preferred when it resolves to an item, because it
@@ -100,6 +125,8 @@ def _agenda_hypotheses(draft: EDAPlanDraft, functions: list[str]) -> tuple[list[
     for hypothesis in draft.hypotheses:
         item_id = resolve_agenda_item(hypothesis)
         if item_id is None:
+            if _is_statistic_deliverable(hypothesis, requested_statistics):
+                continue
             parked.append(hypothesis)
             continue
         agenda.setdefault(item_id, hypothesis)
@@ -315,7 +342,12 @@ class EDAPlanCompiler:
             notes.append("目标电价单位未知，绝对数值和阈值解释前需要用户确认单位。")
         if "unspecified" in config.study.market.casefold():
             notes.append("市场范围尚未明确，当前不生成依赖具体市场规则的解释。")
-        agenda, parked = _agenda_hypotheses(draft, ordered_names)
+        requested_statistics = _requested_statistics(question)
+        agenda, parked = _agenda_hypotheses(
+            draft,
+            ordered_names,
+            requested_statistics=requested_statistics,
+        )
         if parked:
             notes.append(
                 "以下说法没有对应的确定性检验，未列入本轮议程：" + "；".join(parked[:3])
@@ -348,6 +380,8 @@ class EDAPlanCompiler:
             ),
             hypotheses=agenda,
             unverifiable_hypotheses=parked,
+            analysis_kind="descriptive" if requested_statistics else "research",
+            requested_statistics=requested_statistics,
             selected_variables=selected,
             variable_selection_mode=draft.variable_selection_mode,
             variable_selection_stage=draft.variable_selection_stage,

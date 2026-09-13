@@ -17,6 +17,7 @@ NewsEventType = Literal[
     "generation_restore",
     "transmission_constraint",
     "demand_shock",
+    "storage_dispatch",
     "renewable_supply_change",
     "fuel_supply_change",
     "policy_long_horizon",

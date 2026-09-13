@@ -6,7 +6,7 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.config import Settings, get_settings
 from app.llm import compat
@@ -59,6 +59,58 @@ def _prompt_json_messages(
             prepared[index] = message.model_copy(
                 update={"content": f"{message.content}{instruction}"}
             )
+            break
+    else:
+        prepared.insert(0, ModelMessage(role="system", content=instruction.lstrip()))
+    return prepared
+
+
+class _PromptToolCall(BaseModel):
+    """One locally validated function proposal for explicit proxy compatibility mode."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    arguments: dict[str, Any]
+
+
+class _PromptToolCalls(BaseModel):
+    """Envelope used only when prompt_json is explicitly selected."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    calls: list[_PromptToolCall] = Field(min_length=1)
+
+
+def _prompt_tool_call_messages(
+    messages: list[ModelMessage],
+    tools: list[dict[str, Any]],
+) -> list[ModelMessage]:
+    """Describe the exact tool whitelist when an OpenAI proxy discards ``tools``."""
+
+    definitions = []
+    for tool in tools:
+        function = tool.get("function", tool)
+        if isinstance(function, dict):
+            definitions.append(
+                {
+                    "name": function.get("name"),
+                    "description": function.get("description", ""),
+                    "parameters": function.get("parameters", {}),
+                }
+            )
+    instruction = (
+        "\n\n[研究函数选择兼容协议]\n"
+        "当前代理不会转发原生 tools。请在结构化结果的 calls 数组中选择完成任务所需的最少函数。"
+        "name 必须逐字来自下列白名单，arguments 必须符合对应 parameters；不得返回白名单之外的函数，"
+        "不得执行函数，不得在结构化对象之外输出说明。\n"
+        "函数白名单："
+        + json.dumps(definitions, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    )
+    prepared = list(messages)
+    for index, message in enumerate(prepared):
+        if message.role == "system":
+            prepared[index] = message.model_copy(update={"content": f"{message.content}{instruction}"})
             break
     else:
         prepared.insert(0, ModelMessage(role="system", content=instruction.lstrip()))
@@ -342,6 +394,20 @@ class ResearchModelGateway:
         allowed_names = tool_names(tools)
         if not allowed_names:
             raise ModelConfigurationError("研究函数定义缺少 name。")
+        if self.settings.llm_structured_output_method == "prompt_json":
+            result = self.invoke_structured(
+                messages=_prompt_tool_call_messages(messages, tools),
+                schema=_PromptToolCalls,
+            )
+            calls = [
+                ModelToolCall(
+                    name=call.name,
+                    arguments=call.arguments,
+                    call_id=f"prompt-json-{index}",
+                )
+                for index, call in enumerate(result.calls, start=1)
+            ]
+            return self._validate_tool_calls(calls, allowed_names)
         prepared = transport_messages(messages)
         try:
             response = self._degrade(
@@ -365,6 +431,15 @@ class ResearchModelGateway:
             raise ModelGatewayError(f"大模型函数选择失败：{type(exc).__name__}: {exc}") from exc
         if not calls or any(not call.name for call in calls):
             raise self._protocol_error("Function Calling", "未返回原生函数调用")
+        return self._validate_tool_calls(calls, allowed_names)
+
+    @staticmethod
+    def _validate_tool_calls(
+        calls: list[ModelToolCall],
+        allowed_names: set[str],
+    ) -> list[ModelToolCall]:
+        """Keep compatibility proposals inside the same whitelist as native calls."""
+
         unknown = sorted({call.name for call in calls} - allowed_names)
         if unknown:
             raise ModelResponseError(f"大模型调用了未提供的研究函数：{', '.join(unknown)}")

@@ -16,12 +16,35 @@ from app.research.forecasting.contracts import (
     ForecastPlan,
     ForecastSnapshotSpec,
 )
-from app.research.forecasting.data import adapt_regional_frames, select_backtest_anchors
+from app.research.forecasting.data import (
+    _baseline_common_observations,
+    _normalize_time_columns,
+    _operational_backtest_origin,
+    adapt_regional_frames,
+    select_backtest_anchors,
+)
 from app.research.forecasting.model import forecast_ctm_similar_day
 from app.research.forecasting.service import run_forecast_plan
 from app.research.forecasting.workflow import execute_forecast_workflow
 
 ZONE = ZoneInfo("Asia/Shanghai")
+
+
+def test_time_normalization_accepts_mixed_offsets_and_fractional_seconds() -> None:
+    frame = pd.DataFrame(
+        {
+            "timestamp": ["2026-09-12 15:00:00+00:00", "2026-09-12 23:15:00+08:00"],
+            "available_at": ["2026-09-12 15:00:00+00:00", "2026-09-12 23:19:46.794487+08:00"],
+        }
+    )
+
+    normalized = _normalize_time_columns(frame)
+
+    assert normalized.timestamp.tolist() == [
+        pd.Timestamp("2026-09-12 23:00:00"),
+        pd.Timestamp("2026-09-12 23:15:00"),
+    ]
+    assert normalized.available_at.isna().sum() == 0
 
 
 def _snapshot(role: str, anchor: datetime, path: Path) -> ForecastSnapshotSpec:
@@ -74,6 +97,19 @@ def test_anchor_selection_uses_complete_days_at_least_a_week_apart():
     )
 
     assert [value.date().isoformat() for value in anchors] == ["2026-08-08", "2026-08-15", "2026-08-22"]
+
+
+def test_backtest_origin_replays_current_forecast_lead_and_checks_baseline_coverage():
+    target_start = datetime(2026, 9, 11, tzinfo=ZONE)
+    current_origin = datetime(2026, 9, 12, 22, tzinfo=ZONE)
+
+    origin = _operational_backtest_origin(target_start, current_origin=current_origin)
+
+    assert origin == datetime(2026, 9, 10, 22, tzinfo=ZONE)
+    forecast_index = pd.date_range("2026-09-11", periods=96, freq="15min")
+    history_index = pd.date_range("2026-09-04", "2026-09-10 21:45", freq="15min")
+    frame = pd.DataFrame({"rt_price": 1.0}, index=history_index)
+    assert _baseline_common_observations(frame, forecast_index) == 88
 
 
 def test_adapter_does_not_expose_actual_values_after_cutoff():

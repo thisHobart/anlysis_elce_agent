@@ -11,7 +11,23 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 FORECAST_ALGORITHM_ID = "shandong-rt-ctm-similar-day"
-FORECAST_ALGORITHM_VERSION = "1.0.0+ctm_base_v4_weather_interaction_source"
+FORECAST_ALGORITHM_VERSION = "1.2.0+operational_backtest_origin"
+
+
+class ForecastNewsFeatureSource(BaseModel):
+    """Audited P2→P3 numeric feature hand-off frozen with a forecast plan."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_run_id: str = Field(min_length=1)
+    source_p1_run_id: str | None = None
+    source_path: Path
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    selected_columns: tuple[str, ...] = ()
+    excluded_columns: dict[str, str] = Field(default_factory=dict)
+    selection_cutoff: datetime
+    availability_type: Literal["known_at_timestamp"] = "known_at_timestamp"
+    selection_reason: str = Field(min_length=1)
 
 
 class CTMTrainingConfig(BaseModel):
@@ -55,6 +71,8 @@ class ForecastSnapshotSpec(BaseModel):
     fingerprint: str = Field(pattern=r"^[a-f0-9]{12}$")
     truth_path: Path | None = None
     truth_fingerprint: str | None = Field(default=None, pattern=r"^[a-f0-9]{12}$")
+    news_feature_columns: tuple[str, ...] = ()
+    expected_baseline_common_observations: int = Field(default=0, ge=0, le=96)
 
 
 class ForecastPlan(BaseModel):
@@ -81,6 +99,7 @@ class ForecastPlan(BaseModel):
     data_fingerprint: str = Field(pattern=r"^[a-f0-9]{12}$")
     source_data_fingerprint: str | None = Field(default=None, pattern=r"^[a-f0-9]{12}$")
     preflight_warnings: list[str] = Field(default_factory=list)
+    news_feature_sources: tuple[ForecastNewsFeatureSource, ...] = ()
     read_only: Literal[True] = True
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -123,6 +142,8 @@ class ForecastFoldResult(BaseModel):
     week_naive: ForecastMetricSet
     prediction_path: Path
     snapshot_fingerprint: str
+    common_observations: int = Field(default=0, ge=0)
+    news_feature_columns: tuple[str, ...] = ()
 
 
 class ForecastRunResult(BaseModel):
@@ -146,8 +167,14 @@ class ForecastRunResult(BaseModel):
     @property
     def baseline_verified(self) -> bool:
         model = self.aggregate["model"].mae
-        comparable = self.aggregate["model"].observations >= 3 * 72
-        return comparable and model < min(
+        comparable = all(item.common_observations >= 72 for item in self.folds)
+        return comparable and model is not None and model < min(
             self.aggregate["day_naive"].mae,
             self.aggregate["week_naive"].mae,
         )
+
+    @property
+    def evaluation_status(self) -> Literal["verified", "not_verified", "not_evaluable"]:
+        if any(item.common_observations < 72 for item in self.folds):
+            return "not_evaluable"
+        return "verified" if self.baseline_verified else "not_verified"

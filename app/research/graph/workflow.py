@@ -18,7 +18,11 @@ from app.research.agent.errors import (
     ResearchPlanValidationError,
     SkillVersionMismatchError,
 )
-from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
+from app.research.agent.orchestrator import (
+    DialogueDecision,
+    MainResearchAgent,
+    requests_analysis_before_forecast,
+)
 from app.research.agent.retrieval import bounded_recent_turn_history, select_persisted_conversation_history
 from app.research.agent.schemas import ConversationMessage, EDAPlan
 from app.research.application.execution import EDAExecutionService
@@ -568,6 +572,7 @@ def build_research_workflow(
                 ),
             }
         try:
+            skill_metadata = skills.metadata()
             decision, _ = main_agent.decide(
                 question=_latest_turn(state),
                 status=state.get("phase", "idle"),
@@ -578,13 +583,31 @@ def build_research_workflow(
                 summary=state.get("eda_summary"),
                 evaluation=state.get("evaluation"),
                 history=_messages(state),
-                available_skills=skills.metadata(),
+                available_skills=skill_metadata,
                 episode_summaries=_scoped_episode_summaries(state),
                 active_gate=state.get("user_interrupt_kind") or state.get("return_to_gate"),
                 episode_goal=_episode_goal(state),
                 latest_run=state.get("latest_run"),
                 current_turn_id=state.get("active_turn_id"),
             )
+            if (
+                decision.intent in {"new_forecast_plan", "execute_forecast_plan"}
+                and requests_analysis_before_forecast(_latest_turn(state))
+            ):
+                analysis_skill = next(
+                    (
+                        str(item["name"])
+                        for item in skill_metadata
+                        if item.get("domain") == "eda" and item.get("name") == "price-exogenous-eda"
+                    ),
+                    None,
+                ) or next(
+                    (str(item["name"]) for item in skill_metadata if item.get("domain") == "eda"),
+                    None,
+                )
+                if analysis_skill is None:
+                    raise SkillLoadError("组合请求要求先分析，但当前没有可用的EDA Skill。")
+                decision = DialogueDecision(intent="new_plan", skill_name=analysis_skill)
             active_gate = state.get("user_interrupt_kind") or state.get("return_to_gate")
             if (
                 decision.intent == "execute_plan"
@@ -640,13 +663,32 @@ def build_research_workflow(
             update["revision_cycle_id"] = state.get("active_turn_id") or state.get("revision_cycle_id")
         return update
 
-    def route_main(state: ResearchLoopState) -> Literal["new_plan", "revise_plan", "execute_plan", "reply", "need_user"]:
+    def route_main(
+        state: ResearchLoopState,
+    ) -> Literal["new_plan", "revise_plan", "execute_plan", "forecast_handoff", "reply", "need_user"]:
         control = state.get("control", "reply")
         if control in {"new_forecast_plan", "execute_forecast_plan"}:
-            return "reply"
+            return "forecast_handoff"
         if control == "execute_plan" and _plan(state) is None:
             return "reply"
         return control if control in {"new_plan", "revise_plan", "execute_plan", "need_user"} else "reply"  # type: ignore[return-value]
+
+    def prepare_forecast_handoff(state: ResearchLoopState) -> dict[str, Any]:
+        """Hand forecast intent to the application that owns immutable P3 inputs."""
+
+        intent = DialogueDecision.model_validate(state["decision"]).intent
+        control = "forecast_execute_request" if intent == "execute_forecast_plan" else "forecast_plan_request"
+        return {
+            "phase": "awaiting_user",
+            "control": control,
+            "assistant_message": "",
+            "events": _event(
+                state,
+                "移交固定预测方案入口" if control == "forecast_plan_request" else "校验预测方案确认入口",
+                trace_category="plan",
+                forecast_control=control,
+            ),
+        }
 
     def confirm_existing_plan(state: ResearchLoopState) -> dict[str, Any]:
         return {
@@ -2522,6 +2564,7 @@ def build_research_workflow(
         "prepare_need_user": prepare_need_user,
         "explain_result": explain_result,
         "reply": reply,
+        "prepare_forecast_handoff": prepare_forecast_handoff,
         "user_interrupt": user_interrupt,
         "result_interrupt": result_interrupt,
         "persist_stop": persist_stop,
@@ -2538,10 +2581,12 @@ def build_research_workflow(
             "new_plan": "begin_episode",
             "revise_plan": "revise_user_plan",
             "execute_plan": "confirm_existing_plan",
+            "forecast_handoff": "prepare_forecast_handoff",
             "reply": "reply",
             "need_user": "prepare_need_user",
         },
     )
+    graph.add_edge("prepare_forecast_handoff", END)
     graph.add_edge("confirm_existing_plan", "validate_plan")
     graph.add_conditional_edges("resolve_skill", route_skill, {"plan": "eda_subagent", "need_user": "prepare_need_user"})
     graph.add_conditional_edges(

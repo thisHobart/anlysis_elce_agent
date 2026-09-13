@@ -850,6 +850,23 @@ def evaluate_agent_run(
     warnings: list[str] = []
     followups: list[str] = []
 
+    if plan.requested_statistics:
+        distribution = (summary.get("price") or {}).get("distribution") or {}
+        missing_statistics = [name for name in plan.requested_statistics if distribution.get(name) is None]
+        checks.append(
+            EvaluationCheck(
+                name="描述统计交付完整性",
+                status="warning" if missing_statistics else "pass",
+                message=(
+                    "缺少统计量：" + "、".join(missing_statistics)
+                    if missing_statistics
+                    else "用户要求的均值、最低值或最高值已经由确定性分布函数计算。"
+                ),
+                scope="needs_data" if missing_statistics else "inherent",
+                remediation="检查电价分布函数输出和目标序列有效值。" if missing_statistics else None,
+            )
+        )
+
     if quality.usable_for_eda:
         checks.append(EvaluationCheck(name="目标数据可用性", status="pass", message="目标序列满足最小样本要求。"))
     else:

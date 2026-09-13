@@ -320,6 +320,24 @@ def test_restoration_closes_the_matching_open_outage() -> None:
     assert rows[_at(11, 30)].active_event_count == 0
 
 
+def test_point_demand_and_dispatch_events_do_not_become_permanent_states() -> None:
+    known_doc = _document(source_id="DEMAND", body="demand peak", collected_at=_at(10))
+    late_doc = _document(source_id="DISPATCH", body="dispatch record", collected_at=_at(12))
+    events = merge_event_records(
+        [
+            (_event(known_doc, 1, start=11, event_type="demand_shock"), known_doc),
+            (_event(late_doc, 2, start=11, event_type="storage_dispatch"), late_doc),
+        ],
+        as_of=_at(13),
+    )
+    rows = _feature_rows(events)
+
+    assert rows[_at(11)].event_type_counts["demand_shock"] == 1
+    assert rows[_at(11, 30)].event_type_counts["demand_shock"] == 0
+    assert all(row.event_type_counts["storage_dispatch"] == 0 for row in rows.values())
+    assert rows[_at(12)].new_announcement_count == 1
+
+
 def test_same_asset_sibling_events_survive_a_document_revision() -> None:
     first_doc = _document(body="initial", collected_at=_at(10))
     corrected_doc = _document(body="corrected", version=2, collected_at=_at(12))

@@ -92,6 +92,10 @@ from app.research.news.features import (
     build_event_features,
     snapshot_to_csv_rows,
 )
+from app.research.news.forecast_features import (
+    build_forecast_news_features,
+    forecast_news_feature_hash,
+)
 from app.research.news.long_context import FullContextNewsExtractor, ModelRoute
 from app.research.news.merging import AsOfEventAssembler, EventView, merge_event_records
 from app.research.news.model_extraction import (
@@ -207,6 +211,7 @@ __all__ = [
     "benchmark_real_news_extractor",
     "build_event_features",
     "build_evidence_links",
+    "build_forecast_news_features",
     "build_model_news_extraction_messages",
     "build_phase2_goal_input",
     "build_quality_report",
@@ -216,6 +221,7 @@ __all__ = [
     "document_ref",
     "evaluate_phase2_goal_agent",
     "evaluate_result_quality",
+    "forecast_news_feature_hash",
     "is_region_mention",
     "is_usable_at",
     "lead_time_table",

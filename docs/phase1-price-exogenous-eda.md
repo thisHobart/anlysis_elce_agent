@@ -36,7 +36,7 @@
 → 保存对话、计划版本、运行血缘、执行轨迹、结果与哈希
 ```
 
-Agent 只有一条模型函数提议路径：已配置模型通过显式选择的 Chat 或 Responses API，根据研究问题、授权函数、数据画像、领域协议和对话历史返回原生 Function Call。模型未配置、调用失败、消息协议不兼容或结构化输出无效时，研究暂停并显示真实错误，不能由关键词规则或提示词 JSON 替代模型决策。桌面端显式选择 DeepSeek、Qwen 或 Custom 以及 Chat/Responses API；Provider 适配只发送该组合有文档支持的附加推理控制参数，Custom 默认不注入。端点仍返回非空思考字段或标签时，默认丢弃思考内容后继续，严格策略下研究立即失败。可审计研究链只来自本地版本化协议、原生函数调用、确定性证据和门禁结果。
+Agent 只有一条受控模型函数提议边界：已配置模型通过显式选择的 Chat 或 Responses API，根据研究问题、授权函数、数据画像、领域协议和对话历史提出函数调用。默认要求原生 Function Call；显式选择 `prompt_json` 时允许代理兼容路径把函数白名单和参数定义写入提示，返回结果仍须通过本地 Schema、白名单和计划编译器。模型未配置、调用失败、消息协议不兼容或结构化输出无效时，研究暂停并显示真实错误，不能由关键词规则替代模型决策。桌面端显式选择 DeepSeek、Qwen、Gemini 或 Custom 以及 Chat/Responses API；Provider 适配只发送该组合有文档支持的附加推理控制参数，Custom 默认不注入。端点仍返回非空思考字段或标签时，默认丢弃思考内容后继续，严格策略下研究立即失败。可审计研究链只来自本地版本化协议、受校验的函数提议、确定性证据和门禁结果。
 
 桌面的每个研究回合都进入同一个持久化 LangGraph。方案审批和结果决策使用 `interrupt/resume`；函数按稳定调用 ID 逐个执行和校验；评估反馈在预算内回到 Subagent。SQLite checkpoint 支持在审批、函数执行和结果交互位置恢复。
 
@@ -89,7 +89,7 @@ Windows 非开发用户也可以双击仓库根目录的 `start_desktop.bat`。
 | `relationship_evidence` | `relationship_scipy_pearson_pairwise`、`relationship_scipy_spearman_pairwise`、`relationship_mutual_information_scan`、`relationship_pearson_positive_lead_scan`、`relationship_granger_causality_scan`、`relationship_pearson_by_hour`、`relationship_pearson_by_month`、`relationship_feature_quartile_response`、`relationship_rolling_correlation_stability`、`relationship_pearson_segment_comparison` |
 | `forecast_readiness` | `price_variance_stabilization_check`、`price_naive_baseline_benchmark` |
 
-大模型通过原生 Function Calling 提出一个或多个具体函数调用。Graph 先拦截并编译为候选计划，用户批准前不会执行。用户修改不直接改写可执行队列，而是作为反馈再次交给模型；最大滞后按数据频率换算，安全上限为 31 天。
+大模型通过原生 Function Calling，或显式 `prompt_json` 兼容模式下经本地严格校验的函数清单，提出一个或多个具体调用。Graph 先拦截并编译为候选计划，用户批准前不会执行。用户修改不直接改写可执行队列，而是作为反馈再次交给模型；最大滞后按数据频率换算，安全上限为 31 天。
 
 同一函数每个计划最多出现一次。变量合并到 `variables`，滞后合并到一个最大 `max_lag`，峰谷、季节和单一事件前后子样本合并到一次 `segments` 调用。`exogenous_variance_inflation` 至少需要两个变量，编译期即校验。
 

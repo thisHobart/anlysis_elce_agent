@@ -44,6 +44,7 @@ def test_desktop_smoke_payload_loads_both_skills_and_all_functions(
     assert payload["function_count"] == 30
     assert Path(payload["session_store_path"]) == (tmp_path / "sessions.json").resolve()
     assert Path(payload["research_output_directory"]).is_absolute()
+    assert Path(payload["p2_news_path"]).is_file()
 
 
 def test_validation_shutdown_cancels_busy_worker_before_closing() -> None:
