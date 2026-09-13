@@ -87,7 +87,14 @@ def test_p2_workspace_handoff_and_p1_feature_decisions_are_persistent(tmp_path: 
             }
         },
         information_cutoff=datetime.fromisoformat("2026-03-01T23:30:00+00:00"),
+        request_text="分析新闻并准备次日电价预测",
+        requested_forecast=True,
     )
+    assert state.durable_goal == "分析新闻并准备次日电价预测"
+    assert state.current_stage == "p2"
+    assert state.last_completed_stage == "p1_initial"
+    assert state.allowed_actions == ("continue", "stop")
+    assert state.input_fingerprints == {}
     state = state.model_copy(
         update={
             "p1_request": state.p1_request.model_copy(
@@ -104,6 +111,12 @@ def test_p2_workspace_handoff_and_p1_feature_decisions_are_persistent(tmp_path: 
         extractor=ObviousNewsEventExtractor(market_timezone="UTC"),
     )
     assert state.phase == "p2_ready"
+    assert state.current_stage == "p1_synthesis"
+    assert state.last_completed_stage == "p2"
+    assert state.stage_attempts == {"p2": 1}
+    assert state.input_fingerprints["p2_news"] == hashlib.sha256(
+        (FIXTURES / "synthetic_news.jsonl").read_bytes()
+    ).hexdigest()
     assert state.p2_feature_path and state.p2_feature_path.is_file()
     assert state.p2_manifest_path and state.p2_manifest_path.is_file()
     review_queue = json.loads(
@@ -134,14 +147,67 @@ def test_p2_workspace_handoff_and_p1_feature_decisions_are_persistent(tmp_path: 
         extractor=ObviousNewsEventExtractor(market_timezone="UTC"),
     )
     assert state.phase == "p2_ready"
+    assert state.stage_attempts["p2"] == 2
     assert state.p2_knowledge_cutoff and state.p2_knowledge_cutoff > state.p1_request.information_cutoff
     resumed_manifest = json.loads(state.p2_manifest_path.read_text(encoding="utf-8"))
     assert datetime.fromisoformat(resumed_manifest["information_cutoff"]) == state.p2_knowledge_cutoff
 
     state = flow.synthesize_p1(state=state)
     assert state.phase == "p1_synthesis_complete"
+    assert state.current_stage == "p3_prepare"
+    assert state.last_completed_stage == "p1_synthesis"
+    assert state.stage_attempts["p1_synthesis"] == 1
     assert any(item.decision == "selected" for item in state.feature_decisions)
     assert flow.store.load().runs[-1].parent_run_id == state.runs[-2].run_id
+
+
+def test_v1_flow_state_is_migrated_with_a_durable_cursor(tmp_path: Path):
+    moment = datetime(2026, 9, 13, tzinfo=UTC)
+    report = _touch(tmp_path / "p1" / "report.md")
+    store = FullFlowStore(tmp_path / "flow.json")
+    flow = FullResearchFlow(store=store, output_directory=tmp_path / "runs")
+    current = flow.start(
+        p1_run=FlowRunReference(
+            run_kind="eda",
+            run_id="p1-migrate",
+            artifact_directory=report.parent,
+            report_path=report,
+            data_fingerprint="a" * 12,
+        ),
+        eda_summary={
+            "price": {
+                "start_time": moment.isoformat(),
+                "end_time": moment.isoformat(),
+                "distribution": {},
+            }
+        },
+        information_cutoff=moment,
+        request_text="分析新闻",
+    )
+    legacy = current.model_dump(mode="json")
+    legacy["schema_version"] = 1
+    for name in (
+        "durable_goal",
+        "requested_stages",
+        "current_stage",
+        "last_completed_stage",
+        "blocked_reason",
+        "allowed_actions",
+        "stage_attempts",
+        "input_fingerprints",
+        "artifact_references",
+    ):
+        legacy.pop(name)
+    store.path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+
+    migrated = store.load()
+
+    assert migrated.schema_version == 2
+    assert migrated.flow_id == current.flow_id
+    assert migrated.durable_goal == "分析新闻"
+    assert migrated.current_stage == "p2"
+    assert migrated.allowed_actions == ("continue", "stop")
+    assert migrated.artifact_references["p1_initial_report"] == report
 
 
 def test_forecast_gate_requires_72_points_in_every_fold_and_feedback_stops(tmp_path: Path):

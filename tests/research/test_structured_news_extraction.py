@@ -519,6 +519,34 @@ def test_model_evidence_must_be_an_exact_source_substring() -> None:
     assert result.quarantine.reason_code == "invalid_evidence"
 
 
+def test_multi_pass_extraction_reports_each_document_pass() -> None:
+    record = next(
+        item
+        for item in JsonlCollectedNewsAdapter(NEWS).load()
+        if item.source_document_id == "REAL-AEMO-MILLMERRAN-20140326"
+    )
+    document = NewsNormalizer().normalize(record)
+    progress: list[tuple[str, int, int]] = []
+    gateway = ScriptedGateway(_real_source_outputs())
+
+    result = StructuredNewsEventExtractor(
+        gateway,
+        market_timezone="Australia/Brisbane",
+        extraction_passes=3,
+        progress=lambda item, number, total: progress.append(
+            (item.document_version_id, number, total)
+        ),
+    ).extract(document)
+
+    assert result.quarantine is None
+    assert gateway.calls == 3
+    assert progress == [
+        (document.document_version_id, 1, 3),
+        (document.document_version_id, 2, 3),
+        (document.document_version_id, 3, 3),
+    ]
+
+
 def test_stated_time_components_must_use_the_market_offset() -> None:
     record = next(
         item

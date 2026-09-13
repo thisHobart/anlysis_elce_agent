@@ -19,8 +19,16 @@ class ResearchModelOutputTruncatedError(ResearchModelUnavailableError):
     """Raised when a provider stops before a structured response is complete."""
 
 
+class ResearchModelTransientError(ResearchModelUnavailableError):
+    """Raised for a retryable transport or provider failure."""
+
+
 class ResearchPlanValidationError(ResearchAgentError):
     """Raised when model output cannot be compiled into an executable plan."""
+
+
+class ResearchModelSchemaError(ResearchPlanValidationError):
+    """Raised when a complete model response violates its structured contract."""
 
 
 class DuplicateResearchFunctionError(ResearchPlanValidationError):

@@ -20,10 +20,13 @@ from app.llm.gateway import (
     ModelOutputTruncatedError,
     ModelResponseError,
     ModelToolCall,
+    ModelTransientError,
 )
 from app.research.agent.errors import (
     ResearchModelContextLimitError,
     ResearchModelOutputTruncatedError,
+    ResearchModelSchemaError,
+    ResearchModelTransientError,
     ResearchModelUnavailableError,
     ResearchPlanValidationError,
 )
@@ -452,8 +455,10 @@ class ModelEDAPlanner:
             raise ResearchModelOutputTruncatedError(f"大模型规划输出达到长度限制：{exc}") from exc
         except ModelContextLimitError as exc:
             raise ResearchModelContextLimitError(f"大模型规划请求超过上下文限制：{exc}") from exc
+        except ModelTransientError as exc:
+            raise ResearchModelTransientError(f"大模型规划调用暂时失败：{exc}") from exc
         except ModelResponseError as exc:
-            raise ResearchPlanValidationError(f"大模型返回的研究方案无法解析：{exc}") from exc
+            raise ResearchModelSchemaError(f"大模型返回的研究方案无法解析：{exc}") from exc
         except (ModelConfigurationError, ModelGatewayError) as exc:
             raise ResearchModelUnavailableError(f"大模型规划调用失败：{exc}") from exc
 

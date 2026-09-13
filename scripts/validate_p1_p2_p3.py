@@ -198,7 +198,10 @@ def main() -> int:
                 run_id="p1-synthetic",
                 artifact_directory=p1_root,
                 report_path=p1_report,
-                data_fingerprint=hashlib.sha256(target.to_csv(index=False).encode()).hexdigest()[:12],
+                data_fingerprint=(
+                    session.dataset_fingerprint
+                    or hashlib.sha256(target.to_csv(index=False).encode()).hexdigest()[:12]
+                ),
             )
             evidence["timings"]["p1_deterministic"] = round(time.monotonic() - started, 2)  # type: ignore[index]
         else:

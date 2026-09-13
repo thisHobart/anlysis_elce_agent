@@ -8,6 +8,7 @@ import math
 import re
 import time
 from collections import Counter
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -287,6 +288,7 @@ class StructuredNewsEventExtractor:
         minimum_confidence: float = 0.7,
         max_repair_attempts: int = 1,
         extraction_passes: int = 3,
+        progress: Callable[[NewsDocument, int, int], None] | None = None,
     ) -> None:
         try:
             self._market_zone = ZoneInfo(market_timezone)
@@ -303,6 +305,7 @@ class StructuredNewsEventExtractor:
         self.minimum_confidence = minimum_confidence
         self.max_repair_attempts = max_repair_attempts
         self.extraction_passes = extraction_passes
+        self.progress = progress
         # Running cost of this extractor, so a benchmark can report what N passes actually
         # cost instead of leaving it to be guessed from the pass count.
         self.model_calls = 0
@@ -334,6 +337,8 @@ class StructuredNewsEventExtractor:
 
         results: list[EventExtractionResult] = []
         for index in range(1, self.extraction_passes + 1):
+            if self.progress is not None:
+                self.progress(document, index, self.extraction_passes)
             print(f"\n[新闻抽取] 第 {index}/{self.extraction_passes} 趟独立抽取")
             results.append(self._single_pass(document))
         result = self._consensus(document, tuple(results))

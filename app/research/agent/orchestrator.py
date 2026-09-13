@@ -17,11 +17,14 @@ from app.llm.gateway import (
     ModelMessage,
     ModelOutputTruncatedError,
     ModelResponseError,
+    ModelTransientError,
 )
 from app.research.agent.context import compact_episode_context
 from app.research.agent.errors import (
     ResearchModelContextLimitError,
     ResearchModelOutputTruncatedError,
+    ResearchModelSchemaError,
+    ResearchModelTransientError,
     ResearchModelUnavailableError,
     ResearchPlanValidationError,
 )
@@ -493,8 +496,10 @@ class ModelResearchDialogue:
             raise ResearchModelOutputTruncatedError(f"大模型对话输出达到长度限制：{exc}") from exc
         except ModelContextLimitError as exc:
             raise ResearchModelContextLimitError(f"大模型对话请求超过上下文限制：{exc}") from exc
+        except ModelTransientError as exc:
+            raise ResearchModelTransientError(f"大模型对话暂时不可用：{exc}") from exc
         except ModelResponseError as exc:
-            raise ResearchPlanValidationError(f"大模型返回的对话决策无法解析：{exc}") from exc
+            raise ResearchModelSchemaError(f"大模型返回的对话决策无法解析：{exc}") from exc
         except (ModelConfigurationError, ModelGatewayError) as exc:
             raise ResearchModelUnavailableError(f"大模型对话调用失败：{exc}") from exc
 

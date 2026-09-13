@@ -20,6 +20,7 @@ from app.research.full_flow.contracts import (
     ForecastFeedback,
     FullFlowState,
     P2ResearchRequest,
+    synchronize_flow_lifecycle,
 )
 from app.research.news import (
     JsonlCollectedNewsAdapter,
@@ -74,15 +75,21 @@ class FullFlowStore:
     def __init__(self, path: str | Path):
         self.path = Path(path).resolve()
 
-    def save(self, state: FullFlowState) -> None:
+    def save(self, state: FullFlowState) -> FullFlowState:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        updated = state.model_copy(update={"updated_at": datetime.now(UTC)})
+        updated = synchronize_flow_lifecycle(
+            state.model_copy(update={"updated_at": datetime.now(UTC)})
+        )
         temporary = self.path.with_suffix(self.path.suffix + f".{os.getpid()}.tmp")
         temporary.write_text(updated.model_dump_json(indent=2), encoding="utf-8")
         temporary.replace(self.path)
+        return updated
 
     def load(self) -> FullFlowState:
-        return FullFlowState.model_validate_json(self.path.read_text(encoding="utf-8"))
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        if payload.get("schema_version", 1) == 1:
+            payload["schema_version"] = 2
+        return synchronize_flow_lifecycle(FullFlowState.model_validate(payload))
 
 
 def build_p2_request(
@@ -169,6 +176,11 @@ class FullResearchFlow:
         self.store = store
         self.output_directory = Path(output_directory).resolve()
 
+    def _record_stage_attempt(self, state: FullFlowState, stage: str) -> FullFlowState:
+        attempts = dict(state.stage_attempts)
+        attempts[stage] = attempts.get(stage, 0) + 1
+        return self.store.save(state.model_copy(update={"stage_attempts": attempts}))
+
     def start(
         self,
         *,
@@ -183,9 +195,17 @@ class FullResearchFlow:
             runs=(p1_run,),
             request_text=request_text,
             requested_forecast=requested_forecast,
+            durable_goal=request_text,
+            requested_stages=(
+                ("p2", "p1_synthesis", "p3_prepare", "p3_execute", "p1_feedback")
+                if requested_forecast
+                else ("p2", "p1_synthesis")
+            ),
+            input_fingerprints=(
+                {"p1_data": p1_run.data_fingerprint} if p1_run.data_fingerprint else {}
+            ),
         )
-        self.store.save(state)
-        return state
+        return self.store.save(state)
 
     def run_p2(
         self,
@@ -197,6 +217,7 @@ class FullResearchFlow:
     ) -> FullFlowState:
         if state.phase not in {"p1_initial_complete", "p2_needs_review"}:
             raise ValueError(f"当前阶段不能运行P2：{state.phase}")
+        state = self._record_stage_attempt(state, "p2")
         prices = _price_observations(target_path, state.p1_request)
         workspace = NewsWorkspace(self.output_directory / state.flow_id / "p2")
         review_records = workspace.review_records()
@@ -271,6 +292,12 @@ class FullResearchFlow:
             data_fingerprint=_hash_file(feature_path)[:12],
         )
         phase = "p2_needs_review" if study_needs_review(study) else "p2_ready"
+        fingerprints = {
+            **state.input_fingerprints,
+            "p2_news": _hash_file(Path(news_path)),
+            "p2_price": _hash_file(Path(target_path)),
+            "p2_features": _hash_file(feature_path),
+        }
         updated = state.model_copy(
             update={
                 "phase": phase,
@@ -283,14 +310,15 @@ class FullResearchFlow:
                 "error": None,
                 "resume_from_phase": None,
                 "failed_stage": None,
+                "input_fingerprints": fingerprints,
             }
         )
-        self.store.save(updated)
-        return updated
+        return self.store.save(updated)
 
     def synthesize_p1(self, *, state: FullFlowState) -> FullFlowState:
         if state.phase != "p2_ready" or state.p2_feature_path is None:
             raise ValueError("P2必须完成且通过复核门禁后才能进行P1综合分析")
+        state = self._record_stage_attempt(state, "p1_synthesis")
         selection_cutoff = state.p2_knowledge_cutoff or state.p1_request.information_cutoff
         selected, excluded = select_news_forecast_features(
             state.p2_feature_path,
@@ -409,12 +437,12 @@ class FullResearchFlow:
                 "failed_stage": None,
             }
         )
-        self.store.save(updated)
-        return updated
+        return self.store.save(updated)
 
     def prepare_p3(self, *, state: FullFlowState, **kwargs: Any) -> FullFlowState:
         if state.phase != "p1_synthesis_complete" or state.p2_feature_path is None:
             raise ValueError("必须先完成P1综合分析")
+        state = self._record_stage_attempt(state, "p3_prepare")
         plan = prepare_forecast_plan(
             **kwargs,
             news_features_path=state.p2_feature_path,
@@ -434,8 +462,7 @@ class FullResearchFlow:
                 "failed_stage": None,
             }
         )
-        self.store.save(updated)
-        return updated
+        return self.store.save(updated)
 
     def approve_and_run_p3(
         self,
@@ -452,6 +479,7 @@ class FullResearchFlow:
             raise ValueError("P3批准与当前方案身份或内容指纹不一致")
         if state.forecast_runs_used and state.approved_forecast_plan_id != plan_id:
             raise ValueError("本轮P3执行预算已经用完")
+        state = self._record_stage_attempt(state, "p3_execute")
         running = state.model_copy(
             update={
                 "phase": "forecast_running",
@@ -460,7 +488,7 @@ class FullResearchFlow:
                 "forecast_runs_used": 1,
             }
         )
-        self.store.save(running)
+        running = self.store.save(running)
         try:
             result = execute_forecast_workflow(plan, progress=progress)
         except Exception as exc:
@@ -489,8 +517,7 @@ class FullResearchFlow:
                 "failed_stage": None,
             }
         )
-        self.store.save(stopped)
-        return stopped
+        return self.store.save(stopped)
 
     def _finish_forecast(self, state: FullFlowState, result: ForecastRunResult) -> FullFlowState:
         status = result.evaluation_status
@@ -583,6 +610,8 @@ class FullResearchFlow:
                 }
             )
         else:
+            attempts = dict(state.stage_attempts)
+            attempts["p1_feedback"] = attempts.get("p1_feedback", 0) + 1
             feedback_root = self.output_directory / state.flow_id / "p1-feedback"
             feedback_root.mkdir(parents=True, exist_ok=True)
             report = feedback_root / "report.md"
@@ -608,8 +637,8 @@ class FullResearchFlow:
                     "runs": (*state.runs, run, feedback_run),
                     "feedback": feedback,
                     "feedback_runs_used": 1,
+                    "stage_attempts": attempts,
                     "stop_reason": "P3未达标或不可评估；已完成一次P1反馈分析并停止",
                 }
             )
-        self.store.save(updated)
-        return updated
+        return self.store.save(updated)

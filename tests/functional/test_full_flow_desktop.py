@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -11,6 +13,7 @@ from typing import Any
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+from PySide6.QtCore import QThread
 from PySide6.QtWidgets import QApplication
 
 from app.desktop.main_window import MainWindow
@@ -35,6 +38,16 @@ def _touch(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.touch()
     return path
+
+
+def _wait_for(qt_app: QApplication, predicate, *, timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        qt_app.processEvents()
+        if predicate():
+            return
+        time.sleep(0.005)
+    raise AssertionError("timed out waiting for Qt worker")
 
 
 def _plan(tmp_path: Path) -> ForecastPlan:
@@ -86,6 +99,8 @@ def _awaiting_state(tmp_path: Path, plan: ForecastPlan):
             }
         },
         information_cutoff=moment,
+        request_text="分析新闻并准备次日电价预测",
+        requested_forecast=True,
     ).model_copy(
         update={
             "phase": "awaiting_forecast_approval",
@@ -385,6 +400,237 @@ def test_chat_request_reuses_limited_p1_and_reaches_p3_card(
         assert session.current_plan and session.current_plan["plan_id"] == forecast_plan.plan_id
         assert workspace.conversation.current_plan_widget is not None
         assert not any("确认推荐变量" in message.content for message in session.messages)
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_p2_review_gate_lists_items_and_blocks_continue_and_forecast(
+    qt_app: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    plan = _plan(tmp_path)
+    flow, state = _awaiting_state(tmp_path, plan)
+    package = tmp_path / "p2-review"
+    review_queue = package / "review-queue.json"
+    review_queue.parent.mkdir(parents=True, exist_ok=True)
+    review_queue.write_text(
+        json.dumps(
+            {
+                "extractions": [
+                    {
+                        "document_version_id": "newsv_" + "a" * 24,
+                        "review_status": "unreviewed",
+                        "document": {"title": "机组临时停运公告"},
+                        "result": {
+                            "events": [{"relevance": "short_term", "effective_start_at": None}],
+                            "quarantine": None,
+                            "candidate_quarantines": [],
+                        },
+                    }
+                ],
+                "decisions": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    news_run = FlowRunReference(
+        run_kind="news",
+        run_id="p2-review-run",
+        parent_run_id=state.runs[-1].run_id,
+        artifact_directory=package,
+        report_path=_touch(package / "report.md"),
+    )
+    blocked = flow.store.save(
+        state.model_copy(
+            update={
+                "phase": "p2_needs_review",
+                "runs": (*state.runs, news_run),
+                "forecast_plan": None,
+                "forecast_plan_fingerprint": None,
+                "stop_reason": "P2存在未解决复核项",
+            }
+        )
+    )
+    window = MainWindow(session_store=SessionStore(tmp_path / "sessions.json"))
+    workspace = window.workspace
+    calls: list[bool] = []
+    monkeypatch.setattr(workspace, "_resume_full_flow", lambda *, retry_p2=False: calls.append(retry_p2))
+    try:
+        workspace.current_session.dataset_fingerprint = "d" * 12
+        workspace.update_full_flow_state(
+            blocked,
+            state_path=flow.store.path,
+            output_directory=flow.output_directory,
+        )
+
+        workspace.submit_question("继续")
+        workspace.submit_question("预测山东明天实时电价")
+
+        assert calls == []
+        assert flow.store.load().phase == "p2_needs_review"
+        assert any("机组临时停运公告" in message.content for message in workspace.current_session.messages)
+        assert any("短期事件缺少生效开始时间" in message.content for message in workspace.current_session.messages)
+
+        workspace.submit_question("重试")
+        assert calls == [True]
+        assert flow.store.load().flow_id == blocked.flow_id
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_completed_flow_reuses_id_until_user_explicitly_requests_a_new_round(
+    qt_app: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    plan = _plan(tmp_path)
+    flow, state = _awaiting_state(tmp_path, plan)
+    finished = flow.store.save(
+        state.model_copy(
+            update={
+                "phase": "forecast_verified",
+                "forecast_runs_used": 1,
+                "approved_forecast_plan_id": plan.plan_id,
+                "stop_reason": "P3达到目标",
+            }
+        )
+    )
+    window = MainWindow(session_store=SessionStore(tmp_path / "sessions.json"))
+    workspace = window.workspace
+    new_requests: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        workspace,
+        "_submit_news_analysis_request",
+        lambda question, *, prepare_forecast: new_requests.append((question, prepare_forecast)),
+    )
+    try:
+        workspace.current_session.dataset_fingerprint = "d" * 12
+        workspace.update_full_flow_state(
+            finished,
+            state_path=flow.store.path,
+            output_directory=flow.output_directory,
+        )
+
+        workspace.submit_question("根据已经分析的数据，开始新闻分析最后电价预测")
+        assert new_requests == []
+        assert flow.store.load().flow_id == finished.flow_id
+        assert "不会重复执行" in workspace.current_session.messages[-1].content
+
+        workspace.submit_question("重新开始新闻分析最后电价预测")
+        assert new_requests == [("重新开始新闻分析最后电价预测", True)]
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_stop_and_reopen_keep_the_same_terminal_flow_without_resuming_work(
+    qt_app: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    plan = _plan(tmp_path)
+    flow, state = _awaiting_state(tmp_path, plan)
+    resumable = flow.store.save(
+        state.model_copy(
+            update={
+                "phase": "p2_ready",
+                "forecast_plan": None,
+                "forecast_plan_fingerprint": None,
+            }
+        )
+    )
+    session_store = SessionStore(tmp_path / "sessions.json")
+    window = MainWindow(session_store=session_store)
+    workspace = window.workspace
+    workspace.current_session.dataset_fingerprint = "d" * 12
+    workspace.update_full_flow_state(
+        resumable,
+        state_path=flow.store.path,
+        output_directory=flow.output_directory,
+    )
+    session_id = workspace.current_session.session_id
+
+    workspace.submit_question("停止")
+    stopped = flow.store.load()
+    assert stopped.phase == "stopped"
+    assert stopped.flow_id == resumable.flow_id
+    window.close()
+    qt_app.processEvents()
+
+    reopened = MainWindow(session_store=SessionStore(tmp_path / "sessions.json"))
+    resumed: list[bool] = []
+    monkeypatch.setattr(
+        reopened.workspace,
+        "_resume_full_flow",
+        lambda *, retry_p2=False: resumed.append(retry_p2),
+    )
+    try:
+        reopened.workspace.select_session(session_id)
+        assert reopened.workspace.current_session.status == "stopped"
+
+        reopened.workspace.submit_question("继续")
+
+        assert resumed == []
+        assert flow.store.load().flow_id == resumable.flow_id
+        assert flow.store.load().phase == "stopped"
+        assert "不会重复执行" in reopened.workspace.current_session.messages[-1].content
+    finally:
+        reopened.close()
+        qt_app.processEvents()
+
+
+def test_real_qthread_delivers_success_failure_and_projection_errors_on_gui_thread(
+    qt_app: QApplication,
+    tmp_path: Path,
+):
+    window = MainWindow(session_store=SessionStore(tmp_path / "sessions.json"))
+    workspace = window.workspace
+    gui_thread = workspace.thread()
+    delivered: list[tuple[str, QThread]] = []
+    try:
+        workspace._start_worker(
+            kind="thread-success-probe",
+            operation=lambda _progress: "done",
+            success_handler=lambda value: delivered.append((value, QThread.currentThread())),
+        )
+        _wait_for(qt_app, lambda: not workspace.is_busy)
+        assert delivered == [("done", gui_thread)]
+
+        def fail(_progress):
+            raise RuntimeError("worker failure probe")
+
+        def receive_failure(detail: str) -> None:
+            delivered.append(("failed", QThread.currentThread()))
+            workspace._task_failed(detail)
+
+        workspace._start_worker(
+            kind="thread-failure-probe",
+            operation=fail,
+            success_handler=lambda _value: None,
+            failure_handler=receive_failure,
+        )
+        _wait_for(qt_app, lambda: not workspace.is_busy)
+        assert delivered[-1] == ("failed", gui_thread)
+        assert "worker failure probe" in workspace.current_session.messages[-1].content
+
+        def broken_projection(_value: object) -> None:
+            delivered.append(("projection", QThread.currentThread()))
+            raise RuntimeError("projection failure probe")
+
+        workspace._start_worker(
+            kind="thread-projection-probe",
+            operation=lambda _progress: object(),
+            success_handler=broken_projection,
+        )
+        _wait_for(qt_app, lambda: not workspace.is_busy)
+        assert delivered[-1] == ("projection", gui_thread)
+        assert workspace.current_session.status == "failed"
+        assert "界面接收结果失败" in workspace.current_session.messages[-1].content
+        assert "projection failure probe" in workspace.current_session.messages[-1].content
     finally:
         window.close()
         qt_app.processEvents()

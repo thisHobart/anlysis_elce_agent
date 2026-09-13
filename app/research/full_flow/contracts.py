@@ -29,6 +29,22 @@ ResumableFlowPhase = Literal[
     "awaiting_forecast_approval",
     "forecast_running",
 ]
+FlowStage = Literal[
+    "p1_initial",
+    "p2",
+    "p1_synthesis",
+    "p3_prepare",
+    "p3_execute",
+    "p1_feedback",
+]
+FlowAction = Literal[
+    "continue",
+    "retry",
+    "stop",
+    "review_p2",
+    "approve_forecast",
+    "new_goal",
+]
 
 
 class FlowRunReference(BaseModel):
@@ -102,13 +118,22 @@ class ForecastFeedback(BaseModel):
 class FullFlowState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     flow_id: str = Field(default_factory=lambda: uuid4().hex[:12])
     phase: FlowPhase = "p1_initial_complete"
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     request_text: str = ""
     requested_forecast: bool = False
+    durable_goal: str = ""
+    requested_stages: tuple[FlowStage, ...] = ()
+    current_stage: FlowStage | None = "p2"
+    last_completed_stage: FlowStage = "p1_initial"
+    blocked_reason: str | None = None
+    allowed_actions: tuple[FlowAction, ...] = ("continue", "stop")
+    stage_attempts: dict[FlowStage, int] = Field(default_factory=dict)
+    input_fingerprints: dict[str, str] = Field(default_factory=dict)
+    artifact_references: dict[str, Path] = Field(default_factory=dict)
     approved_analysis_scope: tuple[
         Literal["p1_initial", "p2", "p1_synthesis", "p1_feedback"], ...
     ] = ("p1_initial", "p2", "p1_synthesis", "p1_feedback")
@@ -133,3 +158,94 @@ class FullFlowState(BaseModel):
     error: str | None = None
     resume_from_phase: ResumableFlowPhase | None = None
     failed_stage: Literal["p2", "p1_synthesis", "p3_prepare", "p3_execute"] | None = None
+
+
+def synchronize_flow_lifecycle(state: FullFlowState) -> FullFlowState:
+    """Derive the durable cursor fields from the authoritative phase and artifacts."""
+
+    requested_stages = state.requested_stages or (
+        ("p2", "p1_synthesis", "p3_prepare", "p3_execute", "p1_feedback")
+        if state.requested_forecast
+        else ("p2", "p1_synthesis")
+    )
+    stage_by_phase: dict[FlowPhase, FlowStage | None] = {
+        "p1_initial_complete": "p2",
+        "p2_needs_review": "p2",
+        "p2_ready": "p1_synthesis",
+        "p1_synthesis_complete": "p3_prepare" if state.requested_forecast else None,
+        "awaiting_forecast_approval": "p3_execute",
+        "forecast_running": "p3_execute",
+        "forecast_verified": None,
+        "feedback_complete": None,
+        "failed": state.failed_stage,
+        "stopped": None,
+    }
+    last_by_phase: dict[FlowPhase, FlowStage] = {
+        "p1_initial_complete": "p1_initial",
+        "p2_needs_review": "p1_initial",
+        "p2_ready": "p2",
+        "p1_synthesis_complete": "p1_synthesis",
+        "awaiting_forecast_approval": "p3_prepare",
+        "forecast_running": "p3_prepare",
+        "forecast_verified": "p3_execute",
+        "feedback_complete": "p1_feedback",
+        "failed": state.last_completed_stage,
+        "stopped": state.last_completed_stage,
+    }
+    actions_by_phase: dict[FlowPhase, tuple[FlowAction, ...]] = {
+        "p1_initial_complete": ("continue", "stop"),
+        "p2_needs_review": ("review_p2", "retry", "stop"),
+        "p2_ready": ("continue", "stop"),
+        "p1_synthesis_complete": (("continue", "stop") if state.requested_forecast else ("new_goal",)),
+        "awaiting_forecast_approval": ("approve_forecast", "stop"),
+        "forecast_running": ("approve_forecast", "stop"),
+        "forecast_verified": ("new_goal",),
+        "feedback_complete": ("new_goal",),
+        "failed": ("retry", "stop"),
+        "stopped": ("new_goal",),
+    }
+    blocked_reason = None
+    if state.phase == "p2_needs_review":
+        blocked_reason = state.stop_reason or "P2存在未解决复核项"
+    elif state.phase == "awaiting_forecast_approval":
+        blocked_reason = "等待用户单独确认P3预测方案"
+    elif state.phase == "failed":
+        blocked_reason = state.stop_reason or state.error or "当前阶段失败"
+    elif state.phase == "stopped":
+        blocked_reason = state.stop_reason or "用户停止当前全流程"
+
+    references = dict(state.artifact_references)
+    for run in state.runs:
+        if run.run_kind == "news":
+            stage = "p2"
+        elif run.run_kind == "forecast":
+            stage = "p3"
+        elif run.run_kind == "feedback":
+            stage = "p1_feedback"
+        elif run.parent_run_id is None:
+            stage = "p1_initial"
+        else:
+            stage = "p1_synthesis"
+        references[f"{stage}_artifact_directory"] = run.artifact_directory
+        references[f"{stage}_report"] = run.report_path
+    for name, path in (
+        ("p2_news", state.p2_news_path),
+        ("p2_features", state.p2_feature_path),
+        ("p2_manifest", state.p2_manifest_path),
+    ):
+        if path is not None:
+            references[name] = path
+
+    return FullFlowState.model_validate(
+        {
+            **state.model_dump(),
+            "schema_version": 2,
+            "durable_goal": state.durable_goal or state.request_text,
+            "requested_stages": requested_stages,
+            "current_stage": stage_by_phase[state.phase],
+            "last_completed_stage": last_by_phase[state.phase],
+            "blocked_reason": blocked_reason,
+            "allowed_actions": actions_by_phase[state.phase],
+            "artifact_references": references,
+        }
+    )
