@@ -43,6 +43,7 @@ MessageKind = Literal[
     "forecast_plan",
     "result",
     "forecast_result",
+    "p2_review",
     "error",
 ]
 TraceCategory = Literal["session", "user", "agent", "input", "plan", "tool", "evaluation", "artifact", "error"]
@@ -149,7 +150,7 @@ class SessionRunRecord(BaseModel):
     memory_status: Literal["active", "stale"] = "active"
 
 
-SESSION_SCHEMA_VERSION = 19
+SESSION_SCHEMA_VERSION = 20
 """Projection schema written by this build; bump it whenever stored sessions change shape."""
 
 
@@ -202,6 +203,8 @@ class ResearchSession(BaseModel):
     news_run_id: str | None = None
     news_p1_run_id: str | None = None
     pending_forecast_question: str | None = None
+    read_only: bool = False
+    read_only_reason: str | None = None
 
     @field_validator("inputs", mode="before")
     @classmethod
@@ -306,6 +309,22 @@ def _migrate_18_to_19(session: ResearchSession) -> None:
     """Persist an optional forecast request waiting for P1 analysis to finish."""
 
 
+def _migrate_19_to_20(session: ResearchSession) -> None:
+    """Keep pre-review-closure conversations as immutable historical evidence."""
+
+    session.read_only = True
+    session.read_only_reason = "升级前会话仅供查看；聊天和报告已保留，执行、复核与旧计划入口已禁用。"
+    session.status = "completed" if session.runs else "stopped"
+    session.messages.append(
+        SessionMessage(
+            role="system",
+            kind="notice",
+            content=session.read_only_reason,
+            payload={"historical_read_only": True},
+        )
+    )
+
+
 SESSION_MIGRATIONS: dict[int, Callable[[ResearchSession], None]] = {
     **{version: _carry_forward for version in range(1, 7)},
     7: _migrate_7_to_8,
@@ -320,6 +339,7 @@ SESSION_MIGRATIONS: dict[int, Callable[[ResearchSession], None]] = {
     16: _migrate_16_to_17,
     17: _migrate_17_to_18,
     18: _migrate_18_to_19,
+    19: _migrate_19_to_20,
 }
 
 

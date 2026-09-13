@@ -63,6 +63,17 @@ class NewsWorkspace:
                     id INTEGER PRIMARY KEY AUTOINCREMENT, cache_key TEXT NOT NULL,
                     payload TEXT NOT NULL, created_at TEXT NOT NULL);
             """)
+            review_columns = {
+                str(row[1]) for row in db.execute("PRAGMA table_info(reviews)").fetchall()
+            }
+            if "usage" not in review_columns:
+                db.execute("ALTER TABLE reviews ADD COLUMN usage TEXT NOT NULL DEFAULT 'analysis'")
+            if "request_id" not in review_columns:
+                db.execute("ALTER TABLE reviews ADD COLUMN request_id TEXT")
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS reviews_request_id "
+                "ON reviews(request_id) WHERE request_id IS NOT NULL"
+            )
 
     def connect(self):
         return sqlite3.connect(self.database, timeout=30)
@@ -118,12 +129,34 @@ class NewsWorkspace:
         reason: str,
         corrected: dict | None = None,
         market_timezone: str,
+        usage: str = "analysis",
+        expected_revision: str | None = None,
+        request_id: str | None = None,
     ) -> int:
         if decision not in {"accepted", "corrected", "rejected"} or not reviewer.strip() or not reason.strip():
             raise ValueError("复核必须包含有效处置、复核人和说明")
+        if usage not in {"analysis", "background_only"}:
+            raise ValueError("复核用途必须是 analysis 或 background_only")
+        if decision == "rejected" and usage != "analysis":
+            raise ValueError("拒绝的抽取结果不能标记为背景材料")
         if (decision == "corrected") != (corrected is not None):
             raise ValueError("只有 corrected 处置需要且必须提供候选文件")
         with self.connect() as db:
+            if request_id:
+                duplicate = db.execute(
+                    "SELECT id, cache_key, decision, usage, reviewer, reason FROM reviews WHERE request_id=?",
+                    (request_id,),
+                ).fetchone()
+                if duplicate is not None:
+                    if duplicate[1:] != (
+                        key,
+                        decision,
+                        usage,
+                        reviewer.strip(),
+                        reason.strip(),
+                    ):
+                        raise ValueError("复核请求ID已用于另一项操作，不能复用")
+                    return int(duplicate[0])
             row = db.execute(
                 "SELECT d.payload, e.payload FROM extractions e JOIN documents d "
                 "ON d.id=e.document_id WHERE e.cache_key=?",
@@ -133,6 +166,9 @@ class NewsWorkspace:
             raise ValueError("找不到待复核抽取记录")
         document = NewsDocument.model_validate_json(row[0])
         original = EventExtractionResult.model_validate_json(row[1])
+        current_revision = self.review_revision(key)
+        if expected_revision is not None and expected_revision != current_revision:
+            raise ValueError("复核条目已更新；请刷新窗口后再提交")
         result = original
         if corrected is not None:
             parsed = ModelNewsExtraction.model_validate(corrected)
@@ -157,8 +193,27 @@ class NewsWorkspace:
             or result.quarantine
             or result.candidate_quarantines
             or any(event.event_type == "unknown" for event in result.events)
+            or any(not event.evidence for event in result.events)
         ):
-            raise ValueError("仍有未通过证据门禁的候选；请修正候选或拒绝，不能直接接受隔离结果")
+            raise ValueError("仍有未通过证据门禁的候选；请修正候选或拒绝，不能直接接受")
+        if decision != "rejected" and usage == "analysis" and any(
+            event.analysis_eligibility != "eligible" for event in result.events
+        ):
+            raise ValueError("事件时间或覆盖范围仍不满足精确分析条件；请修正、拒绝或仅作背景")
+        if usage == "background_only":
+            if not result.events or any(
+                event.analysis_eligibility not in {"eligible", "needs_time_review"}
+                for event in result.events
+            ) or not any(event.analysis_eligibility == "needs_time_review" for event in result.events):
+                raise ValueError("只有事实证据有效且至多存在时间不确定性的事件才能仅作背景")
+            result = result.model_copy(
+                update={
+                    "events": tuple(
+                        event.model_copy(update={"analysis_eligibility": "background_only"})
+                        for event in result.events
+                    )
+                }
+            )
         result = result.model_copy(
             update={
                 "review_status": decision,
@@ -167,8 +222,8 @@ class NewsWorkspace:
         )
         with self.connect() as db:
             cursor = db.execute(
-                "INSERT INTO reviews(cache_key, decision, reviewer, reason, reviewed_at, payload) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO reviews(cache_key, decision, reviewer, reason, reviewed_at, payload, usage, request_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     key,
                     decision,
@@ -176,19 +231,76 @@ class NewsWorkspace:
                     reason.strip(),
                     datetime.now(UTC).isoformat(),
                     result.model_dump_json(),
+                    usage,
+                    request_id,
                 ),
             )
             return cursor.lastrowid
 
+    def review_revision(self, key: str) -> str:
+        """Return a stable optimistic-lock revision for one extraction and its latest review."""
+
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT e.payload, r.id, r.decision, r.usage, r.payload "
+                "FROM extractions e LEFT JOIN reviews r ON r.id=("
+                "SELECT id FROM reviews WHERE cache_key=e.cache_key ORDER BY id DESC LIMIT 1"
+                ") WHERE e.cache_key=?",
+                (key,),
+            ).fetchone()
+        if row is None:
+            raise ValueError("找不到待复核抽取记录")
+        return digest(
+            {
+                "extraction": json.loads(row[0]),
+                "review_id": row[1],
+                "decision": row[2],
+                "usage": row[3],
+                "reviewed_result": json.loads(row[4]) if row[4] else None,
+            }
+        )
+
+    def review_queue(self) -> tuple[dict, ...]:
+        """Read review items from SQLite; exported JSON snapshots are never accepted as input."""
+
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT e.cache_key, e.document_id, e.payload, d.payload, "
+                "r.id, r.decision, r.reviewer, r.reason, r.reviewed_at, r.payload, r.usage "
+                "FROM extractions e JOIN documents d ON d.id=e.document_id "
+                "LEFT JOIN reviews r ON r.id=("
+                "SELECT id FROM reviews WHERE cache_key=e.cache_key ORDER BY id DESC LIMIT 1"
+                ") ORDER BY e.created_at, e.cache_key"
+            ).fetchall()
+        queue = []
+        for row in rows:
+            queue.append(
+                {
+                    "cache_key": row[0],
+                    "document_version_id": row[1],
+                    "original_result": json.loads(row[2]),
+                    "document": json.loads(row[3]),
+                    "review_id": row[4],
+                    "decision": row[5],
+                    "reviewer": row[6],
+                    "reason": row[7],
+                    "reviewed_at": row[8],
+                    "reviewed_result": json.loads(row[9]) if row[9] else None,
+                    "usage": row[10],
+                    "revision": self.review_revision(str(row[0])),
+                }
+            )
+        return tuple(queue)
+
     def review_records(self) -> tuple[CollectedNewsRecord, ...]:
         with self.connect() as db:
             rows = db.execute(
-                "SELECT r.id, r.reviewed_at, r.reviewer, r.reason, d.payload FROM reviews r "
+                "SELECT r.id, r.reviewed_at, r.reviewer, r.reason, d.payload, r.usage FROM reviews r "
                 "JOIN extractions e ON e.cache_key=r.cache_key JOIN documents d ON d.id=e.document_id "
                 "ORDER BY r.id"
             ).fetchall()
         records = []
-        for review_id, stamp, reviewer, reason, payload in rows:
+        for review_id, stamp, reviewer, reason, payload, usage in rows:
             document = NewsDocument.model_validate_json(payload)
             record = _collected(document)
             # A review creates a distinct, explicitly labelled local revision. It only
@@ -205,6 +317,7 @@ class NewsWorkspace:
                             "reviewer": reviewer,
                             "review_reason": reason,
                             "reviewed_at": stamp,
+                            "review_use": usage,
                         },
                     }
                 )
@@ -332,9 +445,15 @@ def export_study(study, workspace: NewsWorkspace) -> Path:
     }
     with workspace.connect() as db:
         reviews = [
-            dict(zip(("id", "cache_key", "decision", "reviewer", "reason", "reviewed_at"), row))
+            dict(
+                zip(
+                    ("id", "cache_key", "decision", "reviewer", "reason", "reviewed_at", "usage", "request_id"),
+                    row,
+                )
+            )
             for row in db.execute(
-                "SELECT id, cache_key, decision, reviewer, reason, reviewed_at FROM reviews ORDER BY id"
+                "SELECT id, cache_key, decision, reviewer, reason, reviewed_at, usage, request_id "
+                "FROM reviews ORDER BY id"
             )
         ]
         queue = [

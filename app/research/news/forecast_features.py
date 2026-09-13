@@ -58,6 +58,8 @@ def build_forecast_news_features(
             state, state_available_at = known
             if state.relevance != "short_term":
                 continue
+            if state.analysis_eligibility != "eligible":
+                continue
             if state.entity_resolution is not None and not state.entity_resolution.matches_market(clock.market):
                 continue
             if state.status == "cancelled" or state.review_status == "rejected":

@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QApplication
 from app.desktop.main import _desktop_smoke_payload, _smoke_result_argument
 from app.desktop.main_window import MainWindow
 from app.desktop.session import SessionStore
-from scripts.build_desktop_exe import sanitized_build_path
+from scripts.build_desktop_exe import restore_runtime_env, runtime_env_for_rebuild, sanitized_build_path
 from scripts.validate_desktop_phase1 import _shutdown_window
 
 
@@ -45,7 +45,39 @@ def test_desktop_smoke_payload_loads_both_skills_and_all_functions(
     assert Path(payload["session_store_path"]) == (tmp_path / "sessions.json").resolve()
     assert Path(payload["research_output_directory"]).is_absolute()
     assert Path(payload["p2_news_path"]).is_file()
+    assert Path(payload["model_profiles_path"]).is_file()
+    assert payload["model_profile_count"] == 3
 
+
+def test_clean_exe_rebuild_preserves_deployed_runtime_env(tmp_path: Path) -> None:
+    root = tmp_path / "worktree"
+    output = root / "dist" / "PriceResearchAgent"
+    root.mkdir()
+    (root / ".env").write_text("SOURCE=one\n", encoding="utf-8")
+    output.mkdir(parents=True)
+    (output / ".env").write_text("DEPLOYED=two\n", encoding="utf-8")
+    deployed_bytes = (output / ".env").read_bytes()
+
+    preserved = runtime_env_for_rebuild(root=root, output=output)
+    assert preserved == deployed_bytes
+    (output / ".env").unlink()
+    restored = restore_runtime_env(output=output, content=preserved)
+
+    assert restored == output / ".env"
+    assert restored.read_bytes() == deployed_bytes
+
+
+def test_first_exe_build_seeds_external_runtime_env_from_worktree(tmp_path: Path) -> None:
+    root = tmp_path / "worktree"
+    output = root / "dist" / "PriceResearchAgent"
+    root.mkdir()
+    (root / ".env").write_text("FIRST=build\n", encoding="utf-8")
+
+    preserved = runtime_env_for_rebuild(root=root, output=output)
+    restored = restore_runtime_env(output=output, content=preserved)
+
+    assert restored is not None
+    assert restored.read_text(encoding="utf-8") == "FIRST=build\n"
 
 def test_validation_shutdown_cancels_busy_worker_before_closing() -> None:
     events: list[str] = []

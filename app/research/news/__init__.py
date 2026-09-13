@@ -7,6 +7,7 @@ from app.research.news.adapters import (
     ExternalNewsApiPlaceholder,
     JsonlCollectedNewsAdapter,
 )
+from app.research.news.adaptive import AdaptiveNewsEventExtractor
 from app.research.news.agent_validation import (
     DEFAULT_FOCUS_WINDOW,
     P2_AGENT_EVALUATOR_VERSION,
@@ -137,6 +138,7 @@ __all__ = [
     "P2_AGENT_GOAL_PROMPT_VERSION",
     "P2_AGENT_GOAL_USER_PROMPT",
     "REAL_NEWS_BENCHMARK_VERSION",
+    "AdaptiveNewsEventExtractor",
     "AgentGoalDisposition",
     "AgentGoalFinding",
     "AgentValidationCheck",

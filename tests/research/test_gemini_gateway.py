@@ -6,6 +6,7 @@ import pytest
 from pydantic import BaseModel
 
 from app.config import Settings
+from app.llm.budget import ModelRequestPurpose
 from app.llm.factory import build_model_gateway
 from app.llm.gateway import ModelConfigurationError, ModelMessage, ModelOutputTruncatedError
 from app.llm.gemini import GeminiModelGateway
@@ -55,6 +56,34 @@ class RecordingGeminiModel:
         return Bound()
 
 
+class GeminiResponseModel:
+    def __init__(self, *, finish_reason: str = "STOP") -> None:
+        self.response = SimpleNamespace(
+            content="partial answer",
+            additional_kwargs={},
+            tool_calls=[{"name": "analyze", "args": {}, "id": "call-1"}],
+            response_metadata={"finish_reason": finish_reason},
+        )
+
+    def invoke(self, messages):
+        del messages
+        return self.response
+
+    def bind_tools(self, tools, **options):
+        del tools, options
+        return self
+
+
+class BindableGeminiResponseModel(GeminiResponseModel):
+    def __init__(self) -> None:
+        super().__init__(finish_reason="STOP")
+        self.bound_options: list[dict[str, int]] = []
+
+    def bind(self, **options):
+        self.bound_options.append(options)
+        return self
+
+
 def test_factory_selects_native_gemini_only_for_gemini_provider():
     assert isinstance(build_model_gateway(_settings()), GeminiModelGateway)
     assert isinstance(
@@ -71,6 +100,12 @@ def test_gemini_client_does_not_reuse_openai_proxy_url():
     assert "base_url" not in options
     assert options["vertexai"] is False
     assert options["api_key"] == "test-key"
+
+
+def test_gemini_25_flash_disables_shared_budget_thinking() -> None:
+    gateway = GeminiModelGateway(_settings(llm_model="gemini-2.5-flash"))
+
+    assert gateway._model_options()["thinking_budget"] == 0
 
 
 def test_gemini_structured_output_always_uses_native_json_schema_and_exposes_raw():
@@ -115,6 +150,38 @@ def test_gemini_rejects_parseable_output_when_finish_reason_is_max_tokens():
             messages=[ModelMessage(role="user", content="test")],
             schema=StructuredAnswer,
         )
+
+
+def test_gemini_rejects_truncated_text_and_tool_calls_before_use():
+    gateway = GeminiModelGateway(_settings())
+    gateway._model = GeminiResponseModel(finish_reason="MAX_TOKENS")
+    messages = [ModelMessage(role="user", content="test")]
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "analyze", "parameters": {"type": "object"}},
+        }
+    ]
+
+    with pytest.raises(ModelOutputTruncatedError, match="响应不完整"):
+        gateway.invoke_text(messages=messages)
+    with pytest.raises(ModelOutputTruncatedError, match="响应不完整"):
+        gateway.invoke_tool_calls(messages=messages, tools=tools)
+
+
+def test_gemini_output_limit_is_bound_per_request_purpose() -> None:
+    gateway = GeminiModelGateway(_settings())
+    model = BindableGeminiResponseModel()
+    gateway._model = model
+
+    result = gateway.invoke_text(
+        messages=[ModelMessage(role="user", content="test")],
+        purpose=ModelRequestPurpose.DIALOGUE,
+    )
+
+    assert result == "partial answer"
+    assert model.bound_options == [{"max_output_tokens": 1024}]
+    assert "max_output_tokens" not in gateway._model_options()
 
 
 def test_gemini_rejects_cherry_model_prefix_with_actionable_error():

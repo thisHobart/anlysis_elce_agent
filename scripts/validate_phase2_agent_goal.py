@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -54,19 +53,14 @@ def validation_settings(minimum_timeout_seconds: float) -> Settings:
     minimum = max(1.0, float(minimum_timeout_seconds))
     if configured.llm_timeout_seconds >= minimum:
         return configured
-    os.environ["VPP_LLM_TIMEOUT_SECONDS"] = str(minimum)
-    get_settings.cache_clear()
-    return get_settings()
+    return configured.model_copy(update={"llm_timeout_seconds": minimum})
 
 
 def load_gold_effects(path: Path) -> dict[str, float]:
     """Read the answer key only for the evaluator, after Agent input is built."""
 
     manifest = yaml.safe_load(path.read_text(encoding="utf-8"))
-    return {
-        str(item["fixture_id"]): float(item["delta"])
-        for item in manifest.get("effects", [])
-    }
+    return {str(item["fixture_id"]): float(item["delta"]) for item in manifest.get("effects", [])}
 
 
 def _write_artifact(directory: Path, payload: dict[str, Any]) -> Path:
@@ -118,9 +112,7 @@ def main() -> int:
                 **validation.model_dump(mode="json"),
                 "passed": validation.passed,
                 "overall_assessment": validation.overall_assessment,
-                "failed_check_codes": [
-                    check.code for check in validation.failed_checks
-                ],
+                "failed_check_codes": [check.code for check in validation.failed_checks],
             },
         }
     except Exception as exc:  # noqa: BLE001 - qualification failures must leave evidence

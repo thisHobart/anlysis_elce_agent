@@ -11,20 +11,14 @@ from app.research.agent.schemas import ConversationMessage
 
 
 def test_recent_history_is_bounded_by_count_and_character_budget() -> None:
-    history = [
-        ConversationMessage(message_id=f"m-{index}", role="user", content=str(index) * 10)
-        for index in range(6)
-    ]
+    history = [ConversationMessage(message_id=f"m-{index}", role="user", content=str(index) * 10) for index in range(6)]
 
     assert [item.message_id for item in bounded_recent_history(history, max_messages=3)] == [
         "m-3",
         "m-4",
         "m-5",
     ]
-    assert [
-        item.message_id
-        for item in bounded_recent_history(history, max_messages=6, max_characters=15)
-    ] == ["m-5"]
+    assert [item.message_id for item in bounded_recent_history(history, max_messages=6, max_characters=15)] == ["m-5"]
 
 
 def test_episode_context_keeps_recent_evidence_without_unbounded_payloads() -> None:
@@ -43,6 +37,31 @@ def test_episode_context_keeps_recent_evidence_without_unbounded_payloads() -> N
     compact = compact_episode_context(summaries, limit=3)
     assert [item["episode_id"] for item in compact] == ["episode-8", "episode-9", "episode-10"]
     assert all("heavy_internal_field" not in item for item in compact)
+
+
+def test_episode_context_bounds_each_semantic_text_field() -> None:
+    compact = compact_episode_context(
+        [
+            {
+                "episode_id": "episode-long",
+                "episode_number": 1,
+                "goal": "目" * 1000,
+                "status": "accepted",
+                "summary": "摘" * 2000,
+                "findings": ["发" * 1000] * 12,
+                "warnings": ["警" * 1000] * 12,
+                "figure_keys": ["figure-" + "x" * 200] * 40,
+            }
+        ]
+    )[0]
+
+    assert len(compact["goal"]) == 512
+    assert len(compact["summary"]) == 1200
+    assert len(compact["findings"]) == 8
+    assert all(len(item) == 512 for item in compact["findings"])
+    assert len(compact["warnings"]) == 8
+    assert len(compact["figure_keys"]) == 32
+    assert all(len(item) == 128 for item in compact["figure_keys"])
 
 
 def test_single_oversized_message_is_hard_truncated_without_mutating_source() -> None:

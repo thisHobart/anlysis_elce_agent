@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -45,6 +45,71 @@ FlowAction = Literal[
     "approve_forecast",
     "new_goal",
 ]
+P2ReviewDisposition = Literal["accepted", "corrected", "rejected"]
+P2ReviewUse = Literal["analysis", "background_only"]
+
+
+class P2ReviewItem(BaseModel):
+    """One authoritative extraction and the review action currently applicable to it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cache_key: str
+    document_version_id: str
+    revision: str
+    title: str
+    source_name: str
+    source_ref: str
+    body: str
+    result: dict[str, Any]
+    blocking_reasons: tuple[str, ...] = ()
+    review_status: Literal["unreviewed", "accepted", "corrected", "rejected"] = "unreviewed"
+    review_use: P2ReviewUse | None = None
+    reviewer: str | None = None
+    review_reason: str | None = None
+    required: bool = False
+    allowed_dispositions: tuple[P2ReviewDisposition, ...] = (
+        "accepted",
+        "corrected",
+        "rejected",
+    )
+    allows_background_only: bool = False
+
+
+class P2ReviewDecision(BaseModel):
+    """Version-bound and idempotent P2 review command accepted by the application service."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    flow_id: str
+    cache_key: str
+    expected_revision: str
+    decision: P2ReviewDisposition
+    use: P2ReviewUse = "analysis"
+    reviewer: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=2048)
+    request_id: str = Field(min_length=8, max_length=128)
+    corrected: dict[str, Any] | None = None
+
+
+class P2ReviewSummary(BaseModel):
+    """Review-gate projection; SQLite remains the underlying source of truth."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    flow_id: str
+    phase: FlowPhase
+    revision: str
+    items: tuple[P2ReviewItem, ...] = ()
+    required_pending: int = Field(ge=0)
+    required_resolved: int = Field(ge=0)
+    optional_unreviewed: int = Field(ge=0)
+    quality_failures: tuple[str, ...] = ()
+    report_path: Path | None = None
+
+    @property
+    def can_revalidate(self) -> bool:
+        return self.required_pending == 0
 
 
 class FlowRunReference(BaseModel):

@@ -14,9 +14,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PySide6.QtCore import QThread
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from app.desktop.main_window import MainWindow
+from app.desktop.p2_review import P2ReviewDialog
 from app.desktop.session import SessionRunRecord, SessionStore
 from app.research.forecasting.contracts import ForecastPlan, ForecastSnapshotSpec
 from app.research.full_flow import (
@@ -25,6 +26,17 @@ from app.research.full_flow import (
     FullFlowStore,
     FullResearchFlow,
 )
+from app.research.news import JsonlCollectedNewsAdapter, NewsNormalizer, ObviousNewsEventExtractor
+from app.research.news.contracts import (
+    CollectedNewsRecord,
+    EventExtractionResult,
+    EventRecord,
+    ExtractionQuarantine,
+    TimeResolution,
+)
+from app.research.news.workspace import NewsWorkspace
+
+NEWS_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "news_price"
 
 pytestmark = pytest.mark.functional
 
@@ -358,9 +370,7 @@ def test_chat_request_reuses_limited_p1_and_reaches_p3_card(
             report_path=_touch(package / "report.md"),
             data_fingerprint="b" * 12,
         )
-        updated = state.model_copy(
-            update={"phase": "p1_synthesis_complete", "runs": (*state.runs, synthesis_run)}
-        )
+        updated = state.model_copy(update={"phase": "p1_synthesis_complete", "runs": (*state.runs, synthesis_run)})
         self.store.save(updated)
         return updated
 
@@ -385,7 +395,7 @@ def test_chat_request_reuses_limited_p1_and_reaches_p3_card(
             workspace._resume_full_flow()
 
     monkeypatch.setattr("app.desktop.workspace.build_model_gateway", lambda _settings: object())
-    monkeypatch.setattr("app.desktop.workspace.StructuredNewsEventExtractor", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr("app.desktop.workspace.AdaptiveNewsEventExtractor", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(FullResearchFlow, "run_p2", run_p2)
     monkeypatch.setattr(FullResearchFlow, "synthesize_p1", synthesize)
     monkeypatch.setattr(FullResearchFlow, "prepare_p3", prepare)
@@ -412,26 +422,23 @@ def test_p2_review_gate_lists_items_and_blocks_continue_and_forecast(
 ):
     plan = _plan(tmp_path)
     flow, state = _awaiting_state(tmp_path, plan)
-    package = tmp_path / "p2-review"
-    review_queue = package / "review-queue.json"
-    review_queue.parent.mkdir(parents=True, exist_ok=True)
-    review_queue.write_text(
+    review_workspace = NewsWorkspace(flow.output_directory / state.flow_id / "p2")
+    record = JsonlCollectedNewsAdapter(NEWS_FIXTURES / "synthetic_news.jsonl").load()[0]
+    document = NewsNormalizer().normalize(record)
+    result = ObviousNewsEventExtractor(market_timezone="UTC").extract(document)
+    imprecise = result.events[0].model_copy(
+        update={
+            "effective_start_at": None,
+            "effective_end_at": None,
+            "analysis_eligibility": "needs_time_review",
+        }
+    )
+    review_workspace.cache_result("desktop-review-key", document, result.model_copy(update={"events": (imprecise,)}))
+    package = review_workspace.directory / "runs" / "p2-review"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
         json.dumps(
-            {
-                "extractions": [
-                    {
-                        "document_version_id": "newsv_" + "a" * 24,
-                        "review_status": "unreviewed",
-                        "document": {"title": "机组临时停运公告"},
-                        "result": {
-                            "events": [{"relevance": "short_term", "effective_start_at": None}],
-                            "quarantine": None,
-                            "candidate_quarantines": [],
-                        },
-                    }
-                ],
-                "decisions": [],
-            },
+            {"result_quality": {"checks": [{"code": "price_grid", "passed": True, "detail": "通过"}]}},
             ensure_ascii=False,
         ),
         encoding="utf-8",
@@ -456,8 +463,8 @@ def test_p2_review_gate_lists_items_and_blocks_continue_and_forecast(
     )
     window = MainWindow(session_store=SessionStore(tmp_path / "sessions.json"))
     workspace = window.workspace
-    calls: list[bool] = []
-    monkeypatch.setattr(workspace, "_resume_full_flow", lambda *, retry_p2=False: calls.append(retry_p2))
+    calls: list[str] = []
+    monkeypatch.setattr(workspace, "revalidate_p2", lambda revision: calls.append(revision))
     try:
         workspace.current_session.dataset_fingerprint = "d" * 12
         workspace.update_full_flow_state(
@@ -468,15 +475,197 @@ def test_p2_review_gate_lists_items_and_blocks_continue_and_forecast(
 
         workspace.submit_question("继续")
         workspace.submit_question("预测山东明天实时电价")
+        workspace.submit_question("已经完成P2的复核")
 
         assert calls == []
         assert flow.store.load().phase == "p2_needs_review"
-        assert any("机组临时停运公告" in message.content for message in workspace.current_session.messages)
-        assert any("短期事件缺少生效开始时间" in message.content for message in workspace.current_session.messages)
-
-        workspace.submit_question("重试")
-        assert calls == [True]
+        review_message = next(message for message in workspace.current_session.messages if message.kind == "p2_review")
+        assert review_message.payload["required_pending"] == 1
+        summary = flow.get_p2_review_summary(blocked.flow_id)
+        assert summary.items[0].title == document.title
+        assert "精确生效时间" in summary.items[0].blocking_reasons[0]
         assert flow.store.load().flow_id == blocked.flow_id
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_p2_review_dialog_background_action_writes_a_real_audit_record(
+    qt_app: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    plan = _plan(tmp_path)
+    flow, state = _awaiting_state(tmp_path, plan)
+    review_workspace = NewsWorkspace(flow.output_directory / state.flow_id / "p2")
+    record = JsonlCollectedNewsAdapter(NEWS_FIXTURES / "synthetic_news.jsonl").load()[0]
+    document = NewsNormalizer().normalize(record)
+    result = ObviousNewsEventExtractor(market_timezone="UTC").extract(document)
+    event = result.events[0].model_copy(
+        update={
+            "effective_start_at": None,
+            "effective_end_at": None,
+            "analysis_eligibility": "needs_time_review",
+        }
+    )
+    review_workspace.cache_result("dialog-review-key", document, result.model_copy(update={"events": (event,)}))
+    package = review_workspace.directory / "runs" / "dialog-review"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
+        json.dumps({"result_quality": {"checks": []}}), encoding="utf-8"
+    )
+    report = _touch(package / "report.md")
+    blocked = flow.store.save(
+        state.model_copy(
+            update={
+                "phase": "p2_needs_review",
+                "runs": (
+                    *state.runs,
+                    FlowRunReference(
+                        run_kind="news",
+                        run_id="dialog-review",
+                        parent_run_id=state.runs[-1].run_id,
+                        artifact_directory=package,
+                        report_path=report,
+                    ),
+                ),
+                "forecast_plan": None,
+                "forecast_plan_fingerprint": None,
+            }
+        )
+    )
+    monkeypatch.setattr(QMessageBox, "information", lambda *_args, **_kwargs: QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *_args, **_kwargs: QMessageBox.StandardButton.Ok)
+    dialog = P2ReviewDialog(flow.get_p2_review_summary(blocked.flow_id), submit=flow.submit_p2_review)
+    try:
+        dialog.disposition.setCurrentIndex(dialog.disposition.findData("background"))
+        dialog.reviewer.setText("桌面验收员")
+        dialog.reason.setPlainText("事实证据可信，但来源只给出了日期")
+        dialog._save()
+        qt_app.processEvents()
+
+        assert dialog.summary.required_pending == 0
+        with review_workspace.connect() as database:
+            stored = database.execute(
+                "SELECT decision, usage, reviewer, reason FROM reviews"
+            ).fetchone()
+        assert stored == (
+            "accepted",
+            "background_only",
+            "桌面验收员",
+            "事实证据可信，但来源只给出了日期",
+        )
+    finally:
+        dialog.close()
+        qt_app.processEvents()
+
+
+def test_fixed_eight_news_route_keeps_four_blockers_inside_p2(
+    qt_app: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    plan = _plan(tmp_path)
+    flow, state = _awaiting_state(tmp_path, plan)
+    review_workspace = NewsWorkspace(flow.output_directory / state.flow_id / "p2")
+    moment = datetime(2026, 9, 1, 8, tzinfo=UTC)
+    for index in range(8):
+        record = CollectedNewsRecord(
+            source_name="固定桌面验收语料",
+            source_document_id=f"fixed-{index}",
+            source_ref=f"https://example.test/news/{index}",
+            title=f"固定新闻 {index + 1}",
+            body=f"山东电力事件固定证据 {index + 1}",
+            published_at=moment + timedelta(minutes=index),
+            collected_at=moment + timedelta(minutes=index),
+            market_tags=("CN-SHANDONG",),
+        )
+        document = NewsNormalizer().normalize(record)
+        if index >= 6:
+            result = EventExtractionResult(
+                document_version_id=document.document_version_id,
+                quarantine=ExtractionQuarantine(
+                    document_version_id=document.document_version_id,
+                    reason_code="inconsistent_extraction",
+                    message="三次独立抽取存在分歧",
+                    extractor_id="fixed-ui-test",
+                    extractor_version="1.0",
+                ),
+            )
+        else:
+            imprecise = index in {4, 5}
+            result = EventExtractionResult(
+                document_version_id=document.document_version_id,
+                events=(
+                    EventRecord(
+                        event_id=f"evt_{index:024x}",
+                        document_version_id=document.document_version_id,
+                        relevance="short_term",
+                        event_type="demand_shock",
+                        announcement_available_at=document.available_at,
+                        effective_start_at=None if imprecise else moment + timedelta(hours=index + 1),
+                        time_resolution=TimeResolution(
+                            basis="stated_absolute",
+                            precision="day" if imprecise else "hour",
+                            stated_text="当日" if imprecise else None,
+                        ),
+                        extractor_id="fixed-ui-test",
+                        extractor_version="1.0",
+                        analysis_eligibility="needs_time_review" if imprecise else "eligible",
+                    ),
+                ),
+            )
+        review_workspace.cache_result(f"fixed-{index}", document, result)
+    package = review_workspace.directory / "runs" / "fixed-eight"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
+        json.dumps({"result_quality": {"checks": []}}), encoding="utf-8"
+    )
+    blocked = flow.store.save(
+        state.model_copy(
+            update={
+                "phase": "p2_needs_review",
+                "runs": (
+                    *state.runs,
+                    FlowRunReference(
+                        run_kind="news",
+                        run_id="fixed-eight",
+                        parent_run_id=state.runs[-1].run_id,
+                        artifact_directory=package,
+                        report_path=_touch(package / "report.md"),
+                    ),
+                ),
+                "forecast_plan": None,
+                "forecast_plan_fingerprint": None,
+            }
+        )
+    )
+    window = MainWindow(session_store=SessionStore(tmp_path / "sessions.json"))
+    workspace = window.workspace
+    opened: list[bool] = []
+    monkeypatch.setattr(workspace, "open_p2_review", lambda: opened.append(True))
+    try:
+        workspace.current_session.dataset_fingerprint = "d" * 12
+        workspace.update_full_flow_state(
+            blocked,
+            state_path=flow.store.path,
+            output_directory=flow.output_directory,
+        )
+        summary = flow.get_p2_review_summary(blocked.flow_id)
+        assert summary.required_pending == 4
+        assert summary.optional_unreviewed == 4
+        runs_before = list(workspace.current_session.runs)
+
+        workspace.submit_question("如何复核")
+        qt_app.processEvents()
+        workspace.submit_question("继续第三阶段")
+        workspace.submit_question("已经完成P2的复核")
+
+        assert opened == [True]
+        assert flow.store.load().phase == "p2_needs_review"
+        assert workspace.current_session.runs == runs_before
+        card = next(message for message in workspace.current_session.messages if message.kind == "p2_review")
+        assert card.payload["required_pending"] == 4
     finally:
         window.close()
         qt_app.processEvents()
@@ -521,7 +710,8 @@ def test_completed_flow_reuses_id_until_user_explicitly_requests_a_new_round(
         assert "不会重复执行" in workspace.current_session.messages[-1].content
 
         workspace.submit_question("重新开始新闻分析最后电价预测")
-        assert new_requests == [("重新开始新闻分析最后电价预测", True)]
+        assert new_requests == []
+        assert "新的研究" in workspace.current_session.messages[-1].content
     finally:
         window.close()
         qt_app.processEvents()

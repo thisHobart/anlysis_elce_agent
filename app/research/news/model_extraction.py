@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from app.llm.budget import ModelRequestPurpose
 from app.llm.gateway import (
     ModelConfigurationError,
     ModelContextLimitError,
@@ -24,6 +25,7 @@ from app.llm.gateway import (
     ModelResponseError,
     ModelThinkingError,
     ModelTransientError,
+    invoke_structured_for_purpose,
 )
 from app.research.news.contracts import (
     EventExtractionBatch,
@@ -202,9 +204,7 @@ class ModelEventCandidate(BaseModel):
         # A precise instant is only meaningful at instant/hour precision; forbidding it at
         # day/month/vague makes "attach a bare date to a timestamp" unrepresentable.
         if self.event_instant is not None and self.time_precision not in _INSTANT_PRECISIONS:
-            raise ValueError(
-                "event_instant is only allowed when time_precision is 'instant' or 'hour'"
-            )
+            raise ValueError("event_instant is only allowed when time_precision is 'instant' or 'hour'")
         return self
 
 
@@ -223,9 +223,7 @@ class ModelNewsExtraction(BaseModel):
     def validate_disposition(self) -> ModelNewsExtraction:
         if self.disposition == "event" and not self.events:
             raise ValueError("event disposition requires at least one event")
-        if self.disposition == "event" and any(
-            event.event_type in {"irrelevant", "unknown"} for event in self.events
-        ):
+        if self.disposition == "event" and any(event.event_type in {"irrelevant", "unknown"} for event in self.events):
             raise ValueError("event disposition must use a concrete event_type")
         if self.disposition != "event" and self.events:
             raise ValueError("only event disposition may contain events")
@@ -373,15 +371,11 @@ class StructuredNewsEventExtractor:
         if kinds[0] == "quarantine":
             # Every pass held the document back, so the outcome is not in doubt; keep the
             # most common reason instead of masking it behind an inconsistency label.
-            reasons = Counter(
-                result.quarantine.reason_code for result in results if result.quarantine
-            )
+            reasons = Counter(result.quarantine.reason_code for result in results if result.quarantine)
             modal_reason = reasons.most_common(1)[0][0]
             print(f"[新闻抽取] {len(results)} 趟均隔离，采用主要原因 {modal_reason}")
             return next(
-                result
-                for result in results
-                if result.quarantine and result.quarantine.reason_code == modal_reason
+                result for result in results if result.quarantine and result.quarantine.reason_code == modal_reason
             )
 
         signatures = {_event_signature(result) for result in results}
@@ -405,7 +399,8 @@ class StructuredNewsEventExtractor:
             differing = _differing_event_fields(results, identity_only=True)
             detail = "、".join(differing) if differing else "资产与事件的配对关系"
             return self._quarantine(
-                document, reason_code="inconsistent_extraction",
+                document,
+                reason_code="inconsistent_extraction",
                 message=f"{len(results)} 趟规范化后的资产名、集合或事件归属不一致；分歧字段：{detail}",
             )
 
@@ -415,10 +410,7 @@ class StructuredNewsEventExtractor:
     def _single_pass(self, document: NewsDocument) -> EventExtractionResult:
         """Extract one document once and expose each processing step for debugging."""
 
-        print(
-            f"\n[新闻抽取] 开始 document_version_id={document.document_version_id} "
-            f"title={document.title!r}"
-        )
+        print(f"\n[新闻抽取] 开始 document_version_id={document.document_version_id} title={document.title!r}")
         messages = build_model_news_extraction_messages(
             document,
             market_timezone=self.market_timezone,
@@ -469,10 +461,7 @@ class StructuredNewsEventExtractor:
                 reason_code="model_response_invalid",
                 message=f"模型响应不符合结构化 schema：{exc}",
             )
-        print(
-            f"[新闻抽取] Schema 校验通过 disposition={result.disposition} "
-            f"event_count={len(result.events)}"
-        )
+        print(f"[新闻抽取] Schema 校验通过 disposition={result.disposition} event_count={len(result.events)}")
 
         output_hash = _canonical_hash(result.model_dump(mode="json"))
         trace = ExtractionTrace(
@@ -531,17 +520,15 @@ class StructuredNewsEventExtractor:
                 try:
                     event = self._event(document, candidate, trace)
                 except ExtractionValidationError as exc:
-                    print(
-                        f"[新闻抽取] 候选事件 {index} 未通过内容校验 "
-                        f"reason_code={exc.reason_code} message={exc}"
-                    )
+                    print(f"[新闻抽取] 候选事件 {index} 未通过内容校验 reason_code={exc.reason_code} message={exc}")
                     rejected.append(
                         self._quarantine_record(
                             document,
                             reason_code=exc.reason_code,
                             message=f"候选事件 {index}/{len(result.events)}：{exc}",
                             raw_entity_mentions=self._candidate_entity_mentions(document, candidate),
-                            candidate_payload=candidate.model_dump(mode="json"), extraction_trace=trace,
+                            candidate_payload=candidate.model_dump(mode="json"),
+                            extraction_trace=trace,
                         )
                     )
                     continue
@@ -552,15 +539,13 @@ class StructuredNewsEventExtractor:
                             document,
                             reason_code="event_contract_violation",
                             message=f"候选事件 {index}/{len(result.events)} 未通过事件契约：{exc}",
-                            candidate_payload=candidate.model_dump(mode="json"), extraction_trace=trace,
+                            candidate_payload=candidate.model_dump(mode="json"),
+                            extraction_trace=trace,
                         )
                     )
                     continue
                 events.append(event)
-                print(
-                    f"[新闻抽取] 候选事件 {index} 转换成功 "
-                    f"event_id={event.event_id} event_type={event.event_type}"
-                )
+                print(f"[新闻抽取] 候选事件 {index} 转换成功 event_id={event.event_id} event_type={event.event_type}")
 
             if not events:
                 first = rejected[0]
@@ -587,10 +572,7 @@ class StructuredNewsEventExtractor:
                 candidate_quarantines=tuple(rejected),
             )
         except ExtractionValidationError as exc:
-            print(
-                f"[新闻抽取] 本地内容校验未通过 "
-                f"reason_code={exc.reason_code} message={exc}"
-            )
+            print(f"[新闻抽取] 本地内容校验未通过 reason_code={exc.reason_code} message={exc}")
             return self._quarantine(
                 document,
                 reason_code=exc.reason_code,
@@ -619,8 +601,7 @@ class StructuredNewsEventExtractor:
             return None
         anchors = time_anchors(document.body)
         claimed = sum(
-            (1 if event.effective_start_at is not None else 0)
-            + (1 if event.effective_end_at is not None else 0)
+            (1 if event.effective_start_at is not None else 0) + (1 if event.effective_end_at is not None else 0)
             for event in events
         )
         repeated_event_language = re.search(
@@ -664,9 +645,11 @@ class StructuredNewsEventExtractor:
             self.model_calls += 1
             try:
                 try:
-                    raw_result = self.gateway.invoke_structured(
+                    raw_result = invoke_structured_for_purpose(
+                        self.gateway,
                         messages=attempt_messages,
                         schema=ModelNewsExtraction,
+                        purpose=ModelRequestPurpose.NEWS_EXTRACTION,
                     )
                 finally:
                     # Every attempt is billed and waited on, successful or not.
@@ -674,9 +657,7 @@ class StructuredNewsEventExtractor:
                 print("[新闻抽取] Gateway 返回内容：")
                 print(
                     json.dumps(
-                        raw_result.model_dump(mode="json")
-                        if isinstance(raw_result, BaseModel)
-                        else raw_result,
+                        raw_result.model_dump(mode="json") if isinstance(raw_result, BaseModel) else raw_result,
                         ensure_ascii=False,
                         indent=2,
                         default=str,
@@ -693,9 +674,7 @@ class StructuredNewsEventExtractor:
                 last_error = exc
                 if attempt >= self.max_repair_attempts:
                     break
-                print(
-                    f"[新闻抽取] 结构化输出未通过校验，第 {attempt + 1} 次回传错误让模型自改"
-                )
+                print(f"[新闻抽取] 结构化输出未通过校验，第 {attempt + 1} 次回传错误让模型自改")
                 attempt_messages = [*messages, _repair_message(exc)]
         assert last_error is not None
         raise last_error
@@ -752,22 +731,36 @@ class StructuredNewsEventExtractor:
                 f"模型事件缺少字段级原文证据：{', '.join(missing)}",
             )
         try:
-            resolution = resolve_entities(document, candidate.affected_regions,
-                                          candidate.affected_assets, candidate.asset_groups, evidence)
+            resolution = resolve_entities(
+                document, candidate.affected_regions, candidate.affected_assets, candidate.asset_groups, evidence
+            )
         except EntityResolutionError as exc:
             raise ExtractionValidationError("invalid_evidence", str(exc)) from exc
         # Rebuild entity evidence from actual mentions. Tag-only regions get no text span.
-        evidence = [span for span in evidence if span.field_name in cleared_fields or span.field_name not in
-                    {"affected_regions", "affected_assets", "asset_groups"}]
+        evidence = [
+            span
+            for span in evidence
+            if span.field_name in cleared_fields
+            or span.field_name not in {"affected_regions", "affected_assets", "asset_groups"}
+        ]
         mentions = {item.mention_id: item for item in resolution.raw_entity_mentions}
-        for field_name, entities in (("affected_regions", resolution.mentioned_regions),
-                                     ("affected_assets", resolution.affected_assets),
-                                     ("asset_groups", resolution.asset_groups)):
+        for field_name, entities in (
+            ("affected_regions", resolution.mentioned_regions),
+            ("affected_assets", resolution.affected_assets),
+            ("asset_groups", resolution.asset_groups),
+        ):
             for mid in sorted({mid for entity in entities for mid in entity.mention_ids}):
                 mention = mentions[mid]
-                evidence.append(EvidenceSpan(field_name=field_name,
-                    document_version_id=mention.document_version_id, text_field=mention.text_field,
-                    start_char=mention.start_char, end_char=mention.end_char, quote=mention.quote))
+                evidence.append(
+                    EvidenceSpan(
+                        field_name=field_name,
+                        document_version_id=mention.document_version_id,
+                        text_field=mention.text_field,
+                        start_char=mention.start_char,
+                        end_char=mention.end_char,
+                        quote=mention.quote,
+                    )
+                )
 
         magnitude, capacity_mw = self._magnitude(document, candidate, evidence)
         start_at, end_at, time_resolution = self._times(document, candidate, evidence)
@@ -812,8 +805,9 @@ class StructuredNewsEventExtractor:
             extractor_version=self.extractor_version,
             extraction_trace=trace,
             confidence=candidate.confidence,
-            analysis_eligibility=("needs_time_review" if candidate.relevance == "short_term" and start_at is None
-                                  else "eligible"),
+            analysis_eligibility=(
+                "needs_time_review" if candidate.relevance == "short_term" and start_at is None else "eligible"
+            ),
             evidence=tuple(span.model_copy(update={"event_id": event_id}) for span in evidence),
             cleared_fields=tuple(sorted(cleared_fields)),
         )
@@ -905,10 +899,7 @@ class StructuredNewsEventExtractor:
         if not any(math.isclose(value_mw, expected_mw, rel_tol=1e-9, abs_tol=1e-9) for value_mw in source_quantities):
             raise ExtractionValidationError(
                 "ambiguous_quantity",
-                (
-                    f"模型数量 {quantity.value:g} {quantity.unit} 与原文短语 "
-                    f"{quantity.raw_text!r} 中的数值或单位不一致"
-                ),
+                (f"模型数量 {quantity.value:g} {quantity.unit} 与原文短语 {quantity.raw_text!r} 中的数值或单位不一致"),
             )
         magnitude_spans = [span for span in evidence if span.field_name == "magnitude"]
         if not any(quantity.raw_text in span.quote or span.quote in quantity.raw_text for span in magnitude_spans):
@@ -926,10 +917,7 @@ class StructuredNewsEventExtractor:
         )
         capacity_mw = normalized_mw if quantity.semantic in _CHANGE_QUANTITIES else None
         if capacity_mw is not None:
-            evidence.extend(
-                span.model_copy(update={"field_name": "capacity_mw"})
-                for span in magnitude_spans
-            )
+            evidence.extend(span.model_copy(update={"field_name": "capacity_mw"}) for span in magnitude_spans)
         return magnitude, capacity_mw
 
     def _times(
@@ -946,8 +934,13 @@ class StructuredNewsEventExtractor:
                 if candidate.time_precision in _PRECISE_EVENT_TIMES:
                     raise ExtractionValidationError("missing_effective_start", "声明精确时间但缺少可校验时刻")
                 # Preserve evidence-checked facts without inventing a settlement timestamp.
-                return None, None, TimeResolution(basis="stated_absolute", precision=candidate.time_precision,
-                                                  stated_text=candidate.time_text)
+                return (
+                    None,
+                    None,
+                    TimeResolution(
+                        basis="stated_absolute", precision=candidate.time_precision, stated_text=candidate.time_text
+                    ),
+                )
             if candidate.time_precision not in _PRECISE_EVENT_TIMES:
                 raise ExtractionValidationError(
                     "ambiguous_event_time",
@@ -964,16 +957,12 @@ class StructuredNewsEventExtractor:
             raise ExtractionValidationError("invalid_evidence", "时间原文 time_text 不存在于新闻中")
         start_spans = [span for span in evidence if span.field_name == "effective_start_at"]
         if candidate.time_text and not any(
-            candidate.time_text in span.quote or span.quote in candidate.time_text
-            for span in start_spans
+            candidate.time_text in span.quote or span.quote in candidate.time_text for span in start_spans
         ):
             raise ExtractionValidationError("invalid_evidence", "开始时间证据没有覆盖 time_text")
         if not candidate.time_text:
             raise ExtractionValidationError("invalid_evidence", "精确事件时间缺少原文 time_text")
-        start_text = " ".join(
-            [candidate.time_text]
-            + [span.quote for span in start_spans]
-        )
+        start_text = " ".join([candidate.time_text] + [span.quote for span in start_spans])
         if not _time_text_supports(
             start_text,
             start_utc,
@@ -986,8 +975,7 @@ class StructuredNewsEventExtractor:
             )
         if end_utc is not None:
             end_text = " ".join(
-                [candidate.time_text]
-                + [span.quote for span in evidence if span.field_name == "effective_end_at"]
+                [candidate.time_text] + [span.quote for span in evidence if span.field_name == "effective_end_at"]
             )
             if not _time_text_supports(
                 end_text,
@@ -1024,9 +1012,7 @@ class StructuredNewsEventExtractor:
         try:
             parsed = datetime.fromisoformat(text)
         except ValueError as exc:
-            raise ExtractionValidationError(
-                "ambiguous_event_time", f"时间无法解析为 ISO-8601：{text!r}"
-            ) from exc
+            raise ExtractionValidationError("ambiguous_event_time", f"时间无法解析为 ISO-8601：{text!r}") from exc
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             raise ExtractionValidationError("ambiguous_event_time", f"时间缺少时区偏移：{text!r}")
         if instant.basis == "stated_components":
@@ -1148,10 +1134,7 @@ def _event_comparison_rows(result: EventExtractionResult) -> list[dict[str, obje
 
 def _field_signature(rows: list[dict[str, object]], field: str) -> str:
     return _canonical_hash(
-        sorted(
-            json.dumps(row[field], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            for row in rows
-        )
+        sorted(json.dumps(row[field], ensure_ascii=False, sort_keys=True, separators=(",", ":")) for row in rows)
     )
 
 
@@ -1172,21 +1155,14 @@ def _differing_event_fields(
     for field in fields:
         if field == "affected_assets":
             variants = {
-                _canonical_hash(sorted(json.dumps(event.asset_keys) for event in result.events))
-                for result in results
+                _canonical_hash(sorted(json.dumps(event.asset_keys) for event in result.events)) for result in results
             }
         else:
-            variants = {
-                _field_signature(rows, field) if rows else _canonical_hash([])
-                for rows in rows_by_pass
-            }
+            variants = {_field_signature(rows, field) if rows else _canonical_hash([]) for rows in rows_by_pass}
         if len(variants) > 1:
             differing.append(field)
     if not identity_only:
-        reasons = {
-            tuple(sorted(item.reason_code for item in result.candidate_quarantines))
-            for result in results
-        }
+        reasons = {tuple(sorted(item.reason_code for item in result.candidate_quarantines)) for result in results}
         if len(reasons) > 1:
             differing.append("rejected_candidates")
     return tuple(differing)
@@ -1202,16 +1178,11 @@ def _event_signature(result: EventExtractionResult) -> str:
     must agree; different plants can never be accepted by majority vote.
     """
 
-    events = sorted(
-        json.dumps(row, ensure_ascii=False, sort_keys=True)
-        for row in _event_comparison_rows(result)
-    )
+    events = sorted(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in _event_comparison_rows(result))
     return _canonical_hash(
         {
             "events": events,
-            "rejected_candidates": sorted(
-                item.reason_code for item in result.candidate_quarantines
-            ),
+            "rejected_candidates": sorted(item.reason_code for item in result.candidate_quarantines),
         }
     )
 
@@ -1306,7 +1277,20 @@ _ISO_DATE_IN_TEXT = re.compile(r"(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)")
 _MONTHS = {
     name.casefold(): index
     for index, name in enumerate(
-        ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"),
+        (
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ),
         start=1,
     )
 }
@@ -1347,31 +1331,19 @@ def _time_text_supports(
 
     dates: set[tuple[int | None, int | None, int]] = set()
     dates.update(
-        (int(year) if year else None, int(month), int(day))
-        for year, month, day in _CN_DATE_IN_TEXT.findall(text)
+        (int(year) if year else None, int(month), int(day)) for year, month, day in _CN_DATE_IN_TEXT.findall(text)
     )
     dates.update((int(year), int(month), int(day)) for year, month, day in _ISO_DATE_IN_TEXT.findall(text))
-    dates.update(
-        (int(year), _MONTHS[month.casefold()], int(day))
-        for month, day, year in _EN_DATE_MDY.findall(text)
-    )
-    dates.update(
-        (int(year), _MONTHS[month.casefold()], int(day))
-        for day, month, year in _EN_DATE_DMY.findall(text)
-    )
+    dates.update((int(year), _MONTHS[month.casefold()], int(day)) for month, day, year in _EN_DATE_MDY.findall(text))
+    dates.update((int(year), _MONTHS[month.casefold()], int(day)) for day, month, year in _EN_DATE_DMY.findall(text))
     dates.update((None, None, int(day)) for day in _DAY_IN_TEXT.findall(text))
     if dates and not any(
-        (month is None or month == local.month)
-        and day == local.day
-        and (year is None or year == local.year)
+        (month is None or month == local.month) and day == local.day and (year is None or year == local.year)
         for year, month, day in dates
     ):
         return False
     publication_local = publication.astimezone(market_zone)
-    return not (
-        ("次日" in text or "翌日" in text)
-        and local.date() != (publication_local.date() + timedelta(days=1))
-    )
+    return not (("次日" in text or "翌日" in text) and local.date() != (publication_local.date() + timedelta(days=1)))
 
 
 def _has_power_unit(raw_text: str) -> bool:

@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import yaml
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QTextDocument
 from PySide6.QtWidgets import QApplication, QFileDialog, QLabel
 
@@ -748,6 +748,53 @@ def test_session_history_persists_across_window_restart(
         assert persisted.can_analyze
     finally:
         second.close()
+
+
+def test_selecting_sessions_does_not_reorder_history_when_state_is_reconciled(
+    qt_app: QApplication,
+    model_agent: ResearchCoordinator,
+    tmp_path: Path,
+):
+    window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
+    try:
+        workspace = window.workspace
+        older = workspace.current_session
+        older.title = "较早会话"
+        older.updated_at = "2026-09-11T08:00:00+00:00"
+        workspace.create_session()
+        newer = workspace.current_session
+        newer.title = "较新会话"
+        newer.updated_at = "2026-09-12T08:00:00+00:00"
+        workspace.history.set_sessions(workspace.sessions, newer.session_id)
+
+        def history_session_ids() -> list[str]:
+            return [
+                session_id
+                for index in range(workspace.history.list.count())
+                if (session_id := str(workspace.history.list.item(index).data(Qt.ItemDataRole.UserRole) or ""))
+            ]
+
+        expected_order = [newer.session_id, older.session_id]
+        assert history_session_ids() == expected_order
+
+        # Restoring a Graph snapshot currently persists via _persist_and_render,
+        # which touches the selected session unless select_session preserves its
+        # activity timestamp.
+        with (
+            patch.object(model_agent, "has_thread", return_value=True),
+            patch.object(model_agent, "get_snapshot", return_value=object()),
+            patch.object(
+                workspace,
+                "_loop_completed",
+                side_effect=lambda _snapshot: workspace._persist_and_render(keep_timeline=True),
+            ),
+        ):
+            workspace.select_session(older.session_id)
+
+        assert older.updated_at == "2026-09-11T08:00:00+00:00"
+        assert history_session_ids() == expected_order
+    finally:
+        window.close()
 
 
 def _session_with_plan(plan: dict) -> ResearchSession:

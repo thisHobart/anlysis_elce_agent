@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {
+      "provider": "gemini",
+      "base_url": "",
+      "model": "gemini-2.5-flash",
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 65536,
+      "api_style": "chat",
+      "structured_output_method": "json_schema",
+      "capabilities": {
+        "function_calling": true,
+        "json_schema": true,
+        "json_mode": true,
+        "parallel_tool_calls": true
+      },
+      "reasoning_uses_output_budget": true,
+      "source_url": "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash",
+      "reviewed_at": "2026-09-13",
+      "deprecated": false
+    },
+    {
+      "provider": "qwen",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "model": "qwen-plus",
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 32768,
+      "api_style": "chat",
+      "structured_output_method": "prompt_json",
+      "capabilities": {
+        "function_calling": false,
+        "json_schema": false,
+        "json_mode": true,
+        "parallel_tool_calls": false
+      },
+      "reasoning_uses_output_budget": true,
+      "source_url": "https://help.aliyun.com/zh/model-studio/qwen-plus",
+      "reviewed_at": "2026-09-13",
+      "deprecated": false
+    },
+    {
+      "provider": "deepseek",
+      "base_url": "https://api.deepseek.com/v1",
+      "model": "deepseek-v4-flash",
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 393216,
+      "api_style": "chat",
+      "structured_output_method": "function_calling",
+      "capabilities": {
+        "function_calling": true,
+        "json_schema": false,
+        "json_mode": true,
+        "parallel_tool_calls": true
+      },
+      "reasoning_uses_output_budget": true,
+      "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+      "reviewed_at": "2026-09-13",
+      "deprecated": false
+    }
+  ]
+}

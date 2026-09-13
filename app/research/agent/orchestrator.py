@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import Settings, get_settings
+from app.llm.budget import ModelRequestPurpose
 from app.llm.factory import build_model_gateway
 from app.llm.gateway import (
     ModelConfigurationError,
@@ -58,9 +60,8 @@ def requests_analysis_before_forecast(question: str) -> bool:
     """Return whether one turn explicitly asks for analysis and a forecast."""
 
     compact = "".join(question.lower().split())
-    return (
-        any(word in compact for word in ("分析", "研究", "诊断"))
-        and any(word in compact for word in ("预测", "预报"))
+    return any(word in compact for word in ("分析", "研究", "诊断")) and any(
+        word in compact for word in ("预测", "预报")
     )
 
 
@@ -114,8 +115,7 @@ def _compact_comparisons(value: Any) -> dict[str, Any]:
                 variable: {
                     "segments": {
                         segment_id: {
-                            key: row.get(key)
-                            for key in ("label", "selector", "observations", "correlation", "p_value")
+                            key: row.get(key) for key in ("label", "selector", "observations", "correlation", "p_value")
                         }
                         for segment_id, row in (result.get("segments") or {}).items()
                     },
@@ -172,9 +172,7 @@ def _compact_price_evidence(value: Any) -> dict[str, Any]:
         compact["autocorrelation"] = autocorrelation
     partial = value.get("partial_autocorrelation")
     if isinstance(partial, dict):
-        compact["partial_autocorrelation"] = {
-            key: item for key, item in partial.items() if key != "series"
-        }
+        compact["partial_autocorrelation"] = {key: item for key, item in partial.items() if key != "series"}
     duration = value.get("duration_curve")
     if isinstance(duration, dict):
         compact["duration_curve"] = {
@@ -205,7 +203,9 @@ def _compact_section_series(value: Any, *, drop: frozenset[str]) -> dict[str, An
     series = value.get("series")
     if isinstance(series, dict):
         compact["series"] = {
-            name: ({key: item for key, item in result.items() if key not in drop} if isinstance(result, dict) else result)
+            name: (
+                {key: item for key, item in result.items() if key not in drop} if isinstance(result, dict) else result
+            )
             for name, result in series.items()
         }
     return compact
@@ -282,6 +282,7 @@ def _compact_dialogue_retry_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "objective",
                 "skill_name",
                 "skill_version",
+                "data_fingerprint",
                 "selected_variables",
                 "variable_selection_stage",
                 "steps",
@@ -323,7 +324,17 @@ def _compact_dialogue_retry_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     skills = payload.get("available_skills")
     compact_skills = [
-        {key: item.get(key) for key in ("name", "version", "domain") if key in item}
+        {
+            key: item.get(key)
+            for key in (
+                "name",
+                "version",
+                "domain",
+                "allowed_functions",
+                "research_protocol",
+            )
+            if key in item
+        }
         for item in skills or []
         if isinstance(item, dict)
     ]
@@ -349,9 +360,7 @@ def _compact_dialogue_retry_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "intent_rules": payload.get("intent_rules"),
         "revision_contract": payload.get("revision_contract"),
         "skill_contract": payload.get("skill_contract"),
-        "supported_workflows": (
-            capabilities.get("supported_workflows") if isinstance(capabilities, dict) else None
-        ),
+        "supported_workflows": (capabilities.get("supported_workflows") if isinstance(capabilities, dict) else None),
     }
 
 
@@ -480,17 +489,25 @@ class ModelResearchDialogue:
                 "new_plan_skill_name": "choose_from_available_skills",
             },
         }
+
         def invoke(value: dict[str, Any]) -> DialogueDecision:
             messages = [
                 ModelMessage(role="system", content=DIALOGUE_SYSTEM_PROMPT),
                 ModelMessage(role="user", content=json.dumps(value, ensure_ascii=False)),
             ]
-            return self.gateway.invoke_structured(messages=messages, schema=DialogueDecision)
+            kwargs: dict[str, Any] = {"messages": messages, "schema": DialogueDecision}
+            if "purpose" in inspect.signature(self.gateway.invoke_structured).parameters:
+                kwargs["purpose"] = (
+                    ModelRequestPurpose.RESULT_EXPLANATION
+                    if summary is not None or evaluation is not None
+                    else ModelRequestPurpose.DIALOGUE
+                )
+            return self.gateway.invoke_structured(**kwargs)
 
         try:
             try:
                 return invoke(payload)
-            except ModelOutputTruncatedError:
+            except (ModelOutputTruncatedError, ModelContextLimitError):
                 return invoke(_compact_dialogue_retry_payload(payload))
         except ModelOutputTruncatedError as exc:
             raise ResearchModelOutputTruncatedError(f"大模型对话输出达到长度限制：{exc}") from exc
@@ -528,9 +545,7 @@ class MainResearchAgent:
 
         enabled_functions = {step.function for step in revised.enabled_steps}
         enabled_item_ids = {
-            FUNCTION_AGENDA_ITEM_IDS[name]
-            for name in enabled_functions
-            if name in FUNCTION_AGENDA_ITEM_IDS
+            FUNCTION_AGENDA_ITEM_IDS[name] for name in enabled_functions if name in FUNCTION_AGENDA_ITEM_IDS
         }
         canonical_by_item_id = {
             FUNCTION_AGENDA_ITEM_IDS[name]: hypothesis
@@ -554,11 +569,7 @@ class MainResearchAgent:
                     represented_item_ids.add(item_id)
 
         generated = set(FUNCTION_AGENDA_HYPOTHESES.values())
-        kept = [
-            item
-            for item in kept
-            if item not in generated or item in canonical_by_item_id.values()
-        ]
+        kept = [item for item in kept if item not in generated or item in canonical_by_item_id.values()]
         for item_id, hypothesis in canonical_by_item_id.items():
             if item_id not in represented_item_ids and hypothesis not in kept:
                 kept.append(hypothesis)
@@ -597,9 +608,7 @@ class MainResearchAgent:
             if unknown_functions:
                 raise ResearchPlanValidationError(f"大模型修订包含未知研究函数：{', '.join(unknown_functions)}")
             if plan.research_protocol_function_order:
-                outside_protocol = sorted(
-                    enabled_functions.difference(plan.research_protocol_function_order)
-                )
+                outside_protocol = sorted(enabled_functions.difference(plan.research_protocol_function_order))
                 if outside_protocol:
                     raise ResearchPlanValidationError(
                         f"大模型修订包含领域协议未授权函数：{', '.join(outside_protocol)}"
@@ -752,11 +761,7 @@ class MainResearchAgent:
                     )
                 )
             revised = revised.model_copy(update={"steps": extra_steps})
-        agenda_decision = (
-            decision.model_copy(update={"hypotheses": []})
-            if selection_stage == "screening"
-            else decision
-        )
+        agenda_decision = decision.model_copy(update={"hypotheses": []}) if selection_stage == "screening" else decision
         revised = revised.model_copy(
             update={
                 "hypotheses": self._revised_agenda(

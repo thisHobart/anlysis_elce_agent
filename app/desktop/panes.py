@@ -38,6 +38,7 @@ from app.desktop.message_widgets import (
     ForecastPlanMessageWidget,
     ForecastResultMessageWidget,
     NoticeMessageWidget,
+    P2ReviewMessageWidget,
     ResultMessageWidget,
     TextMessageWidget,
     ThinkingMessageWidget,
@@ -202,6 +203,8 @@ class ConversationPane(QFrame):
     data_details_requested = Signal()
     end_research_requested = Signal()
     draft_changed = Signal(bool)
+    p2_review_open_requested = Signal()
+    p2_revalidate_requested = Signal(str)
 
     DEFAULT_INPUT_PLACEHOLDER = (
         "说说你想研究什么，例如“负荷对实时电价的影响有多大”“峰谷价差在夏天有什么不同”…"
@@ -214,6 +217,7 @@ class ConversationPane(QFrame):
         super().__init__()
         self.setObjectName("conversationPane")
         self._running = False
+        self._read_only = False
         self._interaction_kind: str | None = None
         self._message_widgets: dict[str, QWidget] = {}
         self.current_plan_widget: DataPlanMessageWidget | ForecastPlanMessageWidget | None = None
@@ -277,6 +281,7 @@ class ConversationPane(QFrame):
         QShortcut(QKeySequence("Ctrl+Return"), self.input, activated=self._submit_or_cancel)
 
     def set_session(self, session: ResearchSession) -> None:
+        self._read_only = session.read_only
         self.set_interaction_context(None)
         self.title_label.setText(session.title)
         self.status_label.setText(STATUS_LABELS.get(session.status, session.status))
@@ -284,6 +289,7 @@ class ConversationPane(QFrame):
         for message in session.messages:
             self.render_message(message)
         self.scroll_to_bottom()
+        self._refresh_interaction_controls()
 
     def set_status(self, status: str) -> None:
         self.status_label.setText(STATUS_LABELS.get(status, status))
@@ -292,7 +298,6 @@ class ConversationPane(QFrame):
         self._running = running
         self.send_button.setText("停止" if running else "发送")
         self.send_button.setToolTip("停止当前分析" if running else "发送消息（Ctrl+Enter）")
-        self.input.setEnabled(not running)
         self._refresh_interaction_controls()
 
     def set_interaction_context(self, kind: str | None) -> None:
@@ -303,10 +308,13 @@ class ConversationPane(QFrame):
 
     def _refresh_interaction_controls(self) -> None:
         continue_research = self._interaction_kind == "result_limitations"
-        self.input.setPlaceholderText(
-            self.CONTINUE_RESEARCH_PLACEHOLDER if continue_research else self.DEFAULT_INPUT_PLACEHOLDER
-        )
-        self.end_research_button.setVisible(continue_research and not self._running)
+        placeholder = self.CONTINUE_RESEARCH_PLACEHOLDER if continue_research else self.DEFAULT_INPUT_PLACEHOLDER
+        if self._read_only:
+            placeholder = "历史会话仅供查看；请使用“新的研究”继续。"
+        self.input.setPlaceholderText(placeholder)
+        self.input.setEnabled(not self._running and not self._read_only)
+        self.send_button.setEnabled(not self._read_only)
+        self.end_research_button.setVisible(continue_research and not self._running and not self._read_only)
 
     def clear_messages(self) -> None:
         while self.timeline_layout.count() > 1:
@@ -344,6 +352,8 @@ class ConversationPane(QFrame):
             elif plan_state in {"completed", "failed", "stopped", "stale"}:
                 labels = {"completed": "已完成", "failed": "执行失败", "stopped": "已停止", "stale": "已作废"}
                 widget.set_finished(labels[plan_state])
+            if self._read_only:
+                widget.set_finished("历史记录")
             self.current_plan_widget = widget
         elif message.kind == "forecast_plan" and message.payload.get("plan"):
             plan = ForecastPlan.model_validate(message.payload["plan"])
@@ -361,11 +371,17 @@ class ConversationPane(QFrame):
                     "stale": "已作废",
                 }
                 widget.set_finished(labels[plan_state])
+            if self._read_only:
+                widget.set_finished("历史记录")
             self.current_plan_widget = widget
         elif message.kind == "result":
             widget = ResultMessageWidget.from_payload(message.payload)
         elif message.kind == "forecast_result":
             widget = ForecastResultMessageWidget(message.payload)
+        elif message.kind == "p2_review":
+            widget = P2ReviewMessageWidget(message.payload, read_only=self._read_only)
+            widget.open_requested.connect(self.p2_review_open_requested)
+            widget.continue_requested.connect(self.p2_revalidate_requested)
         else:
             widget = NoticeMessageWidget(message.content, error=message.kind == "error")
         self._add_timeline_widget(widget, user_aligned=message.role == "user")

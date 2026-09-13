@@ -48,6 +48,30 @@ def sanitized_build_path(path_value: str, *, windows_root: Path) -> str:
     return os.pathsep.join(retained)
 
 
+def runtime_env_for_rebuild(*, root: Path, output: Path) -> bytes | None:
+    """Preserve deployed credentials across PyInstaller's destructive output refresh.
+
+    An existing EXE-side file wins because an operator may have changed it after the
+    previous build.  A first local build is seeded from the worktree file.  Contents
+    stay opaque to the build log and are never embedded inside the executable.
+    """
+
+    deployed = output / ".env" if output.suffix.casefold() != ".exe" else output.parent / ".env"
+    source = deployed if deployed.is_file() else root / ".env"
+    return source.read_bytes() if source.is_file() else None
+
+
+def restore_runtime_env(*, output: Path, content: bytes | None) -> Path | None:
+    """Restore the external runtime file after a clean build without logging secrets."""
+
+    if content is None:
+        return None
+    target = output / ".env" if output.suffix.casefold() != ".exe" else output.parent / ".env"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    return target
+
+
 def validate_built_executable(executable: Path, *, build_root: Path) -> dict[str, object]:
     """Start the freshly built desktop and verify packaged production resources."""
 
@@ -85,11 +109,7 @@ def validate_built_executable(executable: Path, *, build_root: Path) -> dict[str
         if not result_path.is_file():
             raise SystemExit("Built EXE smoke test did not create its result file.")
         payload = json.loads(result_path.read_text(encoding="utf-8"))
-        skill_names = {
-            str(item.get("name"))
-            for item in payload.get("builtin_skills", [])
-            if isinstance(item, dict)
-        }
+        skill_names = {str(item.get("name")) for item in payload.get("builtin_skills", []) if isinstance(item, dict)}
         required = {"price-exogenous-eda", "price-forecastability-audit"}
         if payload.get("status") != "passed" or not required.issubset(skill_names):
             raise SystemExit(f"Built EXE smoke result is incomplete: {payload}")
@@ -100,6 +120,8 @@ def validate_built_executable(executable: Path, *, build_root: Path) -> dict[str
             raise SystemExit(f"Built EXE did not load the P3 CPU forecast runtime: {payload}")
         if not Path(str(payload.get("p2_news_path", ""))).is_file():
             raise SystemExit(f"Built EXE did not load the audited P2 news corpus: {payload}")
+        if payload.get("model_profile_count") != 3 or not Path(str(payload.get("model_profiles_path", ""))).is_file():
+            raise SystemExit(f"Built EXE did not load the builtin model profiles: {payload}")
         expected_app_data = (temporary / "app-data").resolve()
         expected_research = (temporary / "research").resolve()
         session_store = Path(str(payload.get("session_store_path", ""))).resolve()
@@ -119,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit('PyInstaller is not installed. Run: python -m pip install -e ".[build]"') from exc
 
     root = Path(__file__).resolve().parents[1]
+    output = root / "dist" / ("PriceResearchAgent.exe" if args.onefile else "PriceResearchAgent")
+    preserved_runtime_env = runtime_env_for_rebuild(root=root, output=output)
     sys.path.insert(0, str(root))
     from app.research.data.sources.naming import WORD_LIST_FILENAME
 
@@ -140,9 +164,7 @@ def main(argv: list[str] | None = None) -> int:
     builtin_skills = sorted(path for path in skill_root.iterdir() if (path / "SKILL.md").is_file())
     if not builtin_skills:
         raise SystemExit("No builtin Skill bundle was found to package.")
-    skill_args = [
-        f"--add-data={path};app/research/skills/{path.name}" for path in builtin_skills
-    ]
+    skill_args = [f"--add-data={path};app/research/skills/{path.name}" for path in builtin_skills]
     # The variable word list ships beside its loader so a packaged build resolves
     # it the same way a source checkout does.
     word_list = root / "configs" / WORD_LIST_FILENAME
@@ -157,6 +179,10 @@ def main(argv: list[str] | None = None) -> int:
     if not mcp_catalog.is_file():
         raise SystemExit(f"No MCP server catalog was found at {mcp_catalog}.")
     mcp_catalog_arg = f"--add-data={mcp_catalog};app/integrations/mcp"
+    model_profiles = root / "app" / "llm" / "model_profiles.json"
+    if not model_profiles.is_file():
+        raise SystemExit(f"No built-in model profile catalog was found at {model_profiles}.")
+    model_profiles_arg = f"--add-data={model_profiles};app/llm"
     p2_news = root / "data" / "news" / "shandong_p2_test_news.jsonl"
     p2_news_manifest = p2_news.with_suffix(".manifest.json")
     if not p2_news.is_file() or not p2_news_manifest.is_file():
@@ -198,28 +224,34 @@ def main(argv: list[str] | None = None) -> int:
                 # the lazily reached CPU runtime visible to PyInstaller.
                 "--hidden-import=torch",
                 "--hidden-import=sklearn.preprocessing",
-                "--collect-submodules=mcp",
+                # The desktop is an MCP client. Collecting the entire ``mcp``
+                # package also imports its optional CLI (and its unrelated
+                # ``typer`` dependency) during analysis.
+                "--collect-submodules=mcp.client",
+                "--collect-submodules=mcp.shared",
+                "--collect-submodules=mcp.types",
                 "--collect-submodules=mcp_types",
                 *skill_args,
                 word_list_arg,
                 region_catalog_arg,
                 mcp_catalog_arg,
+                model_profiles_arg,
                 *p2_news_args,
                 *exclude_args,
             ]
         )
     finally:
         os.environ["PATH"] = original_path
-    output = root / "dist" / ("PriceResearchAgent.exe" if args.onefile else "PriceResearchAgent")
+    restored_env = restore_runtime_env(output=output, content=preserved_runtime_env)
     external_skill_root = output.parent / "skills" if args.onefile else output / "skills"
     external_skill_root.mkdir(parents=True, exist_ok=True)
     shutil.copy2(root / "skills" / "README.md", external_skill_root / "README.md")
     executable = output if args.onefile else output / "PriceResearchAgent.exe"
     smoke = validate_built_executable(executable, build_root=root / "build")
     print(f"Build completed: {output}")
+    print("Runtime .env restored beside the executable." if restored_env else "Runtime .env was not present.")
     print(
-        "EXE smoke passed: "
-        f"{len(smoke['builtin_skills'])} builtin Skills, {smoke['function_count']} research functions"
+        f"EXE smoke passed: {len(smoke['builtin_skills'])} builtin Skills, {smoke['function_count']} research functions"
     )
     return 0
 

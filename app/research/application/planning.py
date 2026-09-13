@@ -77,13 +77,14 @@ def prepare_research_data(config: StudyConfig) -> PreparedResearchData:
     # Preserve it as an all-missing quality finding instead of rejecting the
     # whole price study; deterministic screening will keep it out of analysis.
     exogenous = [
-        load_series_from_frame(spec, frames[spec.path], **options, allow_empty=True)
-        for spec in config.exogenous
+        load_series_from_frame(spec, frames[spec.path], **options, allow_empty=True) for spec in config.exogenous
     ]
     return assemble_research_data(config, target, exogenous)
 
 
-def restore_prepared_data(fingerprint: str | None, config: StudyConfig) -> tuple[PreparedResearchData, MaterializedSnapshot] | None:
+def restore_prepared_data(
+    fingerprint: str | None, config: StudyConfig
+) -> tuple[PreparedResearchData, MaterializedSnapshot] | None:
     """Rebuild the analysis inputs from a frozen dataset, or return None if there is none."""
 
     restored = restore_dataset(fingerprint, config=config)
@@ -216,6 +217,7 @@ class EDAPlanningService:
             feedback=feedback,
             revision_context=revision_context,
             episode_memory=episode_memory,
+            data_fingerprint=current_data_fingerprint,
         )
         plan = plan.model_copy(update={"data_fingerprint": current_data_fingerprint})
         profile = _data_profile(prepared)

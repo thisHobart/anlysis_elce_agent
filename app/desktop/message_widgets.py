@@ -73,6 +73,56 @@ class NoticeMessageWidget(QFrame):
         layout.addWidget(label)
 
 
+class P2ReviewMessageWidget(QFrame):
+    """Persistent P2 gate card backed by an authoritative review-summary payload."""
+
+    open_requested = Signal()
+    continue_requested = Signal(str)
+
+    def __init__(self, payload: dict[str, Any], *, read_only: bool = False) -> None:
+        super().__init__()
+        self.setObjectName("p2ReviewMessage")
+        self.setMaximumWidth(680)
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+        title = QLabel("P2 新闻复核")
+        title.setObjectName("resultTitle")
+        layout.addWidget(title)
+        pending = int(payload.get("required_pending", 0))
+        resolved = int(payload.get("required_resolved", 0))
+        optional = int(payload.get("optional_unreviewed", 0))
+        summary = QLabel(f"必审未处理 {pending} 条 · 已处理 {resolved} 条 · 可选抽查 {optional} 条")
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+        failures = [str(item) for item in payload.get("quality_failures", [])]
+        quality = QLabel("确定性质量检查：" + ("通过" if not failures else "；".join(failures)))
+        quality.setWordWrap(True)
+        quality.setObjectName("errorNotice" if failures else "messageContent")
+        layout.addWidget(quality)
+        actions = QHBoxLayout()
+        active = payload.get("phase") == "p2_needs_review"
+        open_button = QPushButton("打开复核")
+        open_button.setEnabled(not read_only and active)
+        open_button.clicked.connect(self.open_requested)
+        actions.addWidget(open_button)
+        report_button = QPushButton("查看 P2 报告")
+        report_path = str(payload.get("report_path") or "")
+        report_button.setEnabled(bool(report_path))
+        report_button.clicked.connect(lambda: open_report(report_path))
+        actions.addWidget(report_button)
+        actions.addStretch(1)
+        continue_button = QPushButton("校验并继续")
+        continue_button.setObjectName("primaryButton")
+        continue_button.setEnabled(not read_only and active and pending == 0)
+        continue_button.clicked.connect(
+            lambda: self.continue_requested.emit(str(payload.get("revision") or ""))
+        )
+        actions.addWidget(continue_button)
+        layout.addLayout(actions)
+
+
 class ThinkingStepRow(QWidget):
     """One visible step of the Agent's working process."""
 

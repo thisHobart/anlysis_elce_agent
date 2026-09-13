@@ -17,7 +17,12 @@ from app.research.forecasting.contracts import (
     ForecastRunResult,
     ForecastSnapshotSpec,
 )
-from app.research.full_flow import FlowRunReference, FullFlowStore, FullResearchFlow
+from app.research.full_flow import (
+    FlowRunReference,
+    FullFlowStore,
+    FullResearchFlow,
+    P2ReviewDecision,
+)
 from app.research.news import (
     JsonlCollectedNewsAdapter,
     MarketClock,
@@ -26,6 +31,7 @@ from app.research.news import (
     load_price_csv,
     run_news_price_study,
 )
+from app.research.news.normalization import NewsNormalizer
 from app.research.news.workspace import NewsWorkspace
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "news_price"
@@ -159,6 +165,141 @@ def test_p2_workspace_handoff_and_p1_feature_decisions_are_persistent(tmp_path: 
     assert state.stage_attempts["p1_synthesis"] == 1
     assert any(item.decision == "selected" for item in state.feature_decisions)
     assert flow.store.load().runs[-1].parent_run_id == state.runs[-2].run_id
+
+
+def test_p2_review_service_uses_sqlite_versions_and_background_decisions(tmp_path: Path):
+    moment = datetime(2026, 9, 13, tzinfo=UTC)
+    report = _touch(tmp_path / "p1" / "report.md")
+    flow = FullResearchFlow(
+        store=FullFlowStore(tmp_path / "flow.json"),
+        output_directory=tmp_path / "runs",
+    )
+    state = flow.start(
+        p1_run=FlowRunReference(
+            run_kind="eda",
+            run_id="p1-review",
+            artifact_directory=report.parent,
+            report_path=report,
+        ),
+        eda_summary={
+            "price": {
+                "start_time": moment.isoformat(),
+                "end_time": moment.isoformat(),
+                "distribution": {},
+            }
+        },
+        information_cutoff=moment,
+    )
+    record = JsonlCollectedNewsAdapter(FIXTURES / "synthetic_news.jsonl").load()[0]
+    document = NewsNormalizer().normalize(record)
+    result = ObviousNewsEventExtractor(market_timezone="UTC").extract(document)
+    imprecise = result.events[0].model_copy(
+        update={
+            "effective_start_at": None,
+            "effective_end_at": None,
+            "analysis_eligibility": "needs_time_review",
+        }
+    )
+    result = result.model_copy(update={"events": (imprecise,)})
+    workspace = NewsWorkspace(flow.output_directory / state.flow_id / "p2")
+    workspace.cache_result("review-key", document, result)
+    package = workspace.directory / "runs" / "p2-review"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
+        json.dumps(
+            {
+                "result_quality": {
+                    "checks": [{"code": "price_grid_and_values", "passed": True, "detail": "通过"}]
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    news_report = _touch(package / "report.md")
+    blocked = flow.store.save(
+        state.model_copy(
+            update={
+                "phase": "p2_needs_review",
+                "runs": (
+                    *state.runs,
+                    FlowRunReference(
+                        run_kind="news",
+                        run_id="p2-review",
+                        parent_run_id=state.runs[-1].run_id,
+                        artifact_directory=package,
+                        report_path=news_report,
+                    ),
+                ),
+                "stop_reason": "P2存在未解决复核项",
+            }
+        )
+    )
+    summary = flow.get_p2_review_summary(blocked.flow_id)
+    assert summary.required_pending == 1
+    assert summary.optional_unreviewed == 0
+    assert summary.items[0].allows_background_only
+    with pytest.raises(ValueError, match="仅作背景"):
+        flow.submit_p2_review(
+            P2ReviewDecision(
+                flow_id=blocked.flow_id,
+                cache_key="review-key",
+                expected_revision=summary.items[0].revision,
+                decision="accepted",
+                reviewer="tester",
+                reason="时间只有日期",
+                request_id="request-analysis",
+            )
+        )
+    command = P2ReviewDecision(
+        flow_id=blocked.flow_id,
+        cache_key="review-key",
+        expected_revision=summary.items[0].revision,
+        decision="accepted",
+        use="background_only",
+        reviewer="tester",
+        reason="事实与证据可信，但时间无法精确到事件窗口",
+        request_id="request-background",
+    )
+    reviewed = flow.submit_p2_review(command)
+    duplicate = flow.submit_p2_review(command)
+    assert reviewed.required_pending == duplicate.required_pending == 0
+    assert reviewed.required_resolved == 1
+    with workspace.connect() as database:
+        assert database.execute("SELECT COUNT(*) FROM reviews").fetchone()[0] == 1
+        stored = database.execute("SELECT usage, request_id FROM reviews").fetchone()
+    assert stored == ("background_only", "request-background")
+    review_document = NewsNormalizer().normalize(workspace.review_records()[0])
+    reviewed_result = workspace.reviewed_result(review_document)
+    assert all(event.analysis_eligibility == "background_only" for event in reviewed_result.events)
+
+
+def test_p2_review_rejects_stale_item_revision(tmp_path: Path):
+    workspace = NewsWorkspace(tmp_path)
+    record = JsonlCollectedNewsAdapter(FIXTURES / "synthetic_news.jsonl").load()[0]
+    document = NewsNormalizer().normalize(record)
+    result = ObviousNewsEventExtractor(market_timezone="UTC").extract(document)
+    workspace.cache_result("stale-key", document, result)
+    revision = workspace.review_revision("stale-key")
+    workspace.review(
+        "stale-key",
+        decision="accepted",
+        reviewer="first",
+        reason="证据有效",
+        market_timezone="UTC",
+        expected_revision=revision,
+        request_id="first-request",
+    )
+    with pytest.raises(ValueError, match="刷新窗口"):
+        workspace.review(
+            "stale-key",
+            decision="accepted",
+            reviewer="second",
+            reason="旧窗口重复覆盖",
+            market_timezone="UTC",
+            expected_revision=revision,
+            request_id="second-request",
+        )
 
 
 def test_v1_flow_state_is_migrated_with_a_durable_cursor(tmp_path: Path):

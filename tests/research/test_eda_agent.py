@@ -12,16 +12,11 @@ import pandas as pd
 import pytest
 
 from app.config import Settings
-from app.llm.gateway import ModelGatewayError, ModelToolCall
+from app.llm.gateway import ModelGatewayError, ModelOutputTruncatedError
 from app.research.agent.errors import ResearchModelUnavailableError, ResearchPlanValidationError
 from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent, ModelResearchDialogue
 from app.research.agent.schemas import ConversationMessage
-from app.research.agent.subagents.eda import (
-    AGENDA_FUNCTION_NAME,
-    EDASubagent,
-    ModelEDAPlanner,
-    max_lag_limit,
-)
+from app.research.agent.subagents.eda import EDASubagent, ModelEDAPlanner, max_lag_limit
 from app.research.application.coordinator import ResearchCoordinator
 from app.research.application.execution import EDAExecutionService
 from app.research.application.planning import prepare_research_data
@@ -29,9 +24,9 @@ from app.research.data.loader import ResearchDataError
 from app.research.data.snapshot import input_file_manifest, study_fingerprint
 from app.research.data.sources.materialize import snapshot_root
 from app.research.evaluation.eda import evaluate_agent_run
+from app.research.planning.contracts import EDAPlanDraft
 from app.research.schemas.results import QualityIssue
 from app.research.schemas.study import load_study_config
-from app.research.tools.catalog import FUNCTION_CATALOG
 
 
 class ScriptedModelPlanner:
@@ -203,9 +198,7 @@ def test_research_coordinator_uses_the_active_langgraph_workflow():
         "finalize_iteration",
         "user_interrupt",
         "reply",
-    }.issubset(
-        agent.workflow.get_graph().nodes
-    )
+    }.issubset(agent.workflow.get_graph().nodes)
 
 
 def test_default_agent_roles_share_one_model_gateway():
@@ -254,9 +247,7 @@ def test_model_call_failure_stops_without_local_dialogue_fallback():
             raise ModelGatewayError("simulated provider outage")
 
     agent = ResearchCoordinator(
-        main_agent=MainResearchAgent(
-            model_dialogue=ModelResearchDialogue(gateway=FailingGateway())
-        ),
+        main_agent=MainResearchAgent(model_dialogue=ModelResearchDialogue(gateway=FailingGateway())),
         eda_subagent=EDASubagent(model_planner=ScriptedModelPlanner()),
     )
 
@@ -295,10 +286,14 @@ def test_model_recommends_different_processes_for_different_questions(synthetic_
 
 
 def test_model_selects_only_requested_price_methods(synthetic_study: Path):
-    plan = _model_agent().propose(
-        question="只分析电价季节性和尖峰",
-        config_path=synthetic_study,
-    ).plan
+    plan = (
+        _model_agent()
+        .propose(
+            question="只分析电价季节性和尖峰",
+            config_path=synthetic_study,
+        )
+        .plan
+    )
     assert [step.function for step in plan.enabled_steps] == [
         "data_quality",
         "price_tukey_outer_fence",
@@ -308,27 +303,33 @@ def test_model_selects_only_requested_price_methods(synthetic_study: Path):
 
 
 def test_legacy_implementation_ids_migrate_to_atomic_functions(synthetic_study: Path):
-    planner = ModelEDAPlanner(
-        gateway=FakeModelGateway(
-            {
-                "objective": "兼容旧模型输出",
-                "selected_variables": [],
-                "steps": [
-                    {
-                        "tool": "price_profile",
-                        "enabled": True,
-                        "rationale": "旧模型错误地返回实现 ID。",
-                        "parameters": {
-                            "methods": [
-                                "price.descriptive_distribution",
-                                "price.calendar_group_profile",
-                            ]
-                        },
-                    }
-                ],
-            }
-        )
-    )
+    class LegacyDraftPlanner:
+        enabled = True
+        model_name = "legacy-draft-model"
+
+        def propose(self, *args, **kwargs):
+            del args, kwargs
+            return EDAPlanDraft.model_validate(
+                {
+                    "objective": "兼容旧模型输出",
+                    "selected_variables": [],
+                    "steps": [
+                        {
+                            "tool": "price_profile",
+                            "enabled": True,
+                            "rationale": "旧模型错误地返回实现 ID。",
+                            "parameters": {
+                                "methods": [
+                                    "price.descriptive_distribution",
+                                    "price.calendar_group_profile",
+                                ]
+                            },
+                        }
+                    ],
+                }
+            )
+
+    planner = LegacyDraftPlanner()
     coordinator = ResearchCoordinator(
         eda_subagent=EDASubagent(model_planner=planner),
         main_agent=MainResearchAgent(model_dialogue=ScriptedModelDialogue()),
@@ -344,23 +345,31 @@ def test_legacy_implementation_ids_migrate_to_atomic_functions(synthetic_study: 
     assert all("methods" not in step.parameters for step in plan.steps)
 
 
-def test_native_tool_calls_compile_into_an_approval_plan(synthetic_study: Path):
-    class NativeToolGateway:
+def test_compact_intent_compiles_into_an_approval_plan(synthetic_study: Path):
+    class CompactIntentGateway:
         enabled = True
-        model_name = "native-tool-model"
+        model_name = "compact-intent-model"
 
         def __init__(self):
-            self.tools = []
+            self.schemas = []
+            self.messages = []
 
-        def invoke_tool_calls(self, *, messages, tools):
-            del messages
-            self.tools = tools
-            return [
-                ModelToolCall(name="price_descriptive_distribution", arguments={}),
-                ModelToolCall(name="price_lag_autocorrelation", arguments={"max_lag": 2}),
-            ]
+        def invoke_structured(self, *, messages, schema, purpose=None):
+            self.schemas.append(schema)
+            self.messages.append(messages)
+            return schema.model_validate(
+                {
+                    "objective": "分析电价分布和自相关",
+                    "variable_selection_mode": "explicit",
+                    "selected_variable_ids": [],
+                    "functions": [
+                        {"function": "price_descriptive_distribution"},
+                        {"function": "price_lag_autocorrelation", "max_lag": 2},
+                    ],
+                }
+            )
 
-    gateway = NativeToolGateway()
+    gateway = CompactIntentGateway()
     coordinator = ResearchCoordinator(
         eda_subagent=EDASubagent(model_planner=ModelEDAPlanner(gateway=gateway)),
         main_agent=MainResearchAgent(model_dialogue=ScriptedModelDialogue()),
@@ -375,90 +384,53 @@ def test_native_tool_calls_compile_into_an_approval_plan(synthetic_study: Path):
     ]
     assert "电价可能存在自相关或持续性。" in plan.hypotheses
     assert next(step for step in plan.steps if step.function == "price_lag_autocorrelation").parameters["max_lag"] == 2
-    exposed_names = {tool["function"]["name"] for tool in gateway.tools}
-    assert "price_lag_autocorrelation" in exposed_names
-    assert all("methods" not in tool["function"]["parameters"].get("properties", {}) for tool in gateway.tools)
+    assert gateway.schemas[0].__name__ == "EDAPlanIntent"
+    payload = json.loads(gateway.messages[0][-1].content)
+    assert len(payload["allowed_functions"]) == 29
+    assert payload["variables"][0]["id"] == "v1"
+    assert payload["data_fingerprint"] == plan.data_fingerprint
 
 
-class _AgendaGateway:
-    """Model double that answers with an agenda declaration plus the calls it was given."""
-
-    enabled = True
-    model_name = "agenda-tool-model"
-
-    def __init__(self, calls, agenda_arguments):
-        self._calls = calls
-        self._agenda_arguments = agenda_arguments
-        self.tools: list = []
-
-    def invoke_tool_calls(self, *, messages, tools):
-        del messages
-        self.tools = tools
-        return [
-            ModelToolCall(name=AGENDA_FUNCTION_NAME, arguments=self._agenda_arguments),
-            *self._calls,
-        ]
-
-
-class _AgendaThenFunctionsGateway:
-    """Reproduce a model that needs the executable tool set narrowed once."""
+class _CompactIntentGateway:
+    """Return one bounded intent and retain every attempted schema."""
 
     enabled = True
-    model_name = "agenda-repair-model"
+    model_name = "compact-intent-model"
 
-    def __init__(self) -> None:
-        self.offered_tool_names: list[list[str]] = []
+    def __init__(self, payload, *, truncate_first: bool = False):
+        self.payload = payload
+        self.truncate_first = truncate_first
+        self.schemas: list = []
+        self.messages: list = []
 
-    def invoke_tool_calls(self, *, messages, tools):
-        del messages
-        names = [tool["function"]["name"] for tool in tools]
-        self.offered_tool_names.append(names)
-        if AGENDA_FUNCTION_NAME in names:
-            return [
-                ModelToolCall(
-                    name=AGENDA_FUNCTION_NAME,
-                    arguments={
-                        "objective": "判定 load、wind 与电价的同期和领先滞后关系",
-                        "hypotheses": [
-                            "load、wind 与电价可能存在同期关系。",
-                            "load、wind 可能存在领先滞后关系。",
-                        ],
-                        "variable_selection_mode": "explicit",
-                    },
-                )
-            ]
-        return [
-            ModelToolCall(
-                name="relationship_scipy_pearson_pairwise",
-                arguments={"variables": ["load", "wind"]},
-            ),
-            ModelToolCall(
-                name="relationship_pearson_positive_lead_scan",
-                arguments={"variables": ["load", "wind"], "max_lag": 48},
-            ),
-        ]
+    def invoke_structured(self, *, messages, schema, purpose=None):
+        del purpose
+        self.schemas.append(schema)
+        self.messages.append(messages)
+        if self.truncate_first and len(self.schemas) == 1:
+            raise ModelOutputTruncatedError("length")
+        return schema.model_validate(self.payload)
 
 
-def _agenda_coordinator(gateway) -> ResearchCoordinator:
+def _intent_coordinator(gateway) -> ResearchCoordinator:
     return ResearchCoordinator(
         eda_subagent=EDASubagent(model_planner=ModelEDAPlanner(gateway=gateway)),
         main_agent=MainResearchAgent(model_dialogue=ScriptedModelDialogue()),
     )
 
 
-def test_the_model_declares_the_agenda_alongside_its_function_calls(synthetic_study: Path):
-    gateway = _AgendaGateway(
-        [ModelToolCall(name="price_descriptive_distribution", arguments={})],
+def test_compact_intent_carries_the_agenda_without_pseudo_tool(synthetic_study: Path):
+    gateway = _CompactIntentGateway(
         {
             "objective": "判定电价分布是否需要方差稳定预处理",
             "hypotheses": ["电价分布可能明显偏斜或存在厚尾。"],
             "assumptions": ["目标序列时区已按自动识别的数据上下文对齐。"],
+            "variable_selection_mode": "explicit",
+            "functions": [{"function": "price_descriptive_distribution"}],
         },
     )
 
-    plan = _agenda_coordinator(gateway).propose(
-        question="电价分布长什么样", config_path=synthetic_study
-    ).plan
+    plan = _intent_coordinator(gateway).propose(question="电价分布长什么样", config_path=synthetic_study).plan
 
     assert plan.objective == "判定电价分布是否需要方差稳定预处理"
     assert "电价分布可能明显偏斜或存在厚尾。" in plan.hypotheses
@@ -468,138 +440,108 @@ def test_the_model_declares_the_agenda_alongside_its_function_calls(synthetic_st
         "price_descriptive_distribution",
     ]
 
-    # The agenda call is offered to the model but is not a registered research function.
-    assert AGENDA_FUNCTION_NAME in {tool["function"]["name"] for tool in gateway.tools}
-    assert AGENDA_FUNCTION_NAME not in FUNCTION_CATALOG
-    assert AGENDA_FUNCTION_NAME not in {step.function for step in plan.steps}
+    assert gateway.schemas[0].__name__ == "EDAPlanIntent"
+    assert "declare_research_agenda" not in gateway.messages[0][0].content
 
 
-def test_an_agenda_only_answer_produces_the_data_quality_only_plan(synthetic_study: Path):
-    gateway = _AgendaGateway([], {"objective": "先确认这批数据能不能用", "hypotheses": []})
+def test_empty_compact_function_list_produces_data_quality_only_plan(synthetic_study: Path):
+    gateway = _CompactIntentGateway(
+        {"objective": "先确认这批数据能不能用", "variable_selection_mode": "explicit", "functions": []}
+    )
 
-    plan = _agenda_coordinator(gateway).propose(
-        question="先看看数据质量", config_path=synthetic_study
-    ).plan
+    plan = _intent_coordinator(gateway).propose(question="先看看数据质量", config_path=synthetic_study).plan
 
     assert [step.function for step in plan.enabled_steps] == ["data_quality"]
     assert plan.objective == "先确认这批数据能不能用"
     assert plan.hypotheses == []
 
 
-def test_an_agenda_only_analysis_answer_is_repaired_with_executable_tools(
-    synthetic_study: Path,
-):
-    gateway = _AgendaThenFunctionsGateway()
+def test_truncated_plan_retries_once_with_minimal_schema(synthetic_study: Path):
+    gateway = _CompactIntentGateway(
+        {
+            "variable_selection_mode": "explicit",
+            "selected_variable_ids": ["v1", "v2"],
+            "functions": [
+                {"function": "relationship_scipy_pearson_pairwise"},
+                {"function": "relationship_pearson_positive_lead_scan", "max_lag": 48},
+            ],
+        },
+        truncate_first=True,
+    )
 
-    plan = _agenda_coordinator(gateway).propose(
-        question="分析 load、wind 与实时电价的同期和领先滞后关系",
-        config_path=synthetic_study,
-    ).plan
+    plan = (
+        _intent_coordinator(gateway)
+        .propose(
+            question="分析 load、wind 与实时电价的同期和领先滞后关系",
+            config_path=synthetic_study,
+        )
+        .plan
+    )
 
     assert [step.function for step in plan.enabled_steps] == [
         "data_quality",
         "relationship_scipy_pearson_pairwise",
         "relationship_pearson_positive_lead_scan",
     ]
-    assert len(gateway.offered_tool_names) == 2
-    assert AGENDA_FUNCTION_NAME in gateway.offered_tool_names[0]
-    assert AGENDA_FUNCTION_NAME not in gateway.offered_tool_names[1]
+    assert [schema.__name__ for schema in gateway.schemas] == [
+        "EDAPlanIntent",
+        "MinimalEDAPlanIntent",
+    ]
+    assert plan.objective == "分析 load、wind 与实时电价的同期和领先滞后关系"
+    recovery_payload = json.loads(gateway.messages[1][-1].content)
+    assert "conversation_history" not in recovery_payload
+    assert "quality_issues" not in recovery_payload
 
 
-def test_agenda_cannot_name_analysis_functions_without_calling_them(synthetic_study: Path):
-    gateway = _AgendaGateway(
-        [],
+def test_non_quality_analysis_requires_a_function(synthetic_study: Path):
+    gateway = _CompactIntentGateway(
         {
             "objective": "分析电价周期结构",
-            "hypotheses": [
-                "电价存在日内结构；由 price_calendar_group_profile 与 price_seasonal_decomposition 判定。"
-            ],
+            "variable_selection_mode": "explicit",
+            "functions": [],
         },
     )
 
-    with pytest.raises(ResearchPlanValidationError, match="议程引用了未选择的研究函数"):
-        _agenda_coordinator(gateway).propose(question="分析电价周期结构", config_path=synthetic_study)
+    with pytest.raises(ResearchPlanValidationError, match="至少需要选择一个"):
+        _intent_coordinator(gateway).propose(question="分析电价周期结构", config_path=synthetic_study)
 
 
-def test_agenda_hypotheses_require_at_least_one_analysis_function(synthetic_study: Path):
-    gateway = _AgendaGateway(
-        [],
-        {
-            "objective": "分析电价周期结构",
-            "hypotheses": ["电价可能存在显著的日内与月份周期结构。"],
-        },
-    )
-
-    with pytest.raises(ResearchPlanValidationError, match="没有选择任何研究函数"):
-        _agenda_coordinator(gateway).propose(question="分析电价周期结构", config_path=synthetic_study)
-
-
-def test_agenda_auto_recommend_compiles_all_eligible_variables_into_a_screening_plan(
+def test_compact_auto_recommend_compiles_all_eligible_variables_into_a_screening_plan(
     synthetic_study: Path,
 ):
-    gateway = _AgendaGateway(
-        [
-            ModelToolCall(
-                name="relationship_pearson_by_hour",
-                arguments={"variables": ["load"]},
-            )
-        ],
+    gateway = _CompactIntentGateway(
         {
             "objective": "筛查值得深入研究的外生变量",
             "hypotheses": [],
             "variable_selection_mode": "auto_recommend",
+            "functions": [{"function": "relationship_pearson_by_hour"}],
         },
     )
 
-    plan = _agenda_coordinator(gateway).propose(
-        question="我不知道选什么外生变量，请先推荐",
-        config_path=synthetic_study,
-    ).plan
+    plan = (
+        _intent_coordinator(gateway)
+        .propose(
+            question="我不知道选什么外生变量，请先推荐",
+            config_path=synthetic_study,
+        )
+        .plan
+    )
 
     assert plan.variable_selection_stage == "screening"
     assert plan.selected_variables == ["load", "wind", "temperature"]
     assert plan.deferred_functions == ["relationship_pearson_by_hour"]
-    assert "relationship_scipy_pearson_pairwise" in {
-        step.function for step in plan.enabled_steps
-    }
-
-
-def test_a_model_that_skips_the_agenda_still_yields_a_usable_plan(synthetic_study: Path):
-    class SilentAgendaGateway(_AgendaGateway):
-        def invoke_tool_calls(self, *, messages, tools):
-            del messages
-            self.tools = tools
-            return list(self._calls)
-
-    gateway = SilentAgendaGateway(
-        [ModelToolCall(name="price_descriptive_distribution", arguments={})], {}
-    )
-
-    plan = _agenda_coordinator(gateway).propose(
-        question="电价分布长什么样", config_path=synthetic_study
-    ).plan
-
-    assert plan.objective == "电价分布长什么样"
-    assert "电价分布可能明显偏斜或存在厚尾。" in plan.hypotheses
+    assert "relationship_scipy_pearson_pairwise" in {step.function for step in plan.enabled_steps}
 
 
 def test_invalid_model_plan_is_rejected_without_local_repair(synthetic_study: Path):
     model_planner = ModelEDAPlanner(
         gateway=FakeModelGateway(
-        {
-            "objective": "验证负荷与电价的同期关系",
-            "hypotheses": [],
-            "selected_variables": ["not_a_real_variable"],
-            "steps": [
-                {
-                    "function": "relationship_scipy_pearson_pairwise",
-                    "enabled": True,
-                    "rationale": "问题聚焦同期关系。",
-                    "parameters": {"variables": ["not_a_real_variable"]},
-                }
-            ],
-            "assumptions": [],
-        }
+            {
+                "objective": "验证负荷与电价的同期关系",
+                "variable_selection_mode": "explicit",
+                "selected_variable_ids": ["v99"],
+                "functions": [{"function": "relationship_scipy_pearson_pairwise"}],
+            }
         )
     )
     agent = ResearchCoordinator(
@@ -658,13 +600,10 @@ def test_model_revision_controls_the_executable_plan(synthetic_study: Path, tmp_
         {path.name for path in (result.artifact_directory / "provenance").iterdir()}
     )
     manifest = json.loads((result.artifact_directory / "manifest.json").read_text(encoding="utf-8"))
-    trace = json.loads(
-        (result.artifact_directory / "provenance" / "execution_trace.json").read_text(encoding="utf-8")
-    )
+    trace = json.loads((result.artifact_directory / "provenance" / "execution_trace.json").read_text(encoding="utf-8"))
     assert all(item["started_at"] and item["finished_at"] for item in trace)
     assert all(
-        datetime.fromisoformat(item["started_at"]) <= datetime.fromisoformat(item["finished_at"])
-        for item in trace
+        datetime.fromisoformat(item["started_at"]) <= datetime.fromisoformat(item["finished_at"]) for item in trace
     )
     assert manifest["research_agent"]["planning_model"] == "scripted-test-model"
     assert manifest["research_agent"]["skill"] == {"name": "price-exogenous-eda", "version": "3.2.1"}
@@ -673,9 +612,7 @@ def test_model_revision_controls_the_executable_plan(synthetic_study: Path, tmp_
         "version": "2.2.1",
         "function_order": revised.research_protocol_function_order,
     }
-    assert manifest["research_agent"]["function_versions"] == {
-        step.function: "1.0.0" for step in revised.enabled_steps
-    }
+    assert manifest["research_agent"]["function_versions"] == {step.function: "1.0.0" for step in revised.enabled_steps}
     for output in manifest["outputs"]:
         path = result.artifact_directory / output["path"]
         assert hashlib.sha256(path.read_bytes()).hexdigest() == output["sha256"]
@@ -802,9 +739,7 @@ def _price_only_plan(study: Path, hypotheses: list[str]):
     return agent, plan.model_copy(update={"hypotheses": hypotheses})
 
 
-def test_the_real_evaluator_can_ask_for_an_in_envelope_revision(
-    synthetic_study: Path, tmp_path: Path
-):
+def test_the_real_evaluator_can_ask_for_an_in_envelope_revision(synthetic_study: Path, tmp_path: Path):
     """A lag scan that outruns its pairs is repairable inside the approved envelope."""
 
     from app.research.graph.guards import authorization_envelope, validate_automatic_revision
@@ -834,9 +769,7 @@ def test_the_real_evaluator_can_ask_for_an_in_envelope_revision(
         model_name="regression",
         prompt_version="regression",
     )
-    plan = plan.model_copy(
-        update={"data_fingerprint": study_fingerprint(config, input_file_manifest(config))}
-    )
+    plan = plan.model_copy(update={"data_fingerprint": study_fingerprint(config, input_file_manifest(config))})
     result = EDAExecutionService().execute(
         plan=plan,
         study_config=config,
@@ -847,9 +780,7 @@ def test_the_real_evaluator_can_ask_for_an_in_envelope_revision(
     check = next(item for item in result.evaluation.checks if item.name == "滞后扫描样本")
     assert check.scope == "within_envelope"
     assert result.evaluation.decision == "revise"
-    packet = next(
-        item for item in result.evaluation.feedback_packets if "滞后扫描" in item.message
-    )
+    packet = next(item for item in result.evaluation.feedback_packets if "滞后扫描" in item.message)
     assert packet.retryable and not packet.requires_user
 
     # The remediation it asks for is genuinely inside the approved envelope.
@@ -884,9 +815,7 @@ def test_a_variable_without_any_usable_correlation_is_flagged_for_removal():
     assert _variables_without_relationship_evidence(relationships) == ["flat"]
 
 
-def test_a_hypothesis_no_rule_can_settle_blocks_instead_of_vanishing(
-    synthetic_study: Path, tmp_path: Path
-):
+def test_a_hypothesis_no_rule_can_settle_blocks_instead_of_vanishing(synthetic_study: Path, tmp_path: Path):
     agent, plan = _price_only_plan(synthetic_study, ["碳配额成本可能传导到批发市场。"])
     result = agent.execute(
         plan=plan,
@@ -901,15 +830,11 @@ def test_a_hypothesis_no_rule_can_settle_blocks_instead_of_vanishing(
     assert assessment.remediation
     assert result.evaluation.decision == "need_user"
     assert "改写" in result.evaluation.summary
-    packet = next(
-        item for item in result.evaluation.feedback_packets if "碳配额" in item.message
-    )
+    packet = next(item for item in result.evaluation.feedback_packets if "碳配额" in item.message)
     assert packet.requires_user and not packet.retryable
 
 
-def test_inconclusive_stationarity_is_not_filed_as_a_method_limitation(
-    synthetic_study: Path, tmp_path: Path
-):
+def test_inconclusive_stationarity_is_not_filed_as_a_method_limitation(synthetic_study: Path, tmp_path: Path):
     agent, plan = _price_only_plan(synthetic_study, ["电价可能存在单位根，建模前需要差分。"])
     result = agent.execute(
         plan=plan,
@@ -943,9 +868,7 @@ def test_calendar_evidence_settles_its_own_agenda_item(synthetic_study: Path, tm
         run_id="agenda-calendar",
     )
 
-    assessment = next(
-        item for item in result.evaluation.hypothesis_assessments if "季节" in item.hypothesis
-    )
+    assessment = next(item for item in result.evaluation.hypothesis_assessments if "季节" in item.hypothesis)
     assert assessment.status in {"candidate_support", "not_supported"}
     # Wording is reviewed separately; what matters here is that the calendar item is
     # settled by its own grouped evidence rather than by another item's numbers.

@@ -8,6 +8,9 @@ from pathlib import Path
 
 APP_DIRECTORY_NAME = "PriceResearchAgent"
 DEFAULT_P2_NEWS_FILENAME = "shandong_p2_test_news.jsonl"
+APPLICATION_SETTINGS_FILENAME = "settings.json"
+MODEL_PROFILES_FILENAME = "model_profiles.json"
+MODEL_CALL_AUDIT_FILENAME = "model-calls.jsonl"
 
 
 def application_data_directory() -> Path:
@@ -33,6 +36,24 @@ def default_research_output_directory() -> Path:
         return Path(configured).expanduser().resolve()
     documents = Path.home() / "Documents"
     return (documents / APP_DIRECTORY_NAME / "research").resolve()
+
+
+def application_settings_path() -> Path:
+    """Return the per-user runtime-policy file outside the source tree."""
+
+    return application_data_directory() / APPLICATION_SETTINGS_FILENAME
+
+
+def user_model_profiles_path() -> Path:
+    """Return the writable per-user model-capability catalog."""
+
+    return application_data_directory() / MODEL_PROFILES_FILENAME
+
+
+def model_call_audit_path() -> Path:
+    """Return the append-only, prompt-free model-call audit log."""
+
+    return application_data_directory() / MODEL_CALL_AUDIT_FILENAME
 
 
 def source_worktree() -> Path | None:

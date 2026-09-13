@@ -20,6 +20,9 @@ from app.research.full_flow.contracts import (
     ForecastFeedback,
     FullFlowState,
     P2ResearchRequest,
+    P2ReviewDecision,
+    P2ReviewItem,
+    P2ReviewSummary,
     synchronize_flow_lifecycle,
 )
 from app.research.news import (
@@ -180,6 +183,167 @@ class FullResearchFlow:
         attempts = dict(state.stage_attempts)
         attempts[stage] = attempts.get(stage, 0) + 1
         return self.store.save(state.model_copy(update={"stage_attempts": attempts}))
+
+    def _load_state_for_flow(self, flow_id: str) -> FullFlowState:
+        state = self.store.load()
+        if state.flow_id != flow_id:
+            raise ValueError("复核命令不属于当前全流程；请刷新会话")
+        return state
+
+    @staticmethod
+    def _review_blocking_reasons(result: dict[str, Any]) -> tuple[str, ...]:
+        reasons: list[str] = []
+        quarantine = result.get("quarantine")
+        if isinstance(quarantine, dict):
+            reasons.append(str(quarantine.get("message") or quarantine.get("reason_code") or "抽取结果被隔离"))
+        for candidate in result.get("candidate_quarantines") or ():
+            if isinstance(candidate, dict):
+                reasons.append(
+                    str(candidate.get("message") or candidate.get("reason_code") or "候选事件存在抽取分歧")
+                )
+        for event in result.get("events") or ():
+            if not isinstance(event, dict):
+                continue
+            eligibility = event.get("analysis_eligibility")
+            if event.get("relevance") == "short_term" and not event.get("effective_start_at"):
+                reasons.append("短期事件缺少可用于事件分析的精确生效时间")
+            elif eligibility == "needs_coverage_review":
+                reasons.append("新闻覆盖范围不完整，不能直接用于分析")
+        return tuple(dict.fromkeys(reasons))
+
+    def get_p2_review_summary(self, flow_id: str) -> P2ReviewSummary:
+        """Project the authoritative SQLite review state for desktop and command routing."""
+
+        state = self._load_state_for_flow(flow_id)
+        workspace = NewsWorkspace(self.output_directory / state.flow_id / "p2")
+        items: list[P2ReviewItem] = []
+        required_pending = 0
+        required_resolved = 0
+        optional_unreviewed = 0
+        for entry in workspace.review_queue():
+            original = dict(entry["original_result"])
+            displayed = dict(entry["reviewed_result"] or original)
+            if not displayed.get("pass_results") and original.get("pass_results"):
+                displayed["pass_results"] = original["pass_results"]
+            blocking = self._review_blocking_reasons(original)
+            status = str(entry["decision"] or "unreviewed")
+            required = bool(blocking)
+            if required and status == "unreviewed":
+                required_pending += 1
+            elif required:
+                required_resolved += 1
+            elif status == "unreviewed":
+                optional_unreviewed += 1
+            allows_background = bool(original.get("events")) and not original.get("quarantine") and not (
+                original.get("candidate_quarantines") or ()
+            ) and all(
+                isinstance(event, dict)
+                and event.get("analysis_eligibility") in {"eligible", "needs_time_review"}
+                for event in original.get("events") or ()
+            ) and any(
+                isinstance(event, dict) and event.get("analysis_eligibility") == "needs_time_review"
+                for event in original.get("events") or ()
+            )
+            document = dict(entry["document"])
+            items.append(
+                P2ReviewItem(
+                    cache_key=str(entry["cache_key"]),
+                    document_version_id=str(entry["document_version_id"]),
+                    revision=str(entry["revision"]),
+                    title=str(document.get("title") or entry["document_version_id"]),
+                    source_name=str(document.get("source_name") or "未知来源"),
+                    source_ref=str(document.get("source_ref") or ""),
+                    body=str(document.get("body") or ""),
+                    result=displayed,
+                    blocking_reasons=blocking,
+                    review_status=status,
+                    review_use=(str(entry["usage"]) if entry["review_id"] is not None else None),
+                    reviewer=(str(entry["reviewer"]) if entry["reviewer"] else None),
+                    review_reason=(str(entry["reason"]) if entry["reason"] else None),
+                    required=required,
+                    allows_background_only=allows_background,
+                )
+            )
+        news_run = next((run for run in reversed(state.runs) if run.run_kind == "news"), None)
+        quality_failures: list[str] = []
+        if news_run is not None:
+            package_path = news_run.artifact_directory / "package.json"
+            try:
+                package = json.loads(package_path.read_text(encoding="utf-8"))
+                checks = (package.get("result_quality") or {}).get("checks") or ()
+                quality_failures = [
+                    f"{check.get('code', 'quality')}: {check.get('detail', '质量检查未通过')}"
+                    for check in checks
+                    if isinstance(check, dict) and not check.get("passed")
+                ]
+            except (OSError, ValueError):
+                quality_failures = ["quality_artifact: P2质量检查产物不可读取"]
+        revision = _fingerprint(
+            {
+                "flow_id": state.flow_id,
+                "phase": state.phase,
+                "items": [(item.cache_key, item.revision) for item in items],
+                "quality_failures": quality_failures,
+            }
+        )
+        return P2ReviewSummary(
+            flow_id=state.flow_id,
+            phase=state.phase,
+            revision=revision,
+            items=tuple(items),
+            required_pending=required_pending,
+            required_resolved=required_resolved,
+            optional_unreviewed=optional_unreviewed,
+            quality_failures=tuple(quality_failures),
+            report_path=news_run.report_path if news_run else None,
+        )
+
+    def submit_p2_review(self, command: P2ReviewDecision) -> P2ReviewSummary:
+        """Validate and append one review decision without advancing any flow stage."""
+
+        state = self._load_state_for_flow(command.flow_id)
+        if state.phase != "p2_needs_review":
+            raise ValueError("当前阶段不接受P2复核操作")
+        workspace = NewsWorkspace(self.output_directory / state.flow_id / "p2")
+        workspace.review(
+            command.cache_key,
+            decision=command.decision,
+            reviewer=command.reviewer,
+            reason=command.reason,
+            corrected=command.corrected,
+            market_timezone=state.p1_request.timezone,
+            usage=command.use,
+            expected_revision=command.expected_revision,
+            request_id=command.request_id,
+        )
+        return self.get_p2_review_summary(state.flow_id)
+
+    def revalidate_p2(
+        self,
+        flow_id: str,
+        expected_revision: str,
+        *,
+        target_path: str | Path,
+        extractor: Any,
+    ) -> FullFlowState:
+        """Rebuild P2 from saved decisions, then let deterministic gates choose the phase."""
+
+        state = self._load_state_for_flow(flow_id)
+        if state.phase != "p2_needs_review":
+            raise ValueError("当前阶段不需要P2复核校验")
+        summary = self.get_p2_review_summary(flow_id)
+        if summary.revision != expected_revision:
+            raise ValueError("P2复核状态已更新；请刷新后重新校验")
+        if summary.required_pending:
+            raise ValueError(f"仍有 {summary.required_pending} 条必审项未处理")
+        if state.p2_news_path is None:
+            raise ValueError("P2原始新闻路径缺失，不能重新校验")
+        return self.run_p2(
+            state=state,
+            news_path=state.p2_news_path,
+            target_path=target_path,
+            extractor=extractor,
+        )
 
     def start(
         self,
@@ -616,11 +780,11 @@ class FullResearchFlow:
             feedback_root.mkdir(parents=True, exist_ok=True)
             report = feedback_root / "report.md"
             report.write_text(
-                "# P3 未达标后的 P1 反馈分析\n\n"
+                "# P3 预测结果反馈\n\n"
                 + "\n".join(f"- {item}" for item in feedback.diagnosis)
                 + "\n\n## 下一步\n\n"
                 + "\n".join(f"- {item}" for item in feedback.next_steps)
-                + "\n\n本轮按预算在反馈分析后停止，不再次执行P3。\n",
+                + "\n\n这是预测结果反馈，不是重新开始P1；本轮在反馈后停止，不再次执行P3。\n",
                 encoding="utf-8",
             )
             feedback_run = FlowRunReference(

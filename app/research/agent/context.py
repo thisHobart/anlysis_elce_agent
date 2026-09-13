@@ -116,4 +116,16 @@ def compact_episode_context(
         if item.get("memory_status", "active") == "active"
         and (data_fingerprint is None or item.get("data_fingerprint") == data_fingerprint)
     ]
-    return [{key: item.get(key) for key in keys} for item in eligible[-max(1, limit) :]]
+    result: list[dict[str, Any]] = []
+    for item in eligible[-max(1, limit) :]:
+        compact = {key: item.get(key) for key in keys}
+        for key, maximum in (("goal", 512), ("summary", 1200), ("report_path", 512)):
+            value = compact.get(key)
+            if value is not None:
+                compact[key] = str(value)[:maximum]
+        for key in ("findings", "warnings"):
+            values = compact.get(key)
+            compact[key] = [str(value)[:512] for value in (values or [])[:8]]
+        compact["figure_keys"] = [str(value)[:128] for value in (compact.get("figure_keys") or [])[:32]]
+        result.append(compact)
+    return result

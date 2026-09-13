@@ -10,10 +10,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.config import Settings, get_settings
 from app.llm import compat
+from app.llm.audit import ModelCallAudit
+from app.llm.budget import ModelBudgetManager, ModelRequestPurpose, RequestBudget
 from app.llm.context_safety import (
     ensure_complete_response,
     is_output_truncation_error,
-    structured_request_budget,
 )
 from app.llm.gateway import (
     ModelConfigurationError,
@@ -36,6 +37,8 @@ from app.llm.langchain_support import (
     transport_messages,
     visible_text,
 )
+from app.llm.model_profiles import resolve_effective_model_profile
+from app.llm.runtime_settings import LLMRuntimeSettings
 
 
 def _prompt_json_messages(
@@ -60,9 +63,7 @@ def _prompt_json_messages(
     prepared = list(messages)
     for index, message in enumerate(prepared):
         if message.role == "system":
-            prepared[index] = message.model_copy(
-                update={"content": f"{message.content}{instruction}"}
-            )
+            prepared[index] = message.model_copy(update={"content": f"{message.content}{instruction}"})
             break
     else:
         prepared.insert(0, ModelMessage(role="system", content=instruction.lstrip()))
@@ -108,8 +109,7 @@ def _prompt_tool_call_messages(
         "当前代理不会转发原生 tools。请在结构化结果的 calls 数组中选择完成任务所需的最少函数。"
         "name 必须逐字来自下列白名单，arguments 必须符合对应 parameters；不得返回白名单之外的函数，"
         "不得执行函数，不得在结构化对象之外输出说明。\n"
-        "函数白名单："
-        + json.dumps(definitions, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        "函数白名单：" + json.dumps(definitions, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     )
     prepared = list(messages)
     for index, message in enumerate(prepared):
@@ -135,12 +135,28 @@ class ResearchModelGateway:
         settings: Settings | None = None,
         *,
         structured_output_observer: Callable[[dict[str, Any]], None] | None = None,
+        runtime_settings: LLMRuntimeSettings | None = None,
+        call_audit: ModelCallAudit | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self._model: Any | None = None
         self._http_client: Any | None = None
         self._disabled: set[str] = set()
         self._structured_output_observer = structured_output_observer
+        resolved_profile = resolve_effective_model_profile(
+            provider=self.settings.llm_provider,
+            base_url=self.settings.llm_base_url,
+            model=self.settings.llm_model,
+            context_window_tokens=self.settings.llm_context_window_tokens,
+            max_output_tokens=self.settings.llm_max_output_tokens,
+            api_style=self.settings.llm_api_style,
+            structured_output_method=self.settings.llm_structured_output_method,
+        )
+        self._budget_manager = ModelBudgetManager(
+            resolved_profile=resolved_profile,
+            runtime=runtime_settings,
+        )
+        self._call_audit = call_audit
 
     def _observe_structured_output(
         self,
@@ -164,11 +180,7 @@ class ResearchModelGateway:
                 ),
                 "raw_content": response_text(raw),
                 "tool_calls": [call.model_dump(mode="json") for call in calls],
-                "parsed": (
-                    parsed.model_dump(mode="json")
-                    if isinstance(parsed, BaseModel)
-                    else parsed
-                ),
+                "parsed": (parsed.model_dump(mode="json") if isinstance(parsed, BaseModel) else parsed),
                 "parsing_error": str(parsing_error) if parsing_error is not None else None,
                 "response_metadata": response_metadata(raw),
             }
@@ -181,6 +193,10 @@ class ResearchModelGateway:
     @property
     def model_name(self) -> str:
         return self.settings.llm_model
+
+    @property
+    def budget_manager(self) -> ModelBudgetManager:
+        return self._budget_manager
 
     def _reasoning_options(self) -> dict[str, Any]:
         """Map one semantic effort setting onto the selected provider/API dialect."""
@@ -197,9 +213,7 @@ class ResearchModelGateway:
             return {"reasoning": {"effort": effort}}
         if provider == "deepseek":
             options: dict[str, Any] = {
-                "extra_body": {
-                    "thinking": {"type": "disabled" if effort == "none" else "enabled"}
-                }
+                "extra_body": {"thinking": {"type": "disabled" if effort == "none" else "enabled"}}
             }
             if effort != "none":
                 options["reasoning_effort"] = effort
@@ -228,7 +242,6 @@ class ResearchModelGateway:
             "timeout": self.settings.llm_timeout_seconds,
             "max_retries": self.settings.llm_max_retries,
             "use_responses_api": self.settings.llm_api_style == "responses",
-            "max_tokens": self.settings.llm_max_output_tokens,
         }
         if "temperature" not in self._disabled:
             options["temperature"] = 0
@@ -256,6 +269,71 @@ class ResearchModelGateway:
             except Exception as exc:
                 raise ModelConfigurationError(f"大模型客户端配置无效：{exc}") from exc
         return self._model
+
+    @staticmethod
+    def _purpose(value: ModelRequestPurpose | str) -> ModelRequestPurpose:
+        try:
+            return ModelRequestPurpose(value)
+        except ValueError:
+            return ModelRequestPurpose.GENERIC
+
+    def _budget(
+        self,
+        messages: list[ModelMessage],
+        *,
+        purpose: ModelRequestPurpose | str,
+        schema: type[BaseModel] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> RequestBudget:
+        return self._budget_manager.budget(
+            messages,
+            purpose=self._purpose(purpose),
+            schema=schema,
+            tools=tools,
+        )
+
+    def _request_reasoning_options(self, purpose: ModelRequestPurpose) -> dict[str, Any]:
+        if purpose not in {
+            ModelRequestPurpose.DIALOGUE,
+            ModelRequestPurpose.EDA_PLANNING,
+            ModelRequestPurpose.EDA_PLANNING_RECOVERY,
+        }:
+            return {}
+        if "provider_reasoning" in self._disabled:
+            return {}
+        if self.settings.llm_api_style == "responses":
+            return {"reasoning": {"effort": "none"}}
+        if self.settings.llm_provider == "deepseek":
+            return {"extra_body": {"thinking": {"type": "disabled"}}}
+        if self.settings.llm_provider == "qwen":
+            return {"extra_body": {"enable_thinking": False}}
+        if self.settings.llm_reasoning_effort:
+            return {"reasoning_effort": "none"}
+        return {}
+
+    def _bind_request_options(self, runnable: Any, budget: RequestBudget) -> Any:
+        bind = getattr(runnable, "bind", None)
+        if not callable(bind):
+            return runnable
+        options: dict[str, Any] = {"max_tokens": budget.effective_output_tokens}
+        options.update(self._request_reasoning_options(budget.purpose))
+        return bind(**options)
+
+    def _audit(
+        self,
+        budget: RequestBudget,
+        *,
+        response: Any | None,
+        outcome: str,
+        error: BaseException | None = None,
+    ) -> None:
+        if self._call_audit is not None:
+            self._call_audit.record(
+                budget,
+                response=response,
+                outcome=outcome,
+                error_type=type(error).__name__ if error is not None else None,
+            )
 
     def _disable(self, feature: str) -> None:
         """Drop one refused optional field and rebuild the client when needed."""
@@ -296,28 +374,33 @@ class ResearchModelGateway:
         *,
         messages: list[ModelMessage],
         schema: type[StructuredResult],
+        purpose: ModelRequestPurpose | str = ModelRequestPurpose.GENERIC,
     ) -> StructuredResult:
         """Request structured output and validate every result against the local schema."""
 
         method = self.settings.llm_structured_output_method
-        structured_request_budget(
-            messages,
-            schema,
-            context_window_tokens=self.settings.llm_context_window_tokens,
-            reserved_output_tokens=self.settings.llm_max_output_tokens,
-            safety_tokens=self.settings.llm_context_safety_tokens,
-        )
         compatibility_mode = method == "prompt_json"
-        request_messages = (
-            _prompt_json_messages(messages, schema) if compatibility_mode else messages
+        request_messages = _prompt_json_messages(messages, schema) if compatibility_mode else messages
+        budget = self._budget(
+            request_messages,
+            purpose=purpose,
+            schema=None if compatibility_mode else schema,
         )
         prepared = transport_messages(request_messages)
         wire_method = "json_mode" if compatibility_mode else method
+        raw: Any | None = None
         try:
+
+            def invoke() -> Any:
+                runnable = self._get_model().with_structured_output(
+                    schema,
+                    method=wire_method,
+                    include_raw=True,
+                )
+                return self._bind_request_options(runnable, budget).invoke(prepared)
+
             result = self._degrade(
-                lambda: self._get_model()
-                .with_structured_output(schema, method=wire_method, include_raw=True)
-                .invoke(prepared),
+                invoke,
                 allowed=self._degradable_client_features(),
             )
             if not isinstance(result, dict):
@@ -347,24 +430,27 @@ class ResearchModelGateway:
                 print(str(parsing_error))
             self._observe_structured_output(raw, parsed, parsing_error)
             if parsed is not None:
-                return parsed if isinstance(parsed, schema) else schema.model_validate(parsed)
+                resolved = parsed if isinstance(parsed, schema) else schema.model_validate(parsed)
+                self._audit(budget, response=raw, outcome="completed")
+                return resolved
             if getattr(raw, "tool_calls", None):
                 raise ModelResponseError(f"大模型函数参数不符合结构化 schema：{parsing_error}")
             if compatibility_mode:
-                raise ModelResponseError(
-                    f"Cherry 兼容 JSON 未通过本地结构化 schema：{parsing_error or 'parsed 为空'}"
-                )
+                raise ModelResponseError(f"Cherry 兼容 JSON 未通过本地结构化 schema：{parsing_error or 'parsed 为空'}")
             raise self._protocol_error(
                 f"结构化输出（method={method}）",
                 parsing_error
                 or f"未返回可解析的结构化结果；该端点可能不支持 {method}，可用 "
                 "scripts/probe_structured_output.py 探测其支持的原生方法",
             )
-        except (ModelConfigurationError, ModelThinkingError, ModelResponseError):
+        except (ModelConfigurationError, ModelThinkingError, ModelResponseError) as exc:
+            self._audit(budget, response=raw, outcome="failed", error=exc)
             raise
         except (ValidationError, ValueError, TypeError, AttributeError) as exc:
+            self._audit(budget, response=raw, outcome="failed", error=exc)
             raise ModelResponseError(f"大模型结构化函数参数无法解析：{exc}") from exc
         except Exception as exc:
+            self._audit(budget, response=raw, outcome="failed", error=exc)
             if is_output_truncation_error(exc):
                 raise ModelOutputTruncatedError(f"模型输出达到 token 限制：{exc}") from exc
             if compat.is_transient_failure(exc):
@@ -373,23 +459,36 @@ class ResearchModelGateway:
                 raise self._protocol_error("结构化输出/Function Calling", exc) from exc
             raise ModelGatewayError(f"大模型调用失败：{type(exc).__name__}: {exc}") from exc
 
-    def invoke_text(self, *, messages: list[ModelMessage]) -> str:
+    def invoke_text(
+        self,
+        *,
+        messages: list[ModelMessage],
+        purpose: ModelRequestPurpose | str = ModelRequestPurpose.GENERIC,
+    ) -> str:
+        budget = self._budget(messages, purpose=purpose)
         prepared = transport_messages(messages)
+        response: Any | None = None
         try:
             response = self._degrade(
-                lambda: self._get_model().invoke(prepared),
+                lambda: self._bind_request_options(self._get_model(), budget).invoke(prepared),
                 allowed=self._degradable_client_features(),
             )
             self._guard_thinking(response)
+            ensure_complete_response(response)
             answer = visible_text(response)
-        except ModelGatewayError:
+        except ModelGatewayError as exc:
+            self._audit(budget, response=response, outcome="failed", error=exc)
             raise
         except Exception as exc:
+            self._audit(budget, response=response, outcome="failed", error=exc)
+            if is_output_truncation_error(exc):
+                raise ModelOutputTruncatedError(f"模型输出达到 token 限制：{exc}") from exc
             if compat.is_transient_failure(exc):
                 raise ModelTransientError(f"模型端点暂时不可用：{type(exc).__name__}: {exc}") from exc
             raise ModelGatewayError(f"大模型调用失败：{type(exc).__name__}: {exc}") from exc
         if not answer:
             raise ModelResponseError("大模型返回了空回复。")
+        self._audit(budget, response=response, outcome="completed")
         return answer
 
     def invoke_tool_calls(
@@ -397,6 +496,7 @@ class ResearchModelGateway:
         *,
         messages: list[ModelMessage],
         tools: list[dict[str, Any]],
+        purpose: ModelRequestPurpose | str = ModelRequestPurpose.GENERIC,
     ) -> list[ModelToolCall]:
         """Return validated native calls; never reinterpret response prose as a call."""
 
@@ -409,6 +509,7 @@ class ResearchModelGateway:
             result = self.invoke_structured(
                 messages=_prompt_tool_call_messages(messages, tools),
                 schema=_PromptToolCalls,
+                purpose=purpose,
             )
             calls = [
                 ModelToolCall(
@@ -419,22 +520,27 @@ class ResearchModelGateway:
                 for index, call in enumerate(result.calls, start=1)
             ]
             return self._validate_tool_calls(calls, allowed_names)
+        budget = self._budget(messages, purpose=purpose, tools=tools)
         prepared = transport_messages(messages)
+        response: Any | None = None
         try:
             response = self._degrade(
-                lambda: self._bound_tools(tools).invoke(prepared),
-                allowed=(
-                    self._degradable_client_features()
-                    | compat.OPTIONAL_TOOL_CALL_FEATURES
-                ),
+                lambda: self._bind_request_options(self._bound_tools(tools), budget).invoke(prepared),
+                allowed=(self._degradable_client_features() | compat.OPTIONAL_TOOL_CALL_FEATURES),
             )
             self._guard_thinking(response)
+            ensure_complete_response(response)
             calls = normalized_calls(getattr(response, "tool_calls", None))
-        except (ModelConfigurationError, ModelThinkingError):
+        except (ModelConfigurationError, ModelThinkingError, ModelOutputTruncatedError) as exc:
+            self._audit(budget, response=response, outcome="failed", error=exc)
             raise
         except ValidationError as exc:
+            self._audit(budget, response=response, outcome="failed", error=exc)
             raise ModelResponseError(f"大模型函数参数无法解析：{exc}") from exc
         except Exception as exc:
+            self._audit(budget, response=response, outcome="failed", error=exc)
+            if is_output_truncation_error(exc):
+                raise ModelOutputTruncatedError(f"模型输出达到 token 限制：{exc}") from exc
             if compat.is_transient_failure(exc):
                 raise ModelTransientError(f"模型端点暂时不可用：{type(exc).__name__}: {exc}") from exc
             if compat.is_rejected_request(exc):
@@ -442,7 +548,9 @@ class ResearchModelGateway:
             raise ModelGatewayError(f"大模型函数选择失败：{type(exc).__name__}: {exc}") from exc
         if not calls or any(not call.name for call in calls):
             raise self._protocol_error("Function Calling", "未返回原生函数调用")
-        return self._validate_tool_calls(calls, allowed_names)
+        validated = self._validate_tool_calls(calls, allowed_names)
+        self._audit(budget, response=response, outcome="completed")
+        return validated
 
     @staticmethod
     def _validate_tool_calls(

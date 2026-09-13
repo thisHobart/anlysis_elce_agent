@@ -68,6 +68,7 @@ def _known_state(
             status=event.status,
             physical_effect=event.physical_effect,
             review_status=event.review_status,
+            analysis_eligibility=event.analysis_eligibility,
         ),
         event.announcement_available_at,
     )
@@ -90,6 +91,8 @@ def _restoration_end(
         if known is None:
             continue
         state, state_available_at = known
+        if state.analysis_eligibility != "eligible":
+            continue
         if (
             state.event_type == "generation_restore"
             and state.status != "cancelled"
@@ -184,6 +187,8 @@ def build_event_features(
                 continue
             state, state_available_at = known
             if state.relevance != "short_term":
+                continue
+            if state.analysis_eligibility != "eligible":
                 continue
             if state.entity_resolution is not None and not state.entity_resolution.matches_market(clock.market):
                 continue

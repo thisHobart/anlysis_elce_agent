@@ -89,7 +89,7 @@ PySide6 Desktop
 
 界面上显示的“研究过程”不是模型的私有思考链。它由 `app/research/graph/narration.py` 把已经发生的、可审计的循环事件（阶段、函数、参数门禁、评估结论）翻译成中文句子；模型网关不把服务商返回的隐藏推理写入应用状态，严格策略下会拒绝含推理内容的响应。
 
-大模型每次回复都要调用一次 `declare_research_agenda` 声明本轮目标、假设和前提；它不执行任何计算，只把议程记录进方案。评估器为每个研究函数都准备了确定性验收规则：假设要么得到明确结论，要么被标记为需要补数据、需要扩大审批范围或需要改写，不会被静默忽略。关系样本不足或某个变量全程没有可用相关时，评估器在原审批范围内提出收缩 `max_lag` 或移除该变量的自动修订。
+规划器只返回一个紧凑的 `EDAPlanIntent`：变量使用稳定 ID，函数只提交唯一选择和必要覆盖参数；目标、假设和前提随同意图一次返回。本地适配器再按确定性目录补齐理由、默认参数、受信阈值、函数顺序和编译器议程。评估器为每个研究函数准备确定性验收规则：假设要么得到明确结论，要么被标记为需要补数据、需要扩大审批范围或需要改写，不会被静默忽略。关系样本不足或某个变量全程没有可用相关时，评估器在原审批范围内提出收缩 `max_lag` 或移除该变量的自动修订。
 
 最终证据合并或报告生成失败时，工具结果保留，用户可以选择重试合并或停止；两种结果都写入终态审计记录。
 
@@ -133,14 +133,16 @@ start_desktop.bat
 
 ```dotenv
 VPP_LLM_PROVIDER=custom
-VPP_LLM_API_STYLE=chat
 VPP_LLM_BASE_URL=http://127.0.0.1:xxxx/v1
 VPP_LLM_API_KEY=local-placeholder
 VPP_LLM_MODEL=your-model-name
-# 后台可选；桌面配置不会改写该值
-VPP_LLM_REASONING_EFFORT=
 VPP_SKILL_PATHS=
 ```
+
+`.env` 只保存 Provider、Base URL、API Key 和模型名四项 LLM 连接身份。API 形式、结构化输出能力、
+上下文窗口、最大输出、超时、重试、推理和历史预算由桌面配置写入用户应用数据目录中的
+`settings.json` 与 `model_profiles.json`。无法匹配内置画像的调用路由会标记为“模型能力未验证”，
+使用短上下文和紧凑结构化协议，用户可在模型配置中一次性补全画像。
 
 Gemini Developer API 配置示例（`Base URL` 留空，不经过 Cherry Studio 等 OpenAI 代理）：
 
@@ -151,7 +153,7 @@ VPP_LLM_API_KEY=your-google-api-key
 VPP_LLM_MODEL=gemini-2.5-flash
 ```
 
-Vertex AI 使用应用默认凭据（ADC，即 Google SDK 读取的本机/工作负载身份），并额外设置 `VPP_LLM_GOOGLE_VERTEXAI=true`、`VPP_LLM_GOOGLE_PROJECT` 和 `VPP_LLM_GOOGLE_LOCATION`。模型名只填写 `gemini-*`，不能使用 Cherry Studio 的 `vertexai:` 前缀。
+Vertex AI 使用应用默认凭据（ADC，即 Google SDK 读取的本机/工作负载身份）；Vertex 开关、项目和地区在桌面的运行设置中保存。模型名只填写 `gemini-*`，不能使用 Cherry Studio 的 `vertexai:` 前缀。
 
 桌面端可以选择 `DeepSeek`、`Qwen`、`Gemini（原生 API）` 或 `Custom`。旧配置按 `custom + chat` 读取，不根据 URL 猜供应商。Gemini 固定使用 Google 原生 `json_schema`（服务商在生成时按数据结构约束输出）；其他端点按配置使用 Chat Completions 或 Responses。
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from typing import Any, Literal, Protocol, TypeVar
 
@@ -95,13 +96,33 @@ class ModelGateway(Protocol):
         *,
         messages: list[ModelMessage],
         schema: type[StructuredResult],
+        purpose: Any = "generic",
     ) -> StructuredResult: ...
 
-    def invoke_text(self, *, messages: list[ModelMessage]) -> str: ...
+    def invoke_text(self, *, messages: list[ModelMessage], purpose: Any = "generic") -> str: ...
 
     def invoke_tool_calls(
         self,
         *,
         messages: list[ModelMessage],
         tools: list[dict[str, Any]],
+        purpose: Any = "generic",
     ) -> list[ModelToolCall]: ...
+
+
+def invoke_structured_for_purpose(
+    gateway: ModelGateway,
+    *,
+    messages: list[ModelMessage],
+    schema: type[StructuredResult],
+    purpose: Any,
+) -> StructuredResult:
+    """Pass purpose to the new boundary while preserving injected legacy doubles."""
+
+    invoke = gateway.invoke_structured
+    parameters = inspect.signature(invoke).parameters.values()
+    supports_purpose = any(item.name == "purpose" or item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters)
+    kwargs: dict[str, Any] = {"messages": messages, "schema": schema}
+    if supports_purpose:
+        kwargs["purpose"] = purpose
+    return invoke(**kwargs)

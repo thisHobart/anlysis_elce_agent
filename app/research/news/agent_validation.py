@@ -17,7 +17,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.llm.gateway import ModelGateway, ModelMessage
+from app.llm.budget import ModelRequestPurpose
+from app.llm.gateway import ModelGateway, ModelMessage, invoke_structured_for_purpose
 from app.research.news.pipeline import NewsPriceStudy
 
 P2_AGENT_GOAL_PROMPT_VERSION = "p2-agent-goal-v1"
@@ -221,13 +222,8 @@ def build_phase2_goal_input(
                 "document_version_ids": list(link.document_version_ids),
                 "content_hashes": list(link.content_hashes),
                 "source_names": list(link.source_names),
-                "extraction_traces": [
-                    trace.model_dump(mode="json") for trace in link.extraction_traces
-                ],
-                "evidence_quotes": [
-                    {"field_name": field_name, "quote": quote}
-                    for field_name, quote in link.quotes
-                ],
+                "extraction_traces": [trace.model_dump(mode="json") for trace in link.extraction_traces],
+                "evidence_quotes": [{"field_name": field_name, "quote": quote} for field_name, quote in link.quotes],
             }
         )
 
@@ -246,12 +242,10 @@ def build_phase2_goal_input(
             "method_version": study.analysis.method.analysis_version,
             "results": findings,
             "excluded_events": [
-                {"event_id": event_id, "reason": reason}
-                for event_id, reason in study.analysis.excluded_events
+                {"event_id": event_id, "reason": reason} for event_id, reason in study.analysis.excluded_events
             ],
             "events_not_analyzed": [
-                {"event_id": event_id, "reason": reason}
-                for event_id, reason in study.package.events_not_analyzed
+                {"event_id": event_id, "reason": reason} for event_id, reason in study.package.events_not_analyzed
             ],
         },
         "runtime_quality": {
@@ -281,7 +275,8 @@ def run_phase2_goal_agent(
 
     payload = build_phase2_goal_input(study)
     input_hash = _hash_json(payload)
-    result = gateway.invoke_structured(
+    result = invoke_structured_for_purpose(
+        gateway,
         messages=[
             ModelMessage(role="system", content=P2_AGENT_GOAL_SYSTEM_PROMPT),
             ModelMessage(
@@ -294,6 +289,7 @@ def run_phase2_goal_agent(
             ),
         ],
         schema=Phase2GoalAgentResult,
+        purpose=ModelRequestPurpose.NEWS_EXTRACTION,
     )
     output_hash = _hash_json(result.model_dump(mode="json"))
     return Phase2GoalAgentRun(
@@ -373,23 +369,15 @@ def evaluate_phase2_goal_agent(
     )
 
     expected_links = {
-        link.event_id: link
-        for link in study.package.evidence_links
-        if link.window_label == DEFAULT_FOCUS_WINDOW
+        link.event_id: link for link in study.package.evidence_links if link.window_label == DEFAULT_FOCUS_WINDOW
     }
     finding_ids = [finding.event_id for finding in result.findings]
-    coverage_ok = (
-        len(finding_ids) == len(set(finding_ids))
-        and set(finding_ids) == set(expected_links)
-    )
+    coverage_ok = len(finding_ids) == len(set(finding_ids)) and set(finding_ids) == set(expected_links)
     add(
         "agent_finding_coverage",
         "evaluation",
         coverage_ok,
-        (
-            f"应覆盖 {len(expected_links)} 个一小时窗口事件，实际 {len(finding_ids)} 条，"
-            "且不得重复或虚构事件"
-        ),
+        (f"应覆盖 {len(expected_links)} 个一小时窗口事件，实际 {len(finding_ids)} 条，且不得重复或虚构事件"),
     )
 
     events = {event.event_id: event for event in study.view.events}
@@ -414,9 +402,7 @@ def evaluate_phase2_goal_agent(
         ):
             value_errors.append(finding.event_id)
         expected_quotes = set(link.quotes)
-        cited_quotes = {
-            (quote.field_name, quote.quote) for quote in finding.evidence_quotes
-        }
+        cited_quotes = {(quote.field_name, quote.quote) for quote in finding.evidence_quotes}
         if not (
             tuple(finding.document_version_ids) == link.document_version_ids
             and tuple(finding.content_hashes) == link.content_hashes
@@ -445,16 +431,11 @@ def evaluate_phase2_goal_agent(
         ),
     )
 
-    expected_dispositions = {
-        event_id: "excluded" for event_id, _ in study.analysis.excluded_events
-    }
-    expected_dispositions.update(
-        {event_id: "not_analyzed" for event_id, _ in study.package.events_not_analyzed}
-    )
+    expected_dispositions = {event_id: "excluded" for event_id, _ in study.analysis.excluded_events}
+    expected_dispositions.update({event_id: "not_analyzed" for event_id, _ in study.package.events_not_analyzed})
     actual_dispositions = {item.event_id: item.status for item in result.dispositions}
     disposition_ok = (
-        len(result.dispositions) == len(actual_dispositions)
-        and actual_dispositions == expected_dispositions
+        len(result.dispositions) == len(actual_dispositions) and actual_dispositions == expected_dispositions
     )
     add(
         "agent_disposition_coverage",
@@ -496,27 +477,17 @@ def evaluate_phase2_goal_agent(
         ),
     )
 
-    narrative = "\n".join(
-        [result.summary, *result.caveats, *(finding.interpretation for finding in result.findings)]
-    )
+    narrative = "\n".join([result.summary, *result.caveats, *(finding.interpretation for finding in result.findings)])
     forbidden = [claim for claim in _FORBIDDEN_CLAIMS if claim in narrative]
-    claim_boundary_ok = (
-        result.claim_boundary == "descriptive_association_only" and not forbidden
-    )
+    claim_boundary_ok = result.claim_boundary == "descriptive_association_only" and not forbidden
     add(
         "agent_claim_boundary",
         "evaluation",
         claim_boundary_ok,
-        (
-            "答案保持描述性关联边界"
-            if not forbidden
-            else f"发现越界措辞：{', '.join(forbidden)}"
-        ),
+        ("答案保持描述性关联边界" if not forbidden else f"发现越界措辞：{', '.join(forbidden)}"),
     )
 
-    expected_verdict = (
-        "ready_with_caveats" if study.result_quality.passed else "blocked"
-    )
+    expected_verdict = "ready_with_caveats" if study.result_quality.passed else "blocked"
     add(
         "agent_overall_verdict",
         "evaluation",
@@ -549,11 +520,7 @@ def _add_gold_checks(
     failures: list[str] = []
     for fixture_id, injected_delta in gold_effects.items():
         document = next(
-            (
-                item
-                for item in study.documents
-                if item.raw_metadata.get("fixture_id") == fixture_id
-            ),
+            (item for item in study.documents if item.raw_metadata.get("fixture_id") == fixture_id),
             None,
         )
         if document is None:
@@ -563,10 +530,7 @@ def _add_gold_checks(
             (
                 item
                 for item in study.view.events
-                if any(
-                    ref.document_version_id == document.document_version_id
-                    for ref in item.document_refs
-                )
+                if any(ref.document_version_id == document.document_version_id for ref in item.document_refs)
             ),
             None,
         )

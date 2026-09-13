@@ -16,6 +16,7 @@ from app.research.news import (
     NewsVersionStore,
     ObviousNewsEventExtractor,
     build_event_features,
+    build_forecast_news_features,
     load_price_csv,
     merge_event_records,
     run_news_price_study,
@@ -217,6 +218,42 @@ def test_explicit_review_of_imprecise_short_term_event_closes_the_review_gate() 
 
     assert not study_needs_review(reviewed)
     assert study_needs_review(pending)
+
+
+def test_background_only_event_never_contributes_numeric_or_forecast_features(study):
+    source = next(event for event in study.view.events if event.relevance == "short_term")
+    background = source.model_copy(
+        update={
+            "analysis_eligibility": "background_only",
+            "state_history": tuple(
+                revision.model_copy(update={"analysis_eligibility": "background_only"})
+                for revision in source.state_history
+            ),
+        }
+    )
+    start = max(background.announcement_available_at, background.effective_start_at or CUTOFF)
+    end = start + CLOCK.interval * 2
+    historical = build_event_features(
+        (background,),
+        clock=CLOCK,
+        start_at=start,
+        end_at=end,
+        as_of=end,
+    )
+    assert historical.rows
+    assert all(row.active_event_count == 0 for row in historical.rows)
+    assert all(row.new_announcement_count == 0 for row in historical.rows)
+    forecast = build_forecast_news_features(
+        (background,),
+        clock=CLOCK,
+        start_at=start,
+        end_at=end,
+        knowledge_cutoff=start,
+    )
+    assert not forecast.empty
+    assert (forecast["active_event_count"] == 0).all()
+    assert (forecast["new_announcement_count"] == 0).all()
+    assert (forecast["upcoming_event_count"] == 0).all()
 
 
 def test_import_cannot_impersonate_local_review(tmp_path):

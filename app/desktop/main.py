@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication
 
 from app.desktop.main_window import MainWindow
 from app.desktop.theme import APP_STYLE
+from app.llm.model_profiles import builtin_model_profiles_path, load_model_profile_catalog
 from app.runtime_paths import default_p2_news_path
 
 
@@ -75,6 +76,10 @@ def _desktop_smoke_payload(window: MainWindow) -> dict[str, Any]:
     p2_news_path = default_p2_news_path()
     if p2_news_path is None:
         raise RuntimeError("Built desktop is missing the audited P2 news corpus")
+    model_profiles_path = builtin_model_profiles_path()
+    model_profiles = load_model_profile_catalog(model_profiles_path)
+    if not model_profiles.profiles:
+        raise RuntimeError("Built desktop is missing the builtin model profile catalog")
     return {
         "status": "passed",
         "window_constructed": True,
@@ -86,6 +91,8 @@ def _desktop_smoke_payload(window: MainWindow) -> dict[str, Any]:
         "research_output_directory": str(window.workspace.research_output_directory.resolve()),
         "forecast_runtime": forecast_runtime,
         "p2_news_path": str(p2_news_path),
+        "model_profiles_path": str(model_profiles_path),
+        "model_profile_count": len(model_profiles.profiles),
     }
 
 

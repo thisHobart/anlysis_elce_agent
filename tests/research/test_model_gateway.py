@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from app.config import Settings
 from app.llm import compat
+from app.llm.budget import ModelRequestPurpose
 from app.llm.gateway import (
     ModelConfigurationError,
     ModelMessage,
@@ -115,6 +116,16 @@ class RecordingModel:
         return ProposedCalls()
 
 
+class BindableRecordingModel(RecordingModel):
+    def __init__(self, *, content: str) -> None:
+        super().__init__(content=content)
+        self.bound_options: list[dict[str, int]] = []
+
+    def bind(self, **options):
+        self.bound_options.append(options)
+        return self
+
+
 def test_structured_output_uses_native_function_calling_and_typed_messages():
     gateway = ResearchModelGateway(_settings())
     model = RecordingModel()
@@ -136,6 +147,55 @@ def test_parseable_structured_output_is_rejected_when_provider_reports_truncatio
 
     with pytest.raises(ModelOutputTruncatedError, match="响应不完整"):
         gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
+
+
+def test_text_output_is_rejected_when_provider_reports_truncation():
+    gateway = ResearchModelGateway(_settings())
+    model = RecordingModel(content="partial answer")
+    model.response.response_metadata = {"finish_reason": "length"}
+    gateway._model = model
+
+    with pytest.raises(ModelOutputTruncatedError, match="响应不完整"):
+        gateway.invoke_text(messages=_messages())
+
+
+def test_text_output_limit_is_bound_per_request_purpose() -> None:
+    gateway = ResearchModelGateway(_settings())
+    model = BindableRecordingModel(content="ok")
+    gateway._model = model
+
+    result = gateway.invoke_text(
+        messages=_messages(),
+        purpose=ModelRequestPurpose.DIALOGUE,
+    )
+
+    assert result == "ok"
+    assert model.bound_options == [{"max_tokens": 1024}]
+    assert "max_tokens" not in gateway._model_options()
+
+
+def test_selector_purpose_overrides_enabled_qwen_reasoning_per_request() -> None:
+    gateway = ResearchModelGateway(_settings(llm_provider="qwen", llm_reasoning_effort="high"))
+    model = BindableRecordingModel(content="ok")
+    gateway._model = model
+
+    gateway.invoke_text(
+        messages=_messages(),
+        purpose=ModelRequestPurpose.EDA_PLANNING,
+    )
+
+    assert gateway._model_options()["extra_body"] == {"enable_thinking": True}
+    assert model.bound_options == [{"max_tokens": 2048, "extra_body": {"enable_thinking": False}}]
+
+
+def test_tool_calls_are_rejected_as_a_batch_when_provider_reports_truncation():
+    gateway = ResearchModelGateway(_settings())
+    model = RecordingModel()
+    model.response.response_metadata = {"finish_reason": "length"}
+    gateway._model = model
+
+    with pytest.raises(ModelOutputTruncatedError, match="响应不完整"):
+        gateway.invoke_tool_calls(messages=_messages(), tools=TOOLS)
 
 
 def test_sdk_length_exception_is_exposed_as_output_truncation() -> None:
@@ -210,9 +270,7 @@ def test_structured_output_observer_receives_function_arguments_without_reasonin
 
 
 def test_prompt_json_injects_schema_and_uses_json_mode_for_cherry_compatibility():
-    gateway = ResearchModelGateway(
-        _settings(llm_structured_output_method="prompt_json")
-    )
+    gateway = ResearchModelGateway(_settings(llm_structured_output_method="prompt_json"))
     model = RecordingModel()
     gateway._model = model
 
@@ -246,9 +304,7 @@ def test_prompt_json_schema_failure_is_repairable_response_error_not_protocol_er
 
             return Bound()
 
-    gateway = ResearchModelGateway(
-        _settings(llm_structured_output_method="prompt_json")
-    )
+    gateway = ResearchModelGateway(_settings(llm_structured_output_method="prompt_json"))
     model = InvalidJsonShapeModel()
     gateway._model = model
 
@@ -282,10 +338,7 @@ def test_prompt_json_applies_local_schema_and_whitelist_to_research_function_sel
                     self.last_messages = messages
                     return {
                         "raw": SimpleNamespace(
-                            content=(
-                                '{"calls":[{"name":"price_descriptive_distribution",'
-                                '"arguments":{}}]}'
-                            ),
+                            content=('{"calls":[{"name":"price_descriptive_distribution","arguments":{}}]}'),
                             additional_kwargs={},
                             tool_calls=[],
                             response_metadata={},
@@ -332,9 +385,7 @@ def test_prompt_json_research_function_selection_rejects_names_outside_whitelist
                             tool_calls=[],
                             response_metadata={},
                         ),
-                        "parsed": schema.model_validate(
-                            {"calls": [{"name": "delete_database", "arguments": {}}]}
-                        ),
+                        "parsed": schema.model_validate({"calls": [{"name": "delete_database", "arguments": {}}]}),
                         "parsing_error": None,
                     }
 
@@ -359,9 +410,7 @@ def test_custom_endpoint_sends_no_reasoning_control_by_default():
 
 @pytest.mark.parametrize("model_name", ["deepseek-chat", "deepseek-reasoner", "future-deepseek-model"])
 def test_all_deepseek_models_disable_thinking_with_request_parameter(model_name: str):
-    gateway = ResearchModelGateway(
-        _settings(llm_provider="deepseek", llm_model=model_name)
-    )
+    gateway = ResearchModelGateway(_settings(llm_provider="deepseek", llm_model=model_name))
 
     assert gateway._model_options()["extra_body"] == {"thinking": {"type": "disabled"}}
 
@@ -374,9 +423,7 @@ def test_qwen_chat_uses_its_documented_thinking_toggle():
 
 @pytest.mark.parametrize("provider", ["deepseek", "qwen"])
 def test_provider_responses_api_uses_reasoning_effort(provider: str):
-    gateway = ResearchModelGateway(
-        _settings(llm_provider=provider, llm_api_style="responses")
-    )
+    gateway = ResearchModelGateway(_settings(llm_provider=provider, llm_api_style="responses"))
 
     options = gateway._model_options()
     assert options["use_responses_api"] is True
