@@ -169,10 +169,20 @@ class FullResearchFlow:
         self.store = store
         self.output_directory = Path(output_directory).resolve()
 
-    def start(self, *, p1_run: FlowRunReference, eda_summary: dict[str, Any], information_cutoff: datetime) -> FullFlowState:
+    def start(
+        self,
+        *,
+        p1_run: FlowRunReference,
+        eda_summary: dict[str, Any],
+        information_cutoff: datetime,
+        request_text: str = "",
+        requested_forecast: bool = False,
+    ) -> FullFlowState:
         state = FullFlowState(
             p1_request=build_p2_request(eda_summary=eda_summary, information_cutoff=information_cutoff),
             runs=(p1_run,),
+            request_text=request_text,
+            requested_forecast=requested_forecast,
         )
         self.store.save(state)
         return state
@@ -270,6 +280,9 @@ class FullResearchFlow:
                 "p2_manifest_path": feature_manifest,
                 "p2_knowledge_cutoff": p2_knowledge_cutoff,
                 "stop_reason": "P2存在未解决复核项" if phase == "p2_needs_review" else None,
+                "error": None,
+                "resume_from_phase": None,
+                "failed_stage": None,
             }
         )
         self.store.save(updated)
@@ -386,7 +399,15 @@ class FullResearchFlow:
             data_fingerprint=_hash_file(state.p2_feature_path)[:12],
         )
         updated = state.model_copy(
-            update={"phase": "p1_synthesis_complete", "runs": (*state.runs, run), "feature_decisions": decisions}
+            update={
+                "phase": "p1_synthesis_complete",
+                "runs": (*state.runs, run),
+                "feature_decisions": decisions,
+                "stop_reason": None,
+                "error": None,
+                "resume_from_phase": None,
+                "failed_stage": None,
+            }
         )
         self.store.save(updated)
         return updated
@@ -407,6 +428,10 @@ class FullResearchFlow:
                 "forecast_plan": payload,
                 "forecast_plan_fingerprint": _fingerprint(payload),
                 "approved_forecast_plan_id": None,
+                "stop_reason": None,
+                "error": None,
+                "resume_from_phase": None,
+                "failed_stage": None,
             }
         )
         self.store.save(updated)
@@ -444,11 +469,28 @@ class FullResearchFlow:
                     "phase": "failed",
                     "error": f"{type(exc).__name__}: {exc}",
                     "stop_reason": "P3执行或产物校验失败；保留当前方案和已完成检查点",
+                    "resume_from_phase": "forecast_running",
+                    "failed_stage": "p3_execute",
                 }
             )
             self.store.save(failed)
             raise
         return self._finish_forecast(running, result)
+
+    def stop(self, state: FullFlowState, *, reason: str = "用户停止当前全流程") -> FullFlowState:
+        """Persist a terminal user stop without discarding completed stage artifacts."""
+
+        stopped = state.model_copy(
+            update={
+                "phase": "stopped",
+                "stop_reason": reason,
+                "error": None,
+                "resume_from_phase": None,
+                "failed_stage": None,
+            }
+        )
+        self.store.save(stopped)
+        return stopped
 
     def _finish_forecast(self, state: FullFlowState, result: ForecastRunResult) -> FullFlowState:
         status = result.evaluation_status

@@ -363,8 +363,11 @@ def test_chat_request_reuses_limited_p1_and_reaches_p3_card(
 
     def run_immediately(*, kind, operation, success_handler, failure_handler=None):
         del failure_handler
-        assert kind == "full_flow_analysis"
+        assert kind in {"full_flow_p2", "full_flow_p1_synthesis", "full_flow_p3_prepare"}
         success_handler(operation(lambda *_args: None))
+        if workspace._pending_full_flow_resume:
+            workspace._pending_full_flow_resume = False
+            workspace._resume_full_flow()
 
     monkeypatch.setattr("app.desktop.workspace.build_model_gateway", lambda _settings: object())
     monkeypatch.setattr("app.desktop.workspace.StructuredNewsEventExtractor", lambda *_args, **_kwargs: object())

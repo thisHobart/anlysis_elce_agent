@@ -157,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     if not mcp_catalog.is_file():
         raise SystemExit(f"No MCP server catalog was found at {mcp_catalog}.")
     mcp_catalog_arg = f"--add-data={mcp_catalog};app/integrations/mcp"
-    p2_news = root / "data" / "news" / "shandong_p2_test_news_v2.jsonl"
+    p2_news = root / "data" / "news" / "shandong_p2_test_news.jsonl"
     p2_news_manifest = p2_news.with_suffix(".manifest.json")
     if not p2_news.is_file() or not p2_news_manifest.is_file():
         raise SystemExit("No audited P2 news snapshot was found to package.")

@@ -12,6 +12,8 @@ from app.research.agent.errors import (
     InsufficientDataError,
     PlanCompatibilityError,
     RepairablePlanError,
+    ResearchModelContextLimitError,
+    ResearchModelOutputTruncatedError,
     SkillVersionMismatchError,
 )
 from app.research.agent.schemas import EDAPlan
@@ -204,6 +206,10 @@ def exception_feedback(
         recommendation = "请在原 Skill 权限内修正函数参数或变量选择。"
     elif isinstance(exc, ResearchDataError):
         recommendation = "请检查研究文件、字段、时间轴和数据可读性后重新开始。"
+    elif isinstance(exc, ResearchModelOutputTruncatedError):
+        recommendation = "已用精简上下文重试一次；请重试当前回合，或缩小问题范围。"
+    elif isinstance(exc, ResearchModelContextLimitError):
+        recommendation = "请减少历史上下文或证据范围后重试当前回合。"
     return FeedbackPacket(
         source=source,
         code=f"{source}_{type(exc).__name__}",

@@ -10,7 +10,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.config import Settings, get_settings
 from app.llm import compat
-from app.llm.context_safety import ensure_complete_response, is_output_truncation_error
+from app.llm.context_safety import (
+    ensure_complete_response,
+    is_output_truncation_error,
+    structured_request_budget,
+)
 from app.llm.gateway import (
     ModelConfigurationError,
     ModelGatewayError,
@@ -296,6 +300,13 @@ class ResearchModelGateway:
         """Request structured output and validate every result against the local schema."""
 
         method = self.settings.llm_structured_output_method
+        structured_request_budget(
+            messages,
+            schema,
+            context_window_tokens=self.settings.llm_context_window_tokens,
+            reserved_output_tokens=self.settings.llm_max_output_tokens,
+            safety_tokens=self.settings.llm_context_safety_tokens,
+        )
         compatibility_mode = method == "prompt_json"
         request_messages = (
             _prompt_json_messages(messages, schema) if compatibility_mode else messages

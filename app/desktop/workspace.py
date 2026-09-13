@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QSplitter, QWidget
 
 from app.config import get_settings
@@ -155,6 +155,17 @@ def _requests_news_forecast(question: str) -> bool:
     return _is_news_analysis_request(question) and any(word in compact for word in ("预测", "预报"))
 
 
+def _full_flow_command(question: str) -> str | None:
+    compact = "".join(question.casefold().split()).translate(str.maketrans("", "", "，,。！？!?"))
+    if compact in {"继续", "继续执行", "下一步"}:
+        return "continue"
+    if compact in {"重试", "重新尝试", "再试一次"}:
+        return "retry"
+    if compact in {"停止", "停止研究", "结束", "终止"}:
+        return "stop"
+    return None
+
+
 class ResearchWorkspace(QSplitter):
     """Single source of UI truth for history, conversation, inputs, plan, and trace."""
 
@@ -215,6 +226,9 @@ class ResearchWorkspace(QSplitter):
         self._thread: QThread | None = None
         self._worker: FunctionWorker | None = None
         self._task_kind: str | None = None
+        self._task_success_handler: Callable[[Any], None] | None = None
+        self._task_failure_handler: Callable[[str], None] | None = None
+        self._pending_full_flow_resume = False
         self._thinking_widget: ThinkingMessageWidget | None = None
         self._thinking_message_id: str | None = None
         self._thinking_placeholder = False
@@ -389,6 +403,14 @@ class ResearchWorkspace(QSplitter):
             self._cancel_plan_feedback_window()
             self.current_session_id = session_id
             self._render_current()
+            resolved_flow = self._full_flow_for_session()
+            if resolved_flow is not None:
+                flow, state = resolved_flow
+                self.update_full_flow_state(
+                    state,
+                    state_path=flow.store.path,
+                    output_directory=flow.output_directory,
+                )
             if self.agent.has_thread(session_id):
                 self._loop_completed(self.agent.get_snapshot(session_id))
             elif self.current_session.status == "awaiting_plan_approval" and self.current_session.current_plan:
@@ -798,6 +820,8 @@ class ResearchWorkspace(QSplitter):
             self._append_message(SessionMessage(role="user", kind="text", content=question, turn_id=uuid4().hex))
             self.run_plan(ForecastPlan.model_validate(session.current_plan))
             return
+        if self._handle_full_flow_input(question):
+            return
         if any(run.run_kind == "forecast" for run in session.runs) and _is_forecast_explanation(question):
             self._explain_forecast_result(question)
             return
@@ -940,7 +964,7 @@ class ResearchWorkspace(QSplitter):
         )
         session.full_flow_state_path = str(flow.store.path)
         session.full_flow_output_directory = str(flow.output_directory)
-        session.pending_forecast_question = None
+        session.pending_forecast_question = question if prepare_forecast else None
         session.current_plan = None
         session.plan_stale = False
         session.status = "running"
@@ -960,7 +984,6 @@ class ResearchWorkspace(QSplitter):
                 ),
             )
         )
-        self._start_thinking("compute", "启动P2新闻分析", f"新闻来源：{news_path.name}")
         self._add_trace("plan", "进入P1—P2—P3流程", "completed", "复用当前P1结果；P3仍需单独确认")
 
         p1_run = FlowRunReference(
@@ -971,91 +994,264 @@ class ResearchWorkspace(QSplitter):
             report_path=Path(p1_record.report_path),
             data_fingerprint=p1_record.data_fingerprint,
         )
-        eda_summary = dict(session.latest_eda_summary)
-        target_path = str(session.inputs["target"].path)
-        actuals_path = session.inputs["actuals"].path or None
-        forecasts_path = session.inputs["forecasts"].path or None
-        source_fingerprint = session.dataset_fingerprint
-        market_timezone = session.region_timezone or profile.timezone
+        state = flow.start(
+            p1_run=p1_run,
+            eda_summary=dict(session.latest_eda_summary),
+            information_cutoff=datetime.now(UTC),
+            request_text=question,
+            requested_forecast=prepare_forecast,
+        )
+        state = state.model_copy(update={"p2_news_path": news_path})
+        flow.store.save(state)
+        self.update_full_flow_state(state, state_path=flow.store.path, output_directory=flow.output_directory)
+        self._start_full_flow_stage(flow, state)
+        self.conversation.scroll_to_bottom()
 
-        def execute(progress: Callable[[int, str], None]) -> FullFlowState:
-            state: FullFlowState | None = None
-            try:
-                state = flow.start(
-                    p1_run=p1_run,
-                    eda_summary=eda_summary,
-                    information_cutoff=datetime.now(UTC),
+    def _full_flow_for_session(self) -> tuple[FullResearchFlow, FullFlowState] | None:
+        session = self.current_session
+        if not session.full_flow_state_path:
+            return None
+        store = FullFlowStore(session.full_flow_state_path)
+        try:
+            state = store.load()
+        except (OSError, ValueError):
+            return None
+        output = session.full_flow_output_directory or str(store.path.parent / "runs")
+        return FullResearchFlow(store=store, output_directory=output), state
+
+    def _handle_full_flow_input(self, question: str) -> bool:
+        """Resolve commands against the durable P1/P2/P3 cursor before model routing."""
+
+        resolved = self._full_flow_for_session()
+        if resolved is None:
+            return False
+        flow, state = resolved
+        command = _full_flow_command(question)
+        flow_request = _is_news_analysis_request(question) or _is_forecast_request(
+            question,
+            has_price_context=bool(self.current_session.inputs["target"].path),
+        )
+        guarded_phases = {
+            "p1_initial_complete",
+            "p2_needs_review",
+            "p2_ready",
+            "p1_synthesis_complete",
+            "failed",
+            "forecast_running",
+        }
+        if state.phase not in guarded_phases or (command is None and not flow_request):
+            return False
+
+        self._append_message(SessionMessage(role="user", kind="text", content=question, turn_id=uuid4().hex))
+        if command == "stop":
+            stopped = flow.stop(state)
+            self.update_full_flow_state(
+                stopped,
+                state_path=flow.store.path,
+                output_directory=flow.output_directory,
+            )
+            return True
+        if state.phase == "p2_needs_review" and command != "retry":
+            self._show_p2_review_gate(state)
+            return True
+        if state.phase == "failed" and command != "retry":
+            self._append_message(
+                SessionMessage(
+                    role="assistant",
+                    kind="error",
+                    content="当前全流程停在失败状态。回复“重试”会从最后保存的阶段恢复，或回复“停止”。",
                 )
-                progress(
-                    10,
-                    progress_message(
-                        ThinkingStep("compute", "分析山东新闻", "抽取事件并核对来源、时间与价格窗口", "running"),
-                        "启动P2新闻分析",
-                    ),
+            )
+            self._persist_and_render(keep_timeline=True)
+            return True
+        if state.phase == "forecast_running":
+            self._append_message(
+                SessionMessage(
+                    role="assistant",
+                    kind="notice",
+                    content="预测执行曾被中断，请在已恢复的预测确认卡上重新确认，以继续同一方案。",
                 )
+            )
+            self.update_full_flow_state(state, state_path=flow.store.path, output_directory=flow.output_directory)
+            return True
+        self._resume_full_flow(retry_p2=state.phase == "p2_needs_review")
+        return True
+
+    def _show_p2_review_gate(self, state: FullFlowState) -> None:
+        review_queue = (
+            state.runs[-1].artifact_directory / "review-queue.json"
+            if state.runs and state.runs[-1].run_kind == "news"
+            else None
+        )
+        detail = f"复核队列：{review_queue}" if review_queue and review_queue.is_file() else "请查看P2报告中的待复核项"
+        self._append_message(
+            SessionMessage(
+                role="assistant",
+                kind="notice",
+                content=(
+                    "P2仍有未完成的来源或事件时间复核，不能直接进入P1综合分析或P3预测。"
+                    f"{detail}；完成复核后回复“重试”，或回复“停止”。"
+                ),
+                payload={
+                    "full_flow_id": state.flow_id,
+                    "phase": state.phase,
+                    "review_queue": str(review_queue or ""),
+                    "allowed_actions": ["retry", "stop"],
+                },
+            )
+        )
+        self.current_session.status = "awaiting_user"
+        self._persist_and_render(keep_timeline=True)
+
+    def _resume_full_flow(self, *, retry_p2: bool = False) -> None:
+        resolved = self._full_flow_for_session()
+        if resolved is None:
+            self._fail_before_task("全流程状态文件不可用，无法继续。")
+            return
+        flow, state = resolved
+        if state.phase == "failed":
+            if state.resume_from_phase is None:
+                self._fail_before_task("失败状态没有可恢复阶段；请重新发起新闻分析。")
+                return
+            state = state.model_copy(
+                update={
+                    "phase": state.resume_from_phase,
+                    "error": None,
+                    "stop_reason": None,
+                    "resume_from_phase": None,
+                    "failed_stage": None,
+                }
+            )
+            flow.store.save(state)
+        if state.phase == "p2_needs_review" and not retry_p2:
+            self._show_p2_review_gate(state)
+            return
+        if state.phase in {"p1_initial_complete", "p2_needs_review", "p2_ready", "p1_synthesis_complete"}:
+            self._start_full_flow_stage(flow, state)
+
+    def _start_full_flow_stage(self, flow: FullResearchFlow, state: FullFlowState) -> None:
+        """Run exactly one durable stage; the GUI decides the next stage after completion."""
+
+        session = self.current_session
+        profile = self.region_profiles.get("shandong")
+        target_path = session.inputs["target"].path
+        if profile is None or not target_path:
+            self._fail_before_task("山东数据源或目标电价快照不可用，无法恢复全流程。")
+            return
+        settings = get_settings()
+        resume_phase = state.phase
+
+        if state.phase in {"p1_initial_complete", "p2_needs_review"}:
+            stage = "p2"
+            news_path = state.p2_news_path or default_p2_news_path(settings.p2_news_path)
+            if news_path is None or not Path(news_path).is_file():
+                self._fail_before_task("没有找到可审计的P2新闻资料，无法继续同一流程。")
+                return
+            title, detail = "分析山东新闻", "抽取事件并核对来源、时间与价格窗口"
+
+            def operation(progress: Callable[[int, str], None]) -> FullFlowState:
+                progress(20, progress_message(ThinkingStep("compute", title, detail, "running"), "启动P2新闻分析"))
                 extractor = StructuredNewsEventExtractor(
                     build_model_gateway(settings),
-                    market_timezone=market_timezone,
+                    market_timezone=session.region_timezone or profile.timezone,
                     extraction_passes=3,
                 )
-                state = flow.run_p2(
+                return flow.run_p2(
                     state=state,
                     news_path=news_path,
                     target_path=target_path,
                     extractor=extractor,
                 )
-                if state.phase == "p2_needs_review":
-                    return state
-                progress(
-                    55,
-                    progress_message(
-                        ThinkingStep("review", "综合新闻特征", "检查覆盖率、变化次数和关系稳定性", "running"),
-                        "启动P1综合分析",
-                    ),
-                )
-                state = flow.synthesize_p1(state=state)
-                if not prepare_forecast:
-                    return state
-                progress(
-                    70,
-                    progress_message(
-                        ThinkingStep("compute", "冻结P3输入", "准备三折回测与次日96点预测数据", "running"),
-                        "启动P3方案准备",
-                    ),
-                )
+
+        elif state.phase == "p2_ready":
+            stage = "p1_synthesis"
+            title, detail = "综合新闻特征", "检查覆盖率、变化次数和关系稳定性"
+
+            def operation(progress: Callable[[int, str], None]) -> FullFlowState:
+                progress(55, progress_message(ThinkingStep("review", title, detail, "running"), "启动P1综合分析"))
+                return flow.synthesize_p1(state=state)
+
+        elif state.phase == "p1_synthesis_complete" and state.requested_forecast:
+            stage = "p3_prepare"
+            title, detail = "冻结P3输入", "准备三折回测与次日96点预测数据"
+
+            def operation(progress: Callable[[int, str], None]) -> FullFlowState:
+                progress(75, progress_message(ThinkingStep("compute", title, detail, "running"), "启动P3方案准备"))
                 return flow.prepare_p3(
                     state=state,
                     question="预测山东明天实时电价",
                     profile=profile,
                     target_path=target_path,
-                    actuals_path=actuals_path,
-                    forecasts_path=forecasts_path,
+                    actuals_path=session.inputs["actuals"].path or None,
+                    forecasts_path=session.inputs["forecasts"].path or None,
                     output_directory=self.research_output_directory / "forecasting",
-                    source_data_fingerprint=source_fingerprint,
+                    source_data_fingerprint=session.dataset_fingerprint,
                     snapshot_fetcher=self.region_fetcher,
                 )
+
+        else:
+            self.update_full_flow_state(state, state_path=flow.store.path, output_directory=flow.output_directory)
+            return
+
+        def guarded(progress: Callable[[int, str], None]) -> FullFlowState:
+            try:
+                return operation(progress)
             except Exception as exc:
-                if state is not None:
-                    failed = state.model_copy(
-                        update={
-                            "phase": "failed",
-                            "error": f"{type(exc).__name__}: {exc}",
-                            "stop_reason": "新闻分析、综合分析或P3方案准备失败；已保留完成的阶段产物",
-                        }
-                    )
-                    flow.store.save(failed)
+                failed = state.model_copy(
+                    update={
+                        "phase": "failed",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "stop_reason": f"{title}失败；已保留此前完成的阶段产物",
+                        "resume_from_phase": resume_phase,
+                        "failed_stage": stage,
+                    }
+                )
+                flow.store.save(failed)
                 raise
 
+        session.status = "running"
+        self._start_thinking("compute", title, detail)
         self._start_worker(
-            kind="full_flow_analysis",
-            operation=execute,
-            success_handler=lambda state: self.update_full_flow_state(
-                state,
-                state_path=flow.store.path,
-                output_directory=flow.output_directory,
-            ),
+            kind=f"full_flow_{stage}",
+            operation=guarded,
+            success_handler=self._full_flow_stage_completed,
+            failure_handler=self._full_flow_analysis_failed,
         )
-        self.conversation.scroll_to_bottom()
+
+    @Slot(object)
+    def _full_flow_stage_completed(self, value: object) -> None:
+        state = FullFlowState.model_validate(value)
+        resolved = self._full_flow_for_session()
+        if resolved is None:
+            self._task_failed("全流程阶段完成，但状态文件无法重新读取。")
+            return
+        flow, _ = resolved
+        self._complete_active_tool("全流程阶段已完成并保存")
+        self.update_full_flow_state(state, state_path=flow.store.path, output_directory=flow.output_directory)
+        self._pending_full_flow_resume = (
+            state.phase == "p2_ready"
+            or (state.phase == "p1_synthesis_complete" and state.requested_forecast)
+        )
+
+    @Slot(str)
+    def _full_flow_analysis_failed(self, detail: str) -> None:
+        resolved = self._full_flow_for_session()
+        headline = detail.strip().splitlines()[-1] if detail.strip() else "全流程阶段失败"
+        self._close_latest_running_trace("failed")
+        self._set_active_tool_status("failed", headline)
+        self._append_message(
+            SessionMessage(
+                role="assistant",
+                kind="error",
+                content=f"当前阶段没有完成：{headline}\n已完成的阶段和产物仍保留；可回复“重试”或“停止”。",
+            )
+        )
+        if resolved is not None:
+            flow, state = resolved
+            self.update_full_flow_state(state, state_path=flow.store.path, output_directory=flow.output_directory)
+        else:
+            self.current_session.status = "failed"
+            self._persist_and_render(keep_timeline=True)
 
     def _submit_forecast_request(self, question: str, *, record_user_message: bool = True) -> None:
         """Prepare the fixed P3 plan without allowing chat text to alter its parameters."""
@@ -1121,7 +1317,7 @@ class ResearchWorkspace(QSplitter):
         """Project the application-level P1/P2/P3 cursor into the desktop session."""
 
         session = self.current_session
-        session.pending_forecast_question = None
+        session.pending_forecast_question = state.request_text if state.requested_forecast else None
         session.full_flow_state_path = str(Path(state_path).resolve())
         if output_directory is not None:
             session.full_flow_output_directory = str(Path(output_directory).resolve())
@@ -1163,6 +1359,11 @@ class ResearchWorkspace(QSplitter):
                     study_end_time=state.p1_request.price_end.isoformat(),
                 )
             )
+        if state.runs and state.runs[-1].run_kind != "feedback":
+            latest = state.runs[-1]
+            session.run_id = latest.run_id
+            session.artifact_directory = str(latest.artifact_directory)
+            session.report_path = str(latest.report_path)
         if state.phase in {"awaiting_forecast_approval", "forecast_running"} and state.forecast_plan:
             plan = ForecastPlan.model_validate(state.forecast_plan)
             session.current_plan = plan.model_dump(mode="json")
@@ -1200,11 +1401,15 @@ class ResearchWorkspace(QSplitter):
         elif state.phase == "p1_synthesis_complete":
             session.current_plan = None
             session.plan_stale = False
-            session.status = "completed"
+            session.status = "running" if state.requested_forecast else "completed"
         elif state.phase in {"forecast_verified", "feedback_complete"}:
             session.status = "completed"
         elif state.phase == "failed":
             session.status = "failed"
+        elif state.phase == "stopped":
+            session.current_plan = None
+            session.plan_stale = False
+            session.status = "stopped"
         labels = {
             "p1_initial_complete": "P1初步分析完成",
             "p2_ready": "P2新闻证据完成",
@@ -1215,6 +1420,7 @@ class ResearchWorkspace(QSplitter):
             "forecast_verified": "P3达到目标，本轮结束",
             "feedback_complete": "P1反馈分析完成，本轮结束",
             "failed": "全流程执行失败",
+            "stopped": "全流程已停止",
         }
         previous = next(
             (
@@ -2294,8 +2500,22 @@ class ResearchWorkspace(QSplitter):
     def _task_cancelled(self) -> None:
         self._pending_execute_plan = None
         self._pending_forecast_request = None
+        self._pending_full_flow_resume = False
         session = self.current_session
         session.pending_forecast_question = None
+        if (self._task_kind or "").startswith("full_flow_"):
+            resolved = self._full_flow_for_session()
+            if resolved is not None:
+                flow, state = resolved
+                stopped = flow.stop(state, reason="用户取消了当前全流程")
+                self._close_latest_running_trace("stopped")
+                self._set_active_tool_status("stopped", "用户停止了当前任务")
+                self.update_full_flow_state(
+                    stopped,
+                    state_path=flow.store.path,
+                    output_directory=flow.output_directory,
+                )
+                return
         self._record_forecast_terminal("cancelled", "用户取消运行")
         if self.agent.has_thread(session.session_id):
             self.agent.cancel(session.session_id)
@@ -2370,11 +2590,16 @@ class ResearchWorkspace(QSplitter):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self._task_progress)
-        worker.completed.connect(success_handler)
+        self._task_success_handler = success_handler
+        self._task_failure_handler = failure_handler or self._task_failed
+        # Always cross the QObject boundary through bound slots owned by this
+        # workspace. Connecting a worker signal to a lambda executes that lambda
+        # in the worker thread and makes any QWidget work undefined behavior.
+        worker.completed.connect(self._worker_completed)
         worker.completed.connect(thread.quit)
-        worker.failed.connect(failure_handler or self._task_failed)
+        worker.failed.connect(self._worker_failed)
         worker.failed.connect(thread.quit)
-        worker.cancelled.connect(self._task_cancelled)
+        worker.cancelled.connect(self._worker_cancelled)
         worker.cancelled.connect(thread.quit)
         worker.completed.connect(worker.deleteLater)
         worker.failed.connect(worker.deleteLater)
@@ -2387,6 +2612,28 @@ class ResearchWorkspace(QSplitter):
         self._last_progress_message = ""
         self._set_busy(True)
         thread.start()
+
+    @Slot(object)
+    def _worker_completed(self, result: object) -> None:
+        """Deliver a worker result on the GUI thread before the thread is retired."""
+
+        handler = self._task_success_handler
+        if handler is not None:
+            handler(result)
+
+    @Slot(str)
+    def _worker_failed(self, detail: str) -> None:
+        """Deliver a worker failure on the GUI thread."""
+
+        handler = self._task_failure_handler
+        if handler is not None:
+            handler(detail)
+
+    @Slot()
+    def _worker_cancelled(self) -> None:
+        """Project cancellation on the GUI thread."""
+
+        self._task_cancelled()
 
     def _task_progress(self, value: int, message: str) -> None:
         session = self.current_session
@@ -2437,9 +2684,13 @@ class ResearchWorkspace(QSplitter):
         self._pending_execute_plan = None
         pending_forecast = self._pending_forecast_request
         self._pending_forecast_request = None
+        pending_full_flow = self._pending_full_flow_resume
+        self._pending_full_flow_resume = False
         self._thread = None
         self._worker = None
         self._task_kind = None
+        self._task_success_handler = None
+        self._task_failure_handler = None
         if self._thinking_widget is not None:
             self._set_active_tool_status("completed", "")
         self.conversation.send_button.setEnabled(True)
@@ -2447,6 +2698,8 @@ class ResearchWorkspace(QSplitter):
         self._persist_and_render(keep_timeline=True)
         if pending_plan is not None:
             QTimer.singleShot(0, lambda plan=pending_plan: self.run_plan(plan))
+        elif pending_full_flow:
+            QTimer.singleShot(0, self._resume_full_flow)
         elif pending_forecast:
             QTimer.singleShot(
                 0,

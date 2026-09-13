@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 APP_DIRECTORY_NAME = "PriceResearchAgent"
-DEFAULT_P2_NEWS_FILENAME = "shandong_p2_test_news_v2.jsonl"
+DEFAULT_P2_NEWS_FILENAME = "shandong_p2_test_news.jsonl"
 
 
 def application_data_directory() -> Path:

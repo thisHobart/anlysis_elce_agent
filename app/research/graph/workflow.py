@@ -14,6 +14,8 @@ from app.research.agent.errors import (
     InsufficientDataError,
     PlanCompatibilityError,
     RepairablePlanError,
+    ResearchModelContextLimitError,
+    ResearchModelOutputTruncatedError,
     ResearchModelUnavailableError,
     ResearchPlanValidationError,
     SkillVersionMismatchError,
@@ -625,7 +627,14 @@ def build_research_workflow(
             packet = exception_feedback(
                 exc,
                 source="plan_validator",
-                retryable=isinstance(exc, ResearchModelUnavailableError),
+                retryable=isinstance(
+                    exc,
+                    (
+                        ResearchModelUnavailableError,
+                        ResearchModelOutputTruncatedError,
+                        ResearchModelContextLimitError,
+                    ),
+                ),
                 requires_user=True,
             )
             return {

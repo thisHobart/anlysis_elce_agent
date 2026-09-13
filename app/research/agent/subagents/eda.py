@@ -13,13 +13,20 @@ from app.config import Settings, get_settings
 from app.llm.factory import build_model_gateway
 from app.llm.gateway import (
     ModelConfigurationError,
+    ModelContextLimitError,
     ModelGateway,
     ModelGatewayError,
     ModelMessage,
+    ModelOutputTruncatedError,
     ModelResponseError,
     ModelToolCall,
 )
-from app.research.agent.errors import ResearchModelUnavailableError, ResearchPlanValidationError
+from app.research.agent.errors import (
+    ResearchModelContextLimitError,
+    ResearchModelOutputTruncatedError,
+    ResearchModelUnavailableError,
+    ResearchPlanValidationError,
+)
 from app.research.agent.prompts import (
     PLANNING_FUNCTION_REPAIR_SYSTEM_PROMPT,
     PLANNING_PROMPT_VERSION,
@@ -441,6 +448,10 @@ class ModelEDAPlanner:
             return self.gateway.invoke_structured(messages=messages, schema=EDAPlanDraft)
         except KeyError as exc:
             raise ResearchPlanValidationError(f"大模型调用了未注册研究函数：{exc.args[0]}") from exc
+        except ModelOutputTruncatedError as exc:
+            raise ResearchModelOutputTruncatedError(f"大模型规划输出达到长度限制：{exc}") from exc
+        except ModelContextLimitError as exc:
+            raise ResearchModelContextLimitError(f"大模型规划请求超过上下文限制：{exc}") from exc
         except ModelResponseError as exc:
             raise ResearchPlanValidationError(f"大模型返回的研究方案无法解析：{exc}") from exc
         except (ModelConfigurationError, ModelGatewayError) as exc:

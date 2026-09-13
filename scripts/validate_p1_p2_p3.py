@@ -20,13 +20,6 @@ from PySide6.QtWidgets import QApplication
 
 from app.desktop.main_window import MainWindow
 from app.desktop.session import SessionStore
-from app.integrations.mcp import (
-    BrowserMCPNewsCollector,
-    BrowserNewsTarget,
-    MCPClient,
-    freeze_collected_news,
-    load_mcp_server_catalog,
-)
 from app.llm.factory import build_model_gateway
 from app.research.data.sources.regions import RegionPriceFetch
 from app.research.forecasting.data import prepare_forecast_plan
@@ -46,7 +39,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--news",
         type=Path,
-        default=Path("data/news/shandong_p2_test_news_v2.jsonl"),
+        default=Path("data/news/shandong_p2_test_news.jsonl"),
         help="Frozen local Shandong JSONL",
     )
     parser.add_argument("--output", type=Path, default=Path("artifacts/acceptance"))
@@ -253,6 +246,14 @@ def main() -> int:
             extractor = ObviousNewsEventExtractor(market_timezone="UTC")
         else:
             if args.mcp_targets:
+                from app.integrations.mcp import (
+                    BrowserMCPNewsCollector,
+                    BrowserNewsTarget,
+                    MCPClient,
+                    freeze_collected_news,
+                    load_mcp_server_catalog,
+                )
+
                 target_payload = json.loads(args.mcp_targets.read_text(encoding="utf-8"))
                 if not isinstance(target_payload, list):
                     raise ValueError("--mcp-targets 必须是JSON数组")

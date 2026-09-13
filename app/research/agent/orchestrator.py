@@ -11,13 +11,20 @@ from app.config import Settings, get_settings
 from app.llm.factory import build_model_gateway
 from app.llm.gateway import (
     ModelConfigurationError,
+    ModelContextLimitError,
     ModelGateway,
     ModelGatewayError,
     ModelMessage,
+    ModelOutputTruncatedError,
     ModelResponseError,
 )
 from app.research.agent.context import compact_episode_context
-from app.research.agent.errors import ResearchModelUnavailableError, ResearchPlanValidationError
+from app.research.agent.errors import (
+    ResearchModelContextLimitError,
+    ResearchModelOutputTruncatedError,
+    ResearchModelUnavailableError,
+    ResearchPlanValidationError,
+)
 from app.research.agent.prompts import DIALOGUE_PROMPT_VERSION, DIALOGUE_SYSTEM_PROMPT
 from app.research.agent.retrieval import select_conversation_context
 from app.research.agent.schemas import ConversationMessage, EDAPlan, EDAToolName
@@ -258,6 +265,93 @@ def compact_evidence(
     return compact
 
 
+def _compact_dialogue_retry_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep the facts needed to route a turn after a truncated dialogue response."""
+
+    current_plan = payload.get("current_plan")
+    if isinstance(current_plan, dict):
+        current_plan = {
+            key: current_plan.get(key)
+            for key in (
+                "plan_id",
+                "plan_kind",
+                "question",
+                "objective",
+                "skill_name",
+                "skill_version",
+                "selected_variables",
+                "variable_selection_stage",
+                "steps",
+            )
+            if key in current_plan
+        }
+
+    def short_messages(items: Any, limit: int) -> list[dict[str, Any]]:
+        if not isinstance(items, list):
+            return []
+        compacted = []
+        for item in items[-limit:]:
+            if not isinstance(item, dict):
+                continue
+            compacted.append(
+                {
+                    key: (str(value)[-1200:] if key == "content" else value)
+                    for key, value in item.items()
+                    if key in {"role", "content", "turn_id", "episode_id"}
+                }
+            )
+        return compacted
+
+    def short_turns(items: Any, limit: int) -> list[dict[str, Any]]:
+        if not isinstance(items, list):
+            return []
+        turns = []
+        for item in items[-limit:]:
+            if not isinstance(item, dict):
+                continue
+            turns.append(
+                {
+                    "turn_id": item.get("turn_id"),
+                    "messages": short_messages(item.get("messages"), 4),
+                    "relevance": item.get("relevance"),
+                }
+            )
+        return turns
+
+    skills = payload.get("available_skills")
+    compact_skills = [
+        {key: item.get(key) for key in ("name", "version", "domain") if key in item}
+        for item in skills or []
+        if isinstance(item, dict)
+    ]
+    capabilities = payload.get("output_capabilities")
+    return {
+        "prompt_version": payload.get("prompt_version"),
+        "retry_reason": "上一响应达到输出长度限制；只返回一个简短且完整的结构化决策，response不超过600字。",
+        "question": payload.get("question"),
+        "session_status": payload.get("session_status"),
+        "has_executable_data": payload.get("has_executable_data"),
+        "interaction_context": payload.get("interaction_context"),
+        "conversation_history": short_messages(payload.get("conversation_history"), 4),
+        "earlier_related_turns": short_turns(payload.get("earlier_related_turns"), 2),
+        "episode_memory": list(payload.get("episode_memory") or [])[-4:],
+        "current_plan": current_plan,
+        "study": payload.get("study"),
+        "data_profile": payload.get("data_profile"),
+        "quality_issues": list(payload.get("quality_issues") or [])[:8],
+        "evidence": payload.get("evidence"),
+        "available_variables": payload.get("available_variables"),
+        "available_skills": compact_skills,
+        "allowed_function_names": sorted((payload.get("allowed_functions") or {}).keys()),
+        "intent_rules": payload.get("intent_rules"),
+        "revision_contract": payload.get("revision_contract"),
+        "skill_contract": payload.get("skill_contract"),
+        "supported_workflows": (
+            capabilities.get("supported_workflows") if isinstance(capabilities, dict) else None
+        ),
+    }
+
+
 class ModelResearchDialogue:
     """Call the required model for every research conversation decision."""
 
@@ -383,12 +477,22 @@ class ModelResearchDialogue:
                 "new_plan_skill_name": "choose_from_available_skills",
             },
         }
-        messages = [
-            ModelMessage(role="system", content=DIALOGUE_SYSTEM_PROMPT),
-            ModelMessage(role="user", content=json.dumps(payload, ensure_ascii=False)),
-        ]
-        try:
+        def invoke(value: dict[str, Any]) -> DialogueDecision:
+            messages = [
+                ModelMessage(role="system", content=DIALOGUE_SYSTEM_PROMPT),
+                ModelMessage(role="user", content=json.dumps(value, ensure_ascii=False)),
+            ]
             return self.gateway.invoke_structured(messages=messages, schema=DialogueDecision)
+
+        try:
+            try:
+                return invoke(payload)
+            except ModelOutputTruncatedError:
+                return invoke(_compact_dialogue_retry_payload(payload))
+        except ModelOutputTruncatedError as exc:
+            raise ResearchModelOutputTruncatedError(f"大模型对话输出达到长度限制：{exc}") from exc
+        except ModelContextLimitError as exc:
+            raise ResearchModelContextLimitError(f"大模型对话请求超过上下文限制：{exc}") from exc
         except ModelResponseError as exc:
             raise ResearchPlanValidationError(f"大模型返回的对话决策无法解析：{exc}") from exc
         except (ModelConfigurationError, ModelGatewayError) as exc:

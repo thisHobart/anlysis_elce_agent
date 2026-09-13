@@ -292,7 +292,7 @@ def test_forecast_execution_failure_is_persisted_without_becoming_bad_performanc
 
 
 def test_frozen_shandong_news_corpus_has_auditable_collection_metadata():
-    corpus = Path(__file__).resolve().parents[2] / "data" / "news" / "shandong_p2_test_news_v2.jsonl"
+    corpus = Path(__file__).resolve().parents[2] / "data" / "news" / "shandong_p2_test_news.jsonl"
     records = JsonlCollectedNewsAdapter(corpus).load()
     assert 1 <= len(records) <= 20
     assert all("CN-SHANDONG" in record.market_tags for record in records)
@@ -305,6 +305,4 @@ def test_frozen_shandong_news_corpus_has_auditable_collection_metadata():
     manifest = json.loads(corpus.with_suffix(".manifest.json").read_text(encoding="utf-8"))
     assert manifest["record_count"] == len(records)
     assert manifest["source_file_sha256"] == hashlib.sha256(corpus.read_bytes()).hexdigest()
-    assert manifest["parent_source_file_sha256"]
-    assert len(manifest["replacements"]) == 4
     assert manifest["browser_mcp_changed"] is False

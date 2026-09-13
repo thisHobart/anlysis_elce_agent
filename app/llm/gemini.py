@@ -9,7 +9,11 @@ from pydantic import BaseModel, ValidationError
 
 from app.config import Settings, get_settings
 from app.llm import compat
-from app.llm.context_safety import ensure_complete_response, is_output_truncation_error
+from app.llm.context_safety import (
+    ensure_complete_response,
+    is_output_truncation_error,
+    structured_request_budget,
+)
 from app.llm.gateway import (
     ModelConfigurationError,
     ModelGatewayError,
@@ -134,6 +138,13 @@ class GeminiModelGateway:
     ) -> StructuredResult:
         """Use Gemini's native response schema and then validate the result locally."""
 
+        structured_request_budget(
+            messages,
+            schema,
+            context_window_tokens=self.settings.llm_context_window_tokens,
+            reserved_output_tokens=self.settings.llm_max_output_tokens,
+            safety_tokens=self.settings.llm_context_safety_tokens,
+        )
         prepared = transport_messages(messages)
         try:
             result = (

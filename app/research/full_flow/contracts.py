@@ -19,6 +19,15 @@ FlowPhase = Literal[
     "forecast_verified",
     "feedback_complete",
     "failed",
+    "stopped",
+]
+ResumableFlowPhase = Literal[
+    "p1_initial_complete",
+    "p2_needs_review",
+    "p2_ready",
+    "p1_synthesis_complete",
+    "awaiting_forecast_approval",
+    "forecast_running",
 ]
 
 
@@ -98,6 +107,8 @@ class FullFlowState(BaseModel):
     phase: FlowPhase = "p1_initial_complete"
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    request_text: str = ""
+    requested_forecast: bool = False
     approved_analysis_scope: tuple[
         Literal["p1_initial", "p2", "p1_synthesis", "p1_feedback"], ...
     ] = ("p1_initial", "p2", "p1_synthesis", "p1_feedback")
@@ -120,3 +131,5 @@ class FullFlowState(BaseModel):
     feedback: ForecastFeedback | None = None
     stop_reason: str | None = None
     error: str | None = None
+    resume_from_phase: ResumableFlowPhase | None = None
+    failed_stage: Literal["p2", "p1_synthesis", "p3_prepare", "p3_execute"] | None = None
