@@ -39,6 +39,7 @@ FlowStage = Literal[
 ]
 FlowAction = Literal[
     "continue",
+    "request_p3",
     "retry",
     "stop",
     "review_p2",
@@ -261,7 +262,9 @@ def synchronize_flow_lifecycle(state: FullFlowState) -> FullFlowState:
         "p1_initial_complete": ("continue", "stop"),
         "p2_needs_review": ("review_p2", "retry", "stop"),
         "p2_ready": ("continue", "stop"),
-        "p1_synthesis_complete": (("continue", "stop") if state.requested_forecast else ("new_goal",)),
+        "p1_synthesis_complete": (
+            ("continue", "stop") if state.requested_forecast else ("request_p3", "new_goal")
+        ),
         "awaiting_forecast_approval": ("approve_forecast", "stop"),
         "forecast_running": ("approve_forecast", "stop"),
         "forecast_verified": ("new_goal",),

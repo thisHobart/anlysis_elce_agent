@@ -513,3 +513,53 @@ def test_frozen_shandong_news_corpus_has_auditable_collection_metadata():
     assert manifest["record_count"] == len(records)
     assert manifest["source_file_sha256"] == hashlib.sha256(corpus.read_bytes()).hexdigest()
     assert manifest["browser_mcp_changed"] is False
+
+
+def test_completed_analysis_can_explicitly_extend_to_p3_without_rerunning_p1_or_p2(
+    tmp_path: Path,
+):
+    moment = datetime(2026, 9, 13, tzinfo=UTC)
+    p1_report = _touch(tmp_path / "p1" / "report.md")
+    flow = FullResearchFlow(
+        store=FullFlowStore(tmp_path / "flow.json"),
+        output_directory=tmp_path / "runs",
+    )
+    state = flow.start(
+        p1_run=FlowRunReference(
+            run_kind="eda",
+            run_id="p1",
+            artifact_directory=p1_report.parent,
+            report_path=p1_report,
+        ),
+        eda_summary={
+            "price": {
+                "start_time": moment.isoformat(),
+                "end_time": moment.isoformat(),
+                "distribution": {},
+            }
+        },
+        information_cutoff=moment,
+        request_text="结合新闻，再次分析电价",
+        requested_forecast=False,
+    )
+    completed = flow.store.save(
+        state.model_copy(update={"phase": "p1_synthesis_complete"})
+    )
+    runs_before = completed.runs
+
+    extended = flow.request_p3(completed)
+
+    assert extended.flow_id == completed.flow_id
+    assert extended.phase == "p1_synthesis_complete"
+    assert extended.requested_forecast is True
+    assert extended.current_stage == "p3_prepare"
+    assert extended.allowed_actions == ("continue", "stop")
+    assert extended.runs == runs_before
+    assert extended.requested_stages == (
+        "p2",
+        "p1_synthesis",
+        "p3_prepare",
+        "p3_execute",
+        "p1_feedback",
+    )
+    assert flow.request_p3(extended) == extended

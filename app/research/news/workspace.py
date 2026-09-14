@@ -199,7 +199,10 @@ class NewsWorkspace:
         if decision != "rejected" and usage == "analysis" and any(
             event.analysis_eligibility != "eligible" for event in result.events
         ):
-            raise ValueError("事件时间或覆盖范围仍不满足精确分析条件；请修正、拒绝或仅作背景")
+            raise ValueError(
+                "当前选择的是“接受并用于分析”，但事件时间或覆盖范围仍不满足精确分析条件；"
+                "请改选“修正”“拒绝”或“仅作背景”"
+            )
         if usage == "background_only":
             if not result.events or any(
                 event.analysis_eligibility not in {"eligible", "needs_time_review"}

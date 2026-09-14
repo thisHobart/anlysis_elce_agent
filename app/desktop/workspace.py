@@ -169,7 +169,18 @@ def _requests_new_full_flow(question: str) -> bool:
 
 def _full_flow_command(question: str) -> str | None:
     compact = "".join(question.casefold().split()).translate(str.maketrans("", "", "，,。！？!?"))
-    if compact in {"继续", "继续执行", "下一步", "继续第三阶段", "进入第三阶段", "开始第三阶段"}:
+    if compact in {
+        "开始p1",
+        "开始p1阶段",
+        "重新开始p1",
+        "重新开始p1阶段",
+        "新一轮p1",
+        "开始新的研究",
+    }:
+        return "new_goal"
+    if compact in {"继续第三阶段", "进入第三阶段", "开始第三阶段", "继续p3", "开始p3"}:
+        return "request_p3"
+    if compact in {"继续", "继续执行", "下一步"}:
         return "continue"
     if compact in {"重试", "重新尝试", "再试一次"}:
         return "retry"
@@ -1066,6 +1077,52 @@ class ResearchWorkspace(QSplitter):
         output = session.full_flow_output_directory or str(store.path.parent / "runs")
         return FullResearchFlow(store=store, output_directory=output), state
 
+    def _release_terminal_full_flow(self, state: FullFlowState) -> None:
+        """Return a terminal full-flow conversation to ordinary dialogue safely."""
+
+        session = self.current_session
+        self._cancel_plan_feedback_window()
+        self._set_plan_message_state("stopped")
+        for run in session.runs:
+            run.memory_status = "stale"
+        if self.agent.has_thread(session.session_id):
+            self.agent.delete_thread(session.session_id)
+        session.current_plan = None
+        session.plan_stale = False
+        session.run_id = None
+        session.artifact_directory = None
+        session.report_path = None
+        session.data_profile = None
+        session.quality_report = None
+        session.latest_eda_summary = None
+        session.latest_evaluation = None
+        session.graph_event_count = 0
+        session.graph_event_sequence = 0
+        session.full_flow_state_path = None
+        session.full_flow_output_directory = None
+        session.news_features_path = None
+        session.news_run_id = None
+        session.news_p1_run_id = None
+        session.pending_forecast_question = None
+        session.status = "idle"
+        self._active_interrupt_id = None
+        self._active_state_revision = None
+        self._active_interrupt_kind = None
+        self._append_message(
+            SessionMessage(
+                role="system",
+                kind="notice",
+                content=(
+                    "已退出停止的全流程。旧流程、报告和审计记录均已保留；"
+                    "当前消息将作为新的普通对话或P1研究处理。"
+                ),
+                payload={
+                    "released_full_flow_id": state.flow_id,
+                    "released_phase": state.phase,
+                },
+            )
+        )
+
     def _handle_full_flow_input(self, question: str) -> bool:
         """Resolve commands against the durable P1/P2/P3 cursor before model routing."""
 
@@ -1073,6 +1130,22 @@ class ResearchWorkspace(QSplitter):
         if resolved is None:
             return False
         flow, state = resolved
+        command = _full_flow_command(question)
+        terminal_control_commands = {
+            "continue",
+            "request_p3",
+            "retry",
+            "stop",
+            "review_help",
+            "review_done",
+        }
+        if (
+            state.phase == "stopped"
+            and command not in terminal_control_commands
+            and not _requests_new_full_flow(question)
+        ):
+            self._release_terminal_full_flow(state)
+            return False
         if _requests_new_full_flow(question):
             self._append_message(SessionMessage(role="user", kind="text", content=question, turn_id=uuid4().hex))
             self._append_message(
@@ -1084,7 +1157,6 @@ class ResearchWorkspace(QSplitter):
             )
             self._persist_and_render(keep_timeline=True)
             return True
-        command = _full_flow_command(question)
         guarded_phases = {
             "p1_initial_complete",
             "p2_needs_review",
@@ -1118,6 +1190,24 @@ class ResearchWorkspace(QSplitter):
                 output_directory=flow.output_directory,
             )
             return True
+        if command == "new_goal":
+            self._append_message(
+                SessionMessage(
+                    role="assistant",
+                    kind="notice",
+                    content=(
+                        "当前全流程仍在进行。可先回复“停止”结束它，"
+                        "或点击左侧“新的研究”并行开始另一项研究。"
+                    ),
+                    payload={
+                        "full_flow_id": state.flow_id,
+                        "phase": state.phase,
+                        "allowed_actions": list(state.allowed_actions),
+                    },
+                )
+            )
+            self._persist_and_render(keep_timeline=True)
+            return True
         if state.phase == "awaiting_forecast_approval":
             self._append_message(
                 SessionMessage(
@@ -1133,15 +1223,51 @@ class ResearchWorkspace(QSplitter):
             )
             self._persist_and_render(keep_timeline=True)
             return True
-        if state.phase in {"forecast_verified", "feedback_complete", "stopped"} or (
-            state.phase == "p1_synthesis_complete" and not state.requested_forecast
-        ):
-            label = "当前全流程已经停止" if state.phase == "stopped" else "当前全流程已经完成"
+        if state.phase == "p1_synthesis_complete" and not state.requested_forecast:
+            forecast_request = _is_forecast_request(
+                question,
+                has_price_context=bool(self.current_session.inputs["target"].path),
+            )
+            if command == "request_p3" or forecast_request:
+                state = flow.request_p3(state)
+                self.update_full_flow_state(
+                    state,
+                    state_path=flow.store.path,
+                    output_directory=flow.output_directory,
+                )
+                self._resume_full_flow()
+                return True
             self._append_message(
                 SessionMessage(
                     role="assistant",
                     kind="notice",
-                    content=f"{label}，不会重复执行已完成阶段；如需重做，请明确提出“新一轮新闻分析”。",
+                    content=(
+                        "当前目标只包含P1综合分析，因此本轮已经完成。"
+                        "如需沿用当前新闻特征进入P3，请发送“预测山东明天实时电价”或“继续第三阶段”；"
+                        "程序会先生成单独的P3确认卡，不会重跑P1或P2。"
+                    ),
+                    payload={
+                        "full_flow_id": state.flow_id,
+                        "phase": state.phase,
+                        "allowed_actions": ["request_p3", "new_goal"],
+                    },
+                )
+            )
+            self._persist_and_render(keep_timeline=True)
+            return True
+        if state.phase in {"forecast_verified", "feedback_complete", "stopped"}:
+            content = (
+                "当前全流程已经停止，不会重复执行已完成阶段。"
+                "如需使用右侧当前数据重新开始，请发送“开始P1阶段”，或直接描述新的分析问题；"
+                "旧流程和报告会继续保留。"
+                if state.phase == "stopped"
+                else "当前全流程已经完成，不会重复执行已完成阶段；如需重做，请点击左侧“新的研究”。"
+            )
+            self._append_message(
+                SessionMessage(
+                    role="assistant",
+                    kind="notice",
+                    content=content,
                     payload={
                         "full_flow_id": state.flow_id,
                         "phase": state.phase,
@@ -1742,11 +1868,7 @@ class ResearchWorkspace(QSplitter):
             session.current_plan = None
             session.plan_stale = False
             session.status = (
-                "understanding"
-                if state.requested_forecast and self.is_busy
-                else "awaiting_user"
-                if state.requested_forecast
-                else "completed"
+                "understanding" if state.requested_forecast and self.is_busy else "awaiting_user"
             )
         elif state.phase in {"forecast_verified", "feedback_complete"}:
             session.status = "completed"
@@ -1763,7 +1885,11 @@ class ResearchWorkspace(QSplitter):
             "p1_initial_complete": "P1初步分析完成",
             "p2_ready": "P2新闻证据完成",
             "p2_needs_review": "P2存在待复核项",
-            "p1_synthesis_complete": "P1综合分析完成，等待准备P3",
+            "p1_synthesis_complete": (
+                "P1综合分析完成，正在准备P3"
+                if state.requested_forecast
+                else "P1综合分析完成；如需预测，请发送“继续第三阶段”"
+            ),
             "awaiting_forecast_approval": "P3方案等待单独确认",
             "forecast_running": "P3正在运行",
             "forecast_verified": "P3达到目标，本轮结束",

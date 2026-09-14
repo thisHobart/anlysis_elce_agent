@@ -538,7 +538,10 @@ def test_p2_review_dialog_background_action_writes_a_real_audit_record(
     monkeypatch.setattr(QMessageBox, "warning", lambda *_args, **_kwargs: QMessageBox.StandardButton.Ok)
     dialog = P2ReviewDialog(flow.get_p2_review_summary(blocked.flow_id), submit=flow.submit_p2_review)
     try:
-        dialog.disposition.setCurrentIndex(dialog.disposition.findData("background"))
+        assert set(dialog.disposition_buttons) == {"accept", "correct", "reject", "background"}
+        assert dialog.disposition_buttons["background"].isEnabled()
+        assert dialog.disposition_buttons["background"].isChecked()
+        dialog.disposition_buttons["background"].setChecked(True)
         dialog.reviewer.setText("桌面验收员")
         dialog.reason.setPlainText("事实证据可信，但来源只给出了日期")
         dialog._save()
@@ -717,6 +720,52 @@ def test_completed_flow_reuses_id_until_user_explicitly_requests_a_new_round(
         qt_app.processEvents()
 
 
+def test_completed_analysis_accepts_continue_p3_in_the_same_desktop_flow(
+    qt_app: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    plan = _plan(tmp_path)
+    flow, state = _awaiting_state(tmp_path, plan)
+    completed = flow.store.save(
+        state.model_copy(
+            update={
+                "phase": "p1_synthesis_complete",
+                "requested_forecast": False,
+                "requested_stages": ("p2", "p1_synthesis"),
+                "forecast_plan": None,
+                "forecast_plan_fingerprint": None,
+            }
+        )
+    )
+    window = MainWindow(session_store=SessionStore(tmp_path / "sessions.json"))
+    workspace = window.workspace
+    resumed: list[bool] = []
+    monkeypatch.setattr(workspace, "_resume_full_flow", lambda: resumed.append(True))
+    try:
+        workspace.update_full_flow_state(
+            completed,
+            state_path=flow.store.path,
+            output_directory=flow.output_directory,
+        )
+
+        assert workspace.current_session.status == "awaiting_user"
+        assert "继续第三阶段" in workspace.current_session.messages[-1].content
+        runs_before = flow.store.load().runs
+
+        workspace.submit_question("继续第三阶段")
+
+        extended = flow.store.load()
+        assert resumed == [True]
+        assert extended.flow_id == completed.flow_id
+        assert extended.requested_forecast is True
+        assert extended.current_stage == "p3_prepare"
+        assert extended.runs == runs_before
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
 def test_stop_and_reopen_keep_the_same_terminal_flow_without_resuming_work(
     qt_app: QApplication,
     tmp_path: Path,
@@ -768,6 +817,20 @@ def test_stop_and_reopen_keep_the_same_terminal_flow_without_resuming_work(
         assert flow.store.load().flow_id == resumable.flow_id
         assert flow.store.load().phase == "stopped"
         assert "不会重复执行" in reopened.workspace.current_session.messages[-1].content
+
+        handled = reopened.workspace._handle_full_flow_input("对山东电价进行分析")
+
+        assert handled is False
+        released = reopened.workspace.current_session
+        assert released.status == "idle"
+        assert released.full_flow_state_path is None
+        assert released.full_flow_output_directory is None
+        assert released.run_id is None
+        assert released.latest_eda_summary is None
+        assert all(run.memory_status == "stale" for run in released.runs)
+        assert flow.store.path.is_file()
+        assert flow.store.load().phase == "stopped"
+        assert "当前消息将作为新的普通对话或P1研究处理" in released.messages[-1].content
     finally:
         reopened.close()
         qt_app.processEvents()

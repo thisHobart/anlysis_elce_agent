@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QComboBox,
     QDialog,
     QFormLayout,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QRadioButton,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -190,13 +192,28 @@ class P2ReviewDialog(QDialog):
         detail_layout.addWidget(self.body)
 
         selection = QFormLayout()
-        self.disposition = QComboBox()
-        self.disposition.addItem("接受并用于分析", "accept")
-        self.disposition.addItem("修正后用于分析", "correct")
-        self.disposition.addItem("拒绝并排除", "reject")
-        self.disposition.addItem("接受并仅作背景", "background")
-        self.disposition.currentIndexChanged.connect(self._update_editor_state)
-        selection.addRow("处置", self.disposition)
+        disposition_panel = QWidget()
+        disposition_layout = QVBoxLayout(disposition_panel)
+        disposition_layout.setContentsMargins(0, 0, 0, 0)
+        disposition_layout.setSpacing(3)
+        self.disposition_group = QButtonGroup(self)
+        self.disposition_buttons: dict[str, QRadioButton] = {}
+        for action, label in (
+            ("accept", "接受：用于精确事件分析和预测特征"),
+            ("correct", "修正：修改字段后用于精确分析"),
+            ("reject", "拒绝：排除本条抽取结果"),
+            ("background", "仅作背景：保留事实，但不生成事件统计和预测特征"),
+        ):
+            button = QRadioButton(label)
+            button.setProperty("reviewAction", action)
+            button.toggled.connect(lambda _checked=False: self._update_editor_state())
+            self.disposition_group.addButton(button)
+            self.disposition_buttons[action] = button
+            disposition_layout.addWidget(button)
+        selection.addRow("处置（四选一）", disposition_panel)
+        self.action_help = QLabel()
+        self.action_help.setWordWrap(True)
+        selection.addRow("处置说明", self.action_help)
         self.candidate = QComboBox()
         self.candidate.currentIndexChanged.connect(self._candidate_changed)
         selection.addRow("抽取候选", self.candidate)
@@ -311,9 +328,8 @@ class P2ReviewDialog(QDialog):
         self.blocking.setText(
             "阻断原因：" + ("；".join(item.blocking_reasons) if item.blocking_reasons else "无；本条为可选抽查")
         )
-        self.disposition.model().item(3).setEnabled(item.allows_background_only)
-        if self.disposition.currentData() == "background" and not item.allows_background_only:
-            self.disposition.setCurrentIndex(0)
+        background_button = self.disposition_buttons["background"]
+        background_button.setEnabled(item.allows_background_only)
         candidates: list[tuple[str, dict[str, Any]]] = []
         original = _result_as_model_candidate(item.result)
         if original is not None:
@@ -327,7 +343,24 @@ class P2ReviewDialog(QDialog):
         self.candidate.clear()
         for label, _value in candidates:
             self.candidate.addItem(label)
+        if item.review_status == "rejected":
+            self.disposition_buttons["reject"].setChecked(True)
+        elif item.review_status == "corrected":
+            self.disposition_buttons["correct"].setChecked(True)
+        elif item.review_status == "accepted" and item.review_use == "background_only":
+            background_button.setChecked(True)
+        elif item.review_status == "accepted":
+            self.disposition_buttons["accept"].setChecked(True)
+        elif item.allows_background_only:
+            background_button.setChecked(True)
+        elif item.required and candidates:
+            self.disposition_buttons["correct"].setChecked(True)
+        elif item.required:
+            self.disposition_buttons["reject"].setChecked(True)
+        else:
+            self.disposition_buttons["accept"].setChecked(True)
         self._candidate_changed(0)
+        self._update_editor_state()
 
     def _candidate_changed(self, index: int) -> None:
         if index < 0 or index >= len(self._current_candidates):
@@ -427,7 +460,9 @@ class P2ReviewDialog(QDialog):
         event["evidence"] = evidence
 
     def _update_editor_state(self) -> None:
-        correcting = self.disposition.currentData() == "correct"
+        selected = self.disposition_group.checkedButton()
+        action = str(selected.property("reviewAction")) if selected is not None else "accept"
+        correcting = action == "correct"
         for widget in (
             self.candidate,
             self.event_index,
@@ -448,6 +483,18 @@ class P2ReviewDialog(QDialog):
             self.time_evidence_quote,
         ):
             widget.setEnabled(correcting)
+        item = self._selected_item()
+        if action == "background":
+            detail = "该事件只保留为文字背景；不会产生事件时点、公告、活跃事件或预测特征。"
+        elif action == "correct":
+            detail = "请修改下方中文字段；保存时仍会校验证据原文和事件结构。"
+        elif action == "reject":
+            detail = "原文和原始候选仍保留在审计记录中，但本条结果会从分析中排除。"
+        else:
+            detail = "只有时间、证据和必需字段均满足精确分析条件时才能接受。"
+        if item is not None and not item.allows_background_only:
+            detail += " 当前条目不满足“仅作背景”条件，因此该选项已禁用。"
+        self.action_help.setText(detail)
 
     def _save(self) -> None:
         item = self._selected_item()
@@ -458,7 +505,8 @@ class P2ReviewDialog(QDialog):
         if not reviewer or not reason:
             QMessageBox.warning(self, "复核未保存", "复核人和处置原因都必须填写。")
             return
-        action = str(self.disposition.currentData())
+        selected = self.disposition_group.checkedButton()
+        action = str(selected.property("reviewAction")) if selected is not None else "accept"
         decision = "accepted"
         use = "analysis"
         corrected = None

@@ -318,6 +318,28 @@ class FullResearchFlow:
         )
         return self.get_p2_review_summary(state.flow_id)
 
+    def request_p3(self, state: FullFlowState) -> FullFlowState:
+        """Explicitly extend a completed P1/P2 flow to P3 without rerunning prior stages."""
+
+        latest = self._load_state_for_flow(state.flow_id)
+        if latest.phase != "p1_synthesis_complete":
+            raise ValueError("只有P1综合分析完成后才能追加P3预测")
+        if latest.requested_forecast:
+            return latest
+        requested_stages = tuple(
+            dict.fromkeys((*latest.requested_stages, "p3_prepare", "p3_execute", "p1_feedback"))
+        )
+        return self.store.save(
+            latest.model_copy(
+                update={
+                    "requested_forecast": True,
+                    "requested_stages": requested_stages,
+                    "stop_reason": None,
+                    "blocked_reason": None,
+                }
+            )
+        )
+
     def revalidate_p2(
         self,
         flow_id: str,
