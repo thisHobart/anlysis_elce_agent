@@ -131,9 +131,8 @@ QFrame#toolMessage {
     border-radius: 8px;
 }
 QFrame#thinkingMessage {
-    background: #FAFBFC;
-    border: 1px solid #E7EAEF;
-    border-radius: 10px;
+    background: transparent;
+    border: none;
 }
 QLabel#thinkingStatus {
     color: #7A8194;
@@ -148,6 +147,35 @@ QLabel#stepStage {
 }
 QLabel#stepTitle { font-size: 12.5px; color: #2A3040; }
 QLabel#stepMark { font-size: 12px; color: #98A2B3; }
+QFrame#processStep {
+    background: transparent;
+    border: none;
+    border-left: 1px solid #DDE2EA;
+}
+QPushButton#processStepToggle {
+    background: transparent;
+    border: none;
+    color: #667085;
+    min-height: 18px;
+    padding: 0;
+}
+QLabel#processStepTitle { font-weight: 600; color: #2A3040; }
+QLabel#processStepStatus { color: #667085; font-size: 11.5px; }
+QLabel#processSectionTitle {
+    color: #3F51B5;
+    font-size: 11.5px;
+    font-weight: 600;
+    margin-top: 3px;
+}
+QLabel#processThought, QLabel#processResult, QLabel#processActionDetail {
+    color: #5C6475;
+    font-size: 12px;
+}
+QLabel#processActionTitle { color: #2A3040; font-size: 12.5px; }
+QLabel#processActionStatus, QLabel#processActionMark {
+    color: #667085;
+    font-size: 11.5px;
+}
 QLabel#toolTitle { font-weight: 500; }
 QLabel[traceStatus="running"] { color: #3F51B5; }
 QLabel[traceStatus="completed"] { color: #0F766E; }

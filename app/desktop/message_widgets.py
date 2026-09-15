@@ -6,8 +6,8 @@ import json
 from html import escape
 from typing import Any
 
-from PySide6.QtCore import Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPen
 from PySide6.QtWidgets import (
     QDialog,
     QFrame,
@@ -24,6 +24,7 @@ from app.desktop.report_view import open_report
 from app.research.agent.schemas import AgentRunResult, EDAPlan, EDAResearchScope
 from app.research.data.sources.summary import DataSummary, parse_summary
 from app.research.forecasting.contracts import ForecastPlan
+from app.research.graph.process_events import ProcessEvent
 from app.research.tools.catalog import FUNCTION_CATALOG
 
 STATUS_MARK = {
@@ -175,46 +176,279 @@ class ThinkingStepRow(QWidget):
             self.detail_label.setVisible(bool(detail))
 
 
+class ThinkingSpinner(QWidget):
+    """Small animated activity mark used instead of a thinking card."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("thinkingSpinner")
+        self.setFixedSize(16, 16)
+        self.setAccessibleName("正在思考")
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(80)
+        self._timer.timeout.connect(self._advance)
+        self._timer.start()
+
+    def _advance(self) -> None:
+        self._angle = (self._angle - 30) % 360
+        self.update()
+
+    def set_running(self, running: bool) -> None:
+        if running:
+            self._timer.start()
+            self.show()
+        else:
+            self._timer.stop()
+            self.hide()
+
+    def paintEvent(self, _event: Any) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor("#3F51B5"), 2.0)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.drawArc(self.rect().adjusted(2, 2, -2, -2), self._angle * 16, 250 * 16)
+
+
+class ProcessActionRow(QWidget):
+    """One action and its validated outcome inside a decision step."""
+
+    def __init__(self, event: ProcessEvent) -> None:
+        super().__init__()
+        self.action_id = str(event.action_id)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 3, 0, 5)
+        layout.setSpacing(2)
+        headline = QHBoxLayout()
+        headline.setSpacing(6)
+        self.mark = QLabel("◌")
+        self.mark.setObjectName("processActionMark")
+        headline.addWidget(self.mark)
+        self.title = QLabel(event.title or event.tool_name or "执行行动")
+        self.title.setObjectName("processActionTitle")
+        headline.addWidget(self.title, 1)
+        self.status = QLabel("执行中")
+        self.status.setObjectName("processActionStatus")
+        headline.addWidget(self.status)
+        layout.addLayout(headline)
+        arguments = json.dumps(event.arguments, ensure_ascii=False, separators=(", ", ": "))
+        self.arguments = QLabel(f"参数：{arguments}" if event.arguments else "")
+        self.arguments.setObjectName("processActionDetail")
+        self.arguments.setWordWrap(True)
+        self.arguments.setVisible(bool(event.arguments))
+        layout.addWidget(self.arguments)
+        self.result_heading = QLabel("结果")
+        self.result_heading.setObjectName("processSectionTitle")
+        self.result_heading.hide()
+        layout.addWidget(self.result_heading)
+        self.result = QLabel("")
+        self.result.setObjectName("processResult")
+        self.result.setWordWrap(True)
+        self.result.hide()
+        layout.addWidget(self.result)
+        self.open_result = QPushButton("打开结果")
+        self.open_result.setObjectName("quietButton")
+        self.open_result.hide()
+        layout.addWidget(self.open_result, 0, Qt.AlignmentFlag.AlignLeft)
+
+    def finish(self, event: ProcessEvent) -> None:
+        failed = event.event_type == "action_failed"
+        self.mark.setText("✕" if failed else "✓")
+        self.status.setText("失败" if failed else "已完成")
+        state = "failed" if failed else "completed"
+        for widget in (self.mark, self.status):
+            widget.setProperty("traceStatus", state)
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+        self.result.setText(event.result or ("执行失败" if failed else "已完成"))
+        self.result_heading.show()
+        self.result.show()
+        if event.report_path:
+            try:
+                self.open_result.clicked.disconnect()
+            except RuntimeError:
+                pass
+            self.open_result.clicked.connect(
+                lambda _checked=False, path=event.report_path: open_report(path)
+            )
+            self.open_result.show()
+
+    def interrupt(self, state: str, detail: str) -> None:
+        if self.result.isVisible():
+            return
+        self.mark.setText("■" if state == "stopped" else "✕")
+        self.status.setText("已终止" if state == "stopped" else "失败")
+        self.result.setText(detail)
+        self.result_heading.show()
+        self.result.show()
+
+
+class ProcessStepWidget(QFrame):
+    """One model decision containing its thought, actions, and results."""
+
+    def __init__(self, event: ProcessEvent, *, display_number: int) -> None:
+        super().__init__()
+        self.setObjectName("processStep")
+        self.step_id = event.step_id
+        self._collapsed = False
+        self._actions: dict[str, ProcessActionRow] = {}
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 5, 0, 6)
+        layout.setSpacing(5)
+        header = QHBoxLayout()
+        header.setSpacing(7)
+        self.toggle = QPushButton("收起")
+        self.toggle.setObjectName("processStepToggle")
+        self.toggle.setFixedWidth(34)
+        self.toggle.clicked.connect(self._toggle)
+        self.spinner = ThinkingSpinner()
+        header.addWidget(self.spinner)
+        self.title = QLabel(f"步骤 {display_number} · 正在思考…")
+        self.title.setObjectName("processStepTitle")
+        header.addWidget(self.title, 1)
+        self.status = QLabel("")
+        self.status.setObjectName("processStepStatus")
+        header.addWidget(self.status)
+        header.addWidget(self.toggle)
+        layout.addLayout(header)
+
+        self.body = QWidget()
+        body = QVBoxLayout(self.body)
+        body.setContentsMargins(43, 0, 0, 0)
+        body.setSpacing(3)
+        self.thought_heading = QLabel("思考过程")
+        self.thought_heading.setObjectName("processSectionTitle")
+        body.addWidget(self.thought_heading)
+        self.thought = QLabel(event.content or "正在根据已有证据选择下一步行动…")
+        self.thought.setObjectName("processThought")
+        self.thought.setWordWrap(True)
+        body.addWidget(self.thought)
+        self.action_heading = QLabel("行动")
+        self.action_heading.setObjectName("processSectionTitle")
+        self.action_heading.hide()
+        body.addWidget(self.action_heading)
+        self.actions_widget = QWidget()
+        self.actions_layout = QVBoxLayout(self.actions_widget)
+        self.actions_layout.setContentsMargins(0, 0, 0, 0)
+        self.actions_layout.setSpacing(1)
+        self.actions_widget.hide()
+        body.addWidget(self.actions_widget)
+        layout.addWidget(self.body)
+
+    @property
+    def actions(self) -> dict[str, ProcessActionRow]:
+        return dict(self._actions)
+
+    def apply_event(self, event: ProcessEvent) -> None:
+        if event.event_type == "thinking_started":
+            self.spinner.set_running(True)
+            self.title.setText(f"步骤 {event.round or 1} · 正在思考…")
+            self.thought_heading.setText("思考过程")
+            self.thought.setText(event.content or "正在思考…")
+            self.status.setText("")
+        elif event.event_type == "thinking_ready":
+            self.spinner.set_running(False)
+            self.title.setText(f"步骤 {event.round or 1}")
+            self.thought_heading.setText("执行依据" if event.source == "system" else "思考过程")
+            self.thought.setText(event.content or "本轮未提供思考过程说明")
+        elif event.event_type == "action_started":
+            self.spinner.set_running(True)
+            self.title.setText(f"步骤 {event.round or 1} · 正在行动…")
+            action_id = str(event.action_id or event.event_id)
+            if action_id not in self._actions:
+                row = ProcessActionRow(event)
+                self._actions[action_id] = row
+                self.actions_layout.addWidget(row)
+            self.action_heading.show()
+            self.actions_widget.show()
+            self.status.setText(f"{len(self._actions)} 个行动")
+        elif event.event_type in {"action_completed", "action_failed"}:
+            action_id = str(event.action_id or event.event_id)
+            row = self._actions.get(action_id)
+            if row is None:
+                row = ProcessActionRow(event)
+                self._actions[action_id] = row
+                self.actions_layout.addWidget(row)
+            row.finish(event)
+            self.action_heading.show()
+            self.actions_widget.show()
+            completed = sum(action.result.isVisible() for action in self._actions.values())
+            self.status.setText(f"{completed}/{len(self._actions)} 已完成")
+        elif event.event_type == "step_completed":
+            self.spinner.set_running(False)
+            failed = any(action.status.text() == "失败" for action in self._actions.values())
+            if not self._actions and self.thought.text().startswith("正在"):
+                self.thought_heading.setText("处理结果")
+                self.thought.setText(event.result or "本轮没有生成可执行行动")
+            self.title.setText(f"步骤 {event.round or 1} · {'存在失败' if failed else '已完成'}")
+            self.status.setText(event.result or f"{len(self._actions)} 个行动")
+            self.status.setProperty("traceStatus", "failed" if failed else "completed")
+            self.status.style().unpolish(self.status)
+            self.status.style().polish(self.status)
+
+    def set_collapsed(self, collapsed: bool) -> None:
+        self._collapsed = collapsed
+        self.body.setVisible(not collapsed)
+        self.toggle.setText("展开" if collapsed else "收起")
+
+    def interrupt(self, state: str, detail: str) -> None:
+        self.spinner.set_running(False)
+        for action in self._actions.values():
+            action.interrupt(state, detail)
+        self.title.setText("步骤中断" if state == "stopped" else "步骤失败")
+        self.status.setText(detail)
+
+    def _toggle(self) -> None:
+        self.set_collapsed(not self._collapsed)
+
+
 class ThinkingMessageWidget(QFrame):
-    """Collapsible, live view of what the Agent is doing and why."""
+    """Lightweight live view of observable Agent stages and checks."""
 
     def __init__(
         self,
         *,
         steps: list[dict[str, Any]] | None = None,
+        process_events: list[dict[str, Any]] | None = None,
         state: str = "running",
         mode: str = "research",
     ) -> None:
         super().__init__()
         self.setObjectName("thinkingMessage")
         self.setMaximumWidth(680)
-        self.setMinimumWidth(520)
         self._steps: list[dict[str, Any]] = []
         self._rows: list[ThinkingStepRow] = []
+        self._process_events: list[dict[str, Any]] = []
+        self._process_event_ids: set[str] = set()
+        self._process_rows: dict[str, ProcessStepWidget] = {}
         self._collapsed = False
         self._mode = mode
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 11, 14, 11)
-        layout.setSpacing(8)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(5)
 
         header = QHBoxLayout()
-        header.setSpacing(8)
-        self.toggle_button = QPushButton("▾")
-        self.toggle_button.setObjectName("thinkingToggle")
-        self.toggle_button.setFixedWidth(22)
-        self.toggle_button.clicked.connect(self._toggle)
-        header.addWidget(self.toggle_button)
+        header.setSpacing(7)
+        self.spinner = ThinkingSpinner()
+        header.addWidget(self.spinner)
         self.title_label = QLabel("正在思考…" if mode == "dialogue" else "正在研究…")
         self.title_label.setObjectName("thinkingTitle")
-        header.addWidget(self.title_label, 1)
+        header.addWidget(self.title_label)
         self.status_label = QLabel("")
         self.status_label.setObjectName("thinkingStatus")
         header.addWidget(self.status_label)
+        header.addStretch(1)
+        self.toggle_button = QPushButton("收起")
+        self.toggle_button.setObjectName("thinkingToggle")
+        self.toggle_button.setFixedWidth(34)
+        self.toggle_button.clicked.connect(self._toggle)
+        header.addWidget(self.toggle_button)
         layout.addLayout(header)
 
         self.steps_container = QWidget()
         self.steps_layout = QVBoxLayout(self.steps_container)
-        self.steps_layout.setContentsMargins(2, 0, 0, 0)
+        self.steps_layout.setContentsMargins(23, 0, 0, 0)
         self.steps_layout.setSpacing(2)
         layout.addWidget(self.steps_container)
 
@@ -226,6 +460,8 @@ class ThinkingMessageWidget(QFrame):
                 status=str(step.get("status", "completed")),
                 function_name=step.get("function_name"),
             )
+        for payload in process_events or []:
+            self.apply_process_event(ProcessEvent.model_validate(payload))
         if state != "running":
             self.finish(state=state)
 
@@ -233,6 +469,7 @@ class ThinkingMessageWidget(QFrame):
     def from_payload(cls, payload: dict[str, Any]) -> ThinkingMessageWidget:
         return cls(
             steps=list(payload.get("steps", [])),
+            process_events=list(payload.get("process_events", [])),
             state=str(payload.get("state", "running")),
             mode=str(payload.get("mode", "research")),
         )
@@ -248,6 +485,36 @@ class ThinkingMessageWidget(QFrame):
     @property
     def steps(self) -> list[dict[str, Any]]:
         return list(self._steps)
+
+    @property
+    def process_events(self) -> list[dict[str, Any]]:
+        return list(self._process_events)
+
+    @property
+    def process_rows(self) -> dict[str, ProcessStepWidget]:
+        return dict(self._process_rows)
+
+    def apply_process_event(self, event: ProcessEvent) -> bool:
+        """Apply an idempotent event and keep only the current step expanded."""
+
+        if event.event_id in self._process_event_ids:
+            return False
+        self._process_event_ids.add(event.event_id)
+        self._process_events.append(event.model_dump(mode="json"))
+        row = self._process_rows.get(event.step_id)
+        if row is None:
+            for existing in self._process_rows.values():
+                existing.set_collapsed(True)
+            row = ProcessStepWidget(event, display_number=len(self._process_rows) + 1)
+            self._process_rows[event.step_id] = row
+            self.steps_layout.addWidget(row)
+        row.set_collapsed(False)
+        row.apply_event(event)
+        self.spinner.set_running(False)
+        self.toggle_button.hide()
+        self.title_label.setText("研究过程")
+        self.status_label.setText(f"{len(self._process_rows)} 步")
+        return True
 
     def replace_current(
         self,
@@ -330,12 +597,20 @@ class ThinkingMessageWidget(QFrame):
         }
         self.title_label.setText(titles.get(state, completed_title))
         self.status_label.setText(summary or f"{len(self._steps)} 步")
-        self.set_collapsed(True)
+        self.spinner.set_running(False)
+        if self._process_rows:
+            rows = list(self._process_rows.values())
+            if state in {"failed", "stopped"}:
+                rows[-1].interrupt(state, summary or titles.get(state, completed_title))
+            for row in rows[:-1]:
+                row.set_collapsed(True)
+            rows[-1].set_collapsed(False)
+        self.set_collapsed(False)
 
     def set_collapsed(self, collapsed: bool) -> None:
         self._collapsed = collapsed
         self.steps_container.setVisible(not collapsed)
-        self.toggle_button.setText("▸" if collapsed else "▾")
+        self.toggle_button.setText("展开" if collapsed else "收起")
 
     def _toggle(self) -> None:
         self.set_collapsed(not self._collapsed)

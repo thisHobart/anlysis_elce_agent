@@ -39,6 +39,7 @@ from app.research.agent.subagents.eda import EDASubagent
 from app.research.application.coordinator import ResearchCoordinator
 from app.research.data.inference import infer_study_context
 from app.research.graph.narration import STAGE_LABELS
+from app.research.graph.process_events import ProcessEvent
 from app.research.skills.registry import SkillRegistry
 from app.research.tools.catalog import FUNCTION_CATALOG
 
@@ -569,6 +570,84 @@ def test_conversation_follows_the_bottom_while_a_sent_question_progresses(
         window.close()
 
 
+def test_grouped_process_timeline_keeps_current_step_open(qt_app: QApplication):
+    widget = ThinkingMessageWidget()
+    try:
+        base = {
+            "session_id": "session-1",
+            "flow_id": "flow-1",
+            "phase": "analysis",
+            "source": "model",
+        }
+        events = [
+            ProcessEvent(
+                **base,
+                round=1,
+                step_id="round-1",
+                sequence=1,
+                event_type="thinking_started",
+                content="正在分析已有证据",
+            ),
+            ProcessEvent(
+                **base,
+                round=1,
+                step_id="round-1",
+                sequence=2,
+                event_type="thinking_ready",
+                title="思考过程",
+                content="先检查数据质量，再决定后续方法。",
+            ),
+            ProcessEvent(
+                **base,
+                round=1,
+                step_id="round-1",
+                sequence=3,
+                event_type="action_started",
+                action_id="call-1",
+                tool_name="data_quality",
+                title="数据质量检查",
+            ),
+            ProcessEvent(
+                **base,
+                round=1,
+                step_id="round-1",
+                sequence=4,
+                event_type="action_completed",
+                action_id="call-1",
+                tool_name="data_quality",
+                title="数据质量检查",
+                result="时间轴和缺失率检查通过",
+            ),
+            ProcessEvent(
+                **base,
+                round=1,
+                step_id="round-1",
+                sequence=5,
+                event_type="step_completed",
+                result="1 个行动已完成",
+            ),
+            ProcessEvent(
+                **base,
+                round=2,
+                step_id="round-2",
+                sequence=6,
+                event_type="thinking_started",
+                content="根据质量结果选择规律分析方法",
+            ),
+        ]
+        for event in events:
+            assert widget.apply_process_event(event)
+        assert not widget.apply_process_event(events[-1])
+        first, second = widget.process_rows.values()
+        assert first.body.isHidden()
+        assert not second.body.isHidden()
+        assert first.thought_heading.text() == "思考过程"
+        assert first.actions["call-1"].result.text() == "时间轴和缺失率检查通过"
+        assert second.spinner._timer.isActive()
+    finally:
+        widget.close()
+
+
 def test_main_window_uses_one_three_pane_workspace(qt_app: QApplication, tmp_path: Path):
     window = MainWindow(session_store=SessionStore(tmp_path / "sessions.json"))
     try:
@@ -623,7 +702,10 @@ def test_conversation_does_not_require_files_until_analysis(
         assert workspace.current_session.messages[-1].role == "assistant"
         assert "时间轴" in workspace.current_session.messages[-1].content
         assert "季节性" in workspace.current_session.messages[-1].content
-        assert not any(message.kind == "thinking" for message in workspace.current_session.messages)
+        assert not any(
+            message.kind in {"thinking", "plan", "data_plan"}
+            for message in workspace.current_session.messages
+        )
         assert not model_agent.has_thread(workspace.current_session.session_id)
     finally:
         window.close()
@@ -1340,29 +1422,26 @@ def test_thinking_process_is_visible_and_survives_a_restart(
         wait_until(qt_app, lambda: not workspace.is_busy)
         session = workspace.current_session
 
-        planning_card = next(message for message in session.messages if message.kind == "thinking")
-        stages = [step["stage"] for step in planning_card.payload["steps"]]
-        titles = [step["title"] for step in planning_card.payload["steps"]]
-        assert planning_card.payload["state"] == "completed"
-        assert len(titles) >= 4
-        assert "解析问题" in stages and "生成方案" in stages
-        assert titles[0] == "解析研究问题"
-        assert titles == list(dict.fromkeys(titles))
-        assert not any(title in {"等待方案确认", "等待用户决策"} for title in titles)
-        assert all(step["status"] != "running" for step in planning_card.payload["steps"])
+        assert not any(message.kind == "thinking" for message in session.messages)
 
         workspace.run_plan(workspace.conversation.current_plan_widget.approved_plan())
         wait_until(qt_app, lambda: not workspace.is_busy)
 
         execution_card = [message for message in session.messages if message.kind == "thinking"][-1]
-        steps = execution_card.payload["steps"]
-        computed = [step for step in steps if step["stage"] == "执行分析"]
+        events = execution_card.payload["process_events"]
         assert execution_card.payload["state"] == "completed"
-        assert len(computed) == len(workspace.current_session.current_plan["steps"])
-        assert all(step["title"].startswith("已完成 · ") for step in computed)
-        assert all(step["function_name"] for step in computed)
-        assert any(step["stage"] == "评估结果" for step in steps)
-        assert not any(step["title"] == "等待用户决策" for step in steps)
+        step_ids = list(dict.fromkeys(event["step_id"] for event in events))
+        assert len(step_ids) >= len(workspace.current_session.current_plan["steps"])
+        for step_id in step_ids[: len(workspace.current_session.current_plan["steps"])]:
+            types = [event["event_type"] for event in events if event["step_id"] == step_id]
+            assert types[:2] == ["thinking_ready", "action_started"]
+            assert "action_completed" in types
+            assert "step_completed" in types
+        assert all(
+            event["source"] == "system"
+            for event in events
+            if event["event_type"] == "thinking_ready"
+        )
 
         window.close()
         restored = MainWindow(agent=model_agent, session_store=store)
@@ -1373,11 +1452,15 @@ def test_thinking_process_is_visible_and_survives_a_restart(
                 for widget in restored.workspace.conversation._message_widgets.values()
                 if isinstance(widget, ThinkingMessageWidget)
             ]
-            assert len(widgets) == 2
-            assert widgets[-1].steps == steps
-            assert not widgets[-1].steps_container.isVisible()
-            widgets[-1].toggle_button.click()
+            assert len(widgets) == 1
+            assert widgets[-1].process_events == events
+            rows = list(widgets[-1].process_rows.values())
+            assert rows
+            assert all(row.body.isHidden() for row in rows[:-1])
+            assert not rows[-1].body.isHidden()
             assert widgets[-1].steps_container.isVisibleTo(widgets[-1])
+            widgets[-1].toggle_button.click()
+            assert not widgets[-1].steps_container.isVisible()
         finally:
             restored.close()
     finally:

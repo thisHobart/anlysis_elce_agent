@@ -78,6 +78,7 @@ from app.research.graph.narration import (
     split_progress_message,
     trace_category,
 )
+from app.research.graph.process_events import ProcessEvent, split_process_event_message
 from app.research.news import AdaptiveNewsEventExtractor
 from app.research.schemas.results import DataQualityReport
 from app.research.schemas.study import StudyConfig
@@ -272,6 +273,11 @@ class ResearchWorkspace(QSplitter):
         self._thinking_message_id: str | None = None
         self._thinking_placeholder = False
         self._thinking_function: str | None = None
+        self._local_process_round = 0
+        self._local_process_sequence = 0
+        self._local_process_step_id: str | None = None
+        self._local_process_action_id: str | None = None
+        self._active_process_flow_id: str | None = None
         self._last_progress_message = ""
         self._task_previous_status = "idle"
         self._region_failure_summary: DataSummary | None = None
@@ -2115,7 +2121,7 @@ class ResearchWorkspace(QSplitter):
             "回复已生成" if dialogue_only else "研究循环已到达用户交互点"
         )
         if dialogue_only:
-            self._discard_active_thinking(thinking_message_id)
+            self._discard_thinking_message(thinking_message_id)
         self._active_interrupt_id = snapshot.interrupt.interrupt_id or None if snapshot.interrupt else None
         self._active_state_revision = snapshot.interrupt.state_revision if snapshot.interrupt else None
         self._active_interrupt_kind = snapshot.interrupt.kind if snapshot.interrupt else None
@@ -3364,6 +3370,21 @@ class ResearchWorkspace(QSplitter):
 
     def _task_progress(self, value: int, message: str) -> None:
         session = self.current_session
+        process_event = split_process_event_message(message)
+        if process_event is not None:
+            if process_event.session_id != session.session_id or self._thinking_widget is None:
+                return
+            if self._active_process_flow_id is None:
+                self._active_process_flow_id = process_event.flow_id
+            elif process_event.flow_id != self._active_process_flow_id:
+                return
+            if self._thinking_widget.apply_process_event(process_event):
+                self._store_thinking_steps()
+                self.conversation.scroll_to_bottom()
+            session.status = "running"
+            self.conversation.set_status(session.status)
+            self.status_changed.emit(process_event.title or "研究进行中")
+            return
         source_event, step = split_progress_message(message)
         del value
         session.status = {
@@ -3391,7 +3412,8 @@ class ResearchWorkspace(QSplitter):
         }:
             self._thinking_widget.set_mode("research")
         if message != self._last_progress_message:
-            self._append_thinking_step(step.stage, step.title, step.detail, step.function_name)
+            if step.stage in {"compute", "review", "issue"}:
+                self._project_system_progress(step)
             self._close_latest_running_trace("completed")
             # Store the raw loop event so the trace panel narrates it exactly once.
             self._add_trace(trace_category(step.stage), source_event or step.title, "running", step.detail)
@@ -3492,8 +3514,12 @@ class ResearchWorkspace(QSplitter):
         self._thinking_widget = widget if isinstance(widget, ThinkingMessageWidget) else None
         self._thinking_message_id = message.message_id
         self._thinking_function = None
-        self._append_thinking_step(stage, title, detail)
-        self._thinking_placeholder = True
+        self._thinking_placeholder = False
+        self._local_process_round = 0
+        self._local_process_sequence = 0
+        self._local_process_step_id = None
+        self._local_process_action_id = None
+        self._active_process_flow_id = None
 
     def _append_thinking_step(
         self,
@@ -3531,23 +3557,75 @@ class ResearchWorkspace(QSplitter):
         if message is None:
             return
         message.payload["steps"] = self._thinking_widget.steps
+        message.payload["process_events"] = self._thinking_widget.process_events
         message.payload["mode"] = self._thinking_widget.mode
         if state is not None:
             message.payload["state"] = state
 
-    def _discard_active_thinking(self, message_id: str | None = None) -> None:
-        """Remove transient dialogue routing UI once a direct answer is ready."""
+    def _apply_local_process_event(self, event: ProcessEvent) -> None:
+        if self._thinking_widget is None:
+            return
+        self._thinking_widget.apply_process_event(event)
 
-        message_id = message_id or self._thinking_message_id
-        if message_id is not None:
-            self.current_session.messages = [
-                message for message in self.current_session.messages if message.message_id != message_id
-            ]
-        self._thinking_widget = None
-        self._thinking_message_id = None
-        self._thinking_placeholder = False
-        self._thinking_function = None
-        self._render_current()
+    def _next_local_process_event(self, event_type: str, **values: Any) -> ProcessEvent:
+        self._local_process_sequence += 1
+        return ProcessEvent(
+            session_id=self.current_session.session_id,
+            flow_id=(
+                self.current_session.full_flow_state_path
+                or self._thinking_message_id
+                or self.current_session.session_id
+            ),
+            round=self._local_process_round,
+            step_id=self._local_process_step_id or f"desktop-{self._local_process_round}",
+            sequence=self._local_process_sequence,
+            event_type=event_type,  # type: ignore[arg-type]
+            phase=str(values.pop("phase", "desktop")),
+            source="system",
+            **values,
+        )
+
+    def _close_local_process_step(self, result: str) -> None:
+        if self._local_process_action_id is None:
+            return
+        self._apply_local_process_event(
+            self._next_local_process_event(
+                "action_completed",
+                action_id=self._local_process_action_id,
+                result=result,
+            )
+        )
+        self._apply_local_process_event(
+            self._next_local_process_event("step_completed", result=result)
+        )
+        self._local_process_action_id = None
+
+    def _project_system_progress(self, step: ThinkingStep) -> None:
+        """Project deterministic P2/P3 work into the shared grouped timeline."""
+
+        self._close_local_process_step("已完成")
+        self._local_process_round += 1
+        self._local_process_step_id = f"desktop-{self._local_process_round}"
+        self._local_process_action_id = uuid4().hex
+        self._apply_local_process_event(
+            self._next_local_process_event(
+                "thinking_ready",
+                phase=step.stage,
+                title="执行依据",
+                content=step.detail or "按照当前流程状态执行",
+            )
+        )
+        self._apply_local_process_event(
+            self._next_local_process_event(
+                "action_started",
+                phase=step.stage,
+                title=step.title,
+                content="正在执行",
+                action_id=self._local_process_action_id,
+                tool_name=step.function_name,
+            )
+        )
+        self._store_thinking_steps()
 
     def _complete_active_tool(self, detail: str) -> None:
         self._set_active_tool_status("completed", detail)
@@ -3559,12 +3637,42 @@ class ResearchWorkspace(QSplitter):
         if self._thinking_widget is None:
             return
         state = status if status in {"failed", "stopped"} else "completed"
+        if self._local_process_action_id is not None:
+            if state == "completed":
+                self._close_local_process_step(detail)
+            else:
+                self._apply_local_process_event(
+                    self._next_local_process_event(
+                        "action_failed",
+                        action_id=self._local_process_action_id,
+                        result=detail,
+                    )
+                )
+                self._apply_local_process_event(
+                    self._next_local_process_event("step_completed", result=detail)
+                )
+                self._local_process_action_id = None
         if state != "completed":
             self._thinking_widget.update_current(detail=detail, status=state)
-        self._thinking_widget.finish(state=state, summary=f"{len(self._thinking_widget.steps)} 步")
+        visible_steps = len(self._thinking_widget.process_rows) or len(self._thinking_widget.steps)
+        if visible_steps == 0:
+            message_id = self._thinking_message_id
+            self._thinking_widget = None
+            self._thinking_message_id = None
+            self._discard_thinking_message(message_id)
+            return
+        self._thinking_widget.finish(state=state, summary=f"{visible_steps} 步")
         self._store_thinking_steps(state)
         self._thinking_widget = None
         self._thinking_message_id = None
+
+    def _discard_thinking_message(self, message_id: str | None) -> None:
+        if message_id is None:
+            return
+        self.current_session.messages = [
+            message for message in self.current_session.messages if message.message_id != message_id
+        ]
+        self._render_current()
 
     def _close_latest_running_trace(self, status: str) -> None:
         event = next((item for item in reversed(self.current_session.trace) if item.status == "running"), None)

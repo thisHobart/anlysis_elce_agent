@@ -60,6 +60,8 @@ class ResearchLoopState(TypedDict, total=False):
     provider_call_groups: dict[str, dict[str, Any]]
     call_evidence: list[dict[str, Any]]
     pending_analysis_text: str
+    process_events: list[dict[str, Any]]
+    process_call_steps: dict[str, str]
     post_analysis_action: str | None
     evaluation: dict[str, Any] | None
     eda_summary: dict[str, Any] | None

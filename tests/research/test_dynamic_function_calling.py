@@ -17,6 +17,7 @@ from app.research.application.coordinator import ResearchCoordinator
 from app.research.application.execution import EDAExecutionService
 from app.research.data.inference import resolve_study_input
 from app.research.graph.guards import scope_authorization_envelope, validate_scope_authorization
+from app.research.graph.process_events import split_process_event_message
 from app.research.graph.workflow import validate_analysis_message_protocol
 from app.research.schemas.feedback import FeedbackPacket
 from app.research.schemas.study import StudyInputDescriptor, load_study_config
@@ -188,7 +189,12 @@ def test_scope_approval_recipe_expands_and_round_trips_one_provider_call(
     assert approval.interrupt.scope["max_tool_calls"] == 16
     assert "data_quality" not in approval.interrupt.scope["authorized_functions"]
 
-    result = coordinator.resume(session_id="dynamic-recipe", action="approve")
+    progress_messages: list[str] = []
+    result = coordinator.resume(
+        session_id="dynamic-recipe",
+        action="approve",
+        progress=lambda _value, message: progress_messages.append(message),
+    )
 
     assert result.interrupt is not None
     assert result.interrupt.kind == "result", result.values.get("stop_reason")
@@ -232,6 +238,54 @@ def test_scope_approval_recipe_expands_and_round_trips_one_provider_call(
     assert "只可选择本次研究范围授权" in relationship_schema["parameters"]["properties"][
         "variables"
     ]["description"]
+    process_events = result.values["process_events"]
+    first_step_id = next(
+        event["step_id"]
+        for event in process_events
+        if event["step_id"].endswith("-model-round-1")
+    )
+    first_model_step = [
+        event for event in process_events if event["step_id"] == first_step_id
+    ]
+    assert [event["event_type"] for event in first_model_step].count("thinking_started") == 1
+    assert [event["event_type"] for event in first_model_step].count("thinking_ready") == 1
+    assert [event["event_type"] for event in first_model_step].count("action_started") == 3
+    assert [event["event_type"] for event in first_model_step].count("action_completed") == 3
+    assert first_model_step[-1]["event_type"] == "step_completed"
+    assert first_model_step[1]["content"] == "本轮未提供思考过程说明"
+    assert len(
+        {
+            event["action_id"]
+            for event in first_model_step
+            if event["event_type"] == "action_started"
+        }
+    ) == 3
+    second_step_id = next(
+        event["step_id"]
+        for event in process_events
+        if event["step_id"].endswith("-model-round-2")
+    )
+    second_model_step = [
+        event for event in process_events if event["step_id"] == second_step_id
+    ]
+    assert second_model_step[1]["content"] == "现有证据足够，可以完成评估。"
+    assert second_model_step[-1]["event_type"] == "step_completed"
+    streamed = [
+        event
+        for message in progress_messages
+        if (event := split_process_event_message(message)) is not None
+    ]
+    streamed_ids = [event.event_id for event in streamed]
+    assert len(streamed_ids) == len(set(streamed_ids))
+    first_thinking = next(
+        index for index, event in enumerate(streamed) if event.event_type == "thinking_started"
+    )
+    first_action = next(
+        index
+        for index, event in enumerate(streamed)
+        if event.step_id == first_step_id and event.event_type == "action_started"
+    )
+    assert first_thinking < first_action
 
 
 def test_identical_work_is_reused_and_reported_by_call_id(
@@ -295,6 +349,15 @@ def test_identical_work_is_reused_and_reported_by_call_id(
     ).read_text(encoding="utf-8")
     assert runs[0]["call_id"] in methods
     assert runs[1]["call_id"] in methods
+    distribution_actions = [
+        event
+        for event in result.values["process_events"]
+        if event.get("tool_name") == "price_descriptive_distribution"
+        and event["event_type"] == "action_started"
+    ]
+    assert len(distribution_actions) == 2
+    assert len({event["step_id"] for event in distribution_actions}) == 2
+    assert len({event["action_id"] for event in distribution_actions}) == 2
 
 
 def test_invalid_model_call_is_returned_as_a_matched_tool_error_then_repaired(

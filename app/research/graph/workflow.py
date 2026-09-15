@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from uuid import uuid4
 
+from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 from pydantic import ValidationError
@@ -58,6 +59,7 @@ from app.research.graph.guards import (
     validate_automatic_revision,
     validate_scope_authorization,
 )
+from app.research.graph.process_events import ProcessEvent, append_process_events
 from app.research.graph.state import ResearchLoopState
 from app.research.graph.tool_result_store import ToolResultStore
 from app.research.reporting.loop_history import write_loop_record
@@ -184,6 +186,191 @@ def _event(
             "details": details,
         },
     ][-MAX_STATE_EVENTS:]
+
+
+def _process_sequence(state: ResearchLoopState) -> int:
+    sequences = [
+        int(item.get("sequence", 0))
+        for item in state.get("process_events", [])
+        if isinstance(item, dict)
+    ]
+    return max(sequences, default=0) + 1
+
+
+def _process_event(
+    state: ResearchLoopState,
+    event_type: str,
+    *,
+    step_id: str,
+    round_number: int,
+    source: Literal["model", "system"],
+    sequence: int | None = None,
+    phase: str = "analysis",
+    title: str = "",
+    content: str = "",
+    action_id: str | None = None,
+    tool_name: str | None = None,
+    arguments: dict[str, Any] | None = None,
+    result: str = "",
+    report_path: str | None = None,
+) -> ProcessEvent:
+    cursor = _cursor(state)
+    flow_id = cursor.episode_id or str(state.get("revision_cycle_id") or state["thread_id"])
+    return ProcessEvent(
+        session_id=str(state.get("session_id") or state["thread_id"]),
+        flow_id=flow_id,
+        round=round_number,
+        step_id=step_id,
+        sequence=sequence or _process_sequence(state),
+        event_type=event_type,  # type: ignore[arg-type]
+        phase=phase,
+        source=source,
+        title=title,
+        content=content,
+        action_id=action_id,
+        tool_name=tool_name,
+        arguments=arguments or {},
+        result=result,
+        report_path=report_path,
+    )
+
+
+def _emit_process_event(event: ProcessEvent) -> None:
+    """Stream a live event when invoked inside LangGraph; remain test-friendly."""
+
+    try:
+        get_stream_writer()(event.model_dump(mode="json"))
+    except RuntimeError:
+        # Some unit tests exercise node functions without a streaming runtime.
+        return
+
+
+def _process_result_summary(result: ToolResult) -> str:
+    """Build a short deterministic summary without copying the full tool output."""
+
+    value = result.output.value
+    for key in ("summary", "conclusion", "message"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return _short(candidate, 120)
+    findings = value.get("findings")
+    if isinstance(findings, list) and findings:
+        return _short(findings[0], 120)
+    return f"{result.output.result_key} 已通过校验，用时 {result.duration_ms:.0f} 毫秒"
+
+
+def _process_report_path(result: ToolResult) -> str | None:
+    for key in ("report_path", "artifact_path"):
+        value = result.output.value.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _call_process_context(
+    state: ResearchLoopState,
+    call: ToolCall,
+) -> tuple[str, int, Literal["model", "system"], str]:
+    step_id = state.get("process_call_steps", {}).get(call.call_id) or f"execution-{call.call_id}"
+    scope = _scope(state)
+    if scope is not None and not step_id.endswith("-system-preflight"):
+        return step_id, int(state.get("model_round", 0)), "model", ""
+    if step_id.endswith("-system-preflight"):
+        return step_id, 0, "system", "执行已批准研究前的数据质量门槛检查"
+    plan = _plan(state)
+    planned = next((item for item in plan.enabled_steps if item.step_id == call.step_id), None) if plan else None
+    basis = planned.rationale if planned is not None else "按照已确认的研究方案执行"
+    return step_id, int(call.step_id[1:]), "system", basis
+
+
+def _action_attempt_id(state: ResearchLoopState, call: ToolCall) -> str:
+    record_payload = state.get("tool_records", {}).get(call.call_id, {})
+    attempt = int(record_payload.get("attempts", 1)) if isinstance(record_payload, dict) else 1
+    return f"{call.call_id}:attempt:{max(1, attempt)}"
+
+
+def _action_started_events(
+    state: ResearchLoopState,
+    call: ToolCall,
+) -> tuple[list[dict[str, Any]], ProcessEvent]:
+    step_id, round_number, source, basis = _call_process_context(state, call)
+    existing = list(state.get("process_events", []))
+    step_exists = any(item.get("step_id") == step_id for item in existing)
+    additions: list[ProcessEvent] = []
+    sequence = _process_sequence(state)
+    if not step_exists:
+        ready = _process_event(
+            state,
+            "thinking_ready",
+            step_id=step_id,
+            round_number=round_number,
+            source=source,
+            sequence=sequence,
+            title="执行依据" if source == "system" else "思考过程",
+            content=basis or "本轮未提供思考过程说明",
+        )
+        additions.append(ready)
+        sequence += 1
+    started = _process_event(
+        state,
+        "action_started",
+        step_id=step_id,
+        round_number=round_number,
+        source=source,
+        sequence=sequence,
+        title=FUNCTION_CATALOG.get(call.name).title if call.name in FUNCTION_CATALOG else call.name,
+        content="正在执行",
+        action_id=_action_attempt_id(state, call),
+        tool_name=call.name,
+        arguments=_compact_event_arguments(call.arguments),
+    )
+    additions.append(started)
+    for event in additions:
+        _emit_process_event(event)
+    return append_process_events(existing, *additions), started
+
+
+def _action_finished_events(
+    state: ResearchLoopState,
+    call: ToolCall,
+    *,
+    result: str,
+    failed: bool = False,
+    complete_step: bool = False,
+    report_path: str | None = None,
+) -> list[dict[str, Any]]:
+    step_id, round_number, source, _basis = _call_process_context(state, call)
+    sequence = _process_sequence(state)
+    event = _process_event(
+        state,
+        "action_failed" if failed else "action_completed",
+        step_id=step_id,
+        round_number=round_number,
+        source=source,
+        sequence=sequence,
+        title=FUNCTION_CATALOG[call.name].title if call.name in FUNCTION_CATALOG else call.name,
+        action_id=_action_attempt_id(state, call),
+        tool_name=call.name,
+        result=result,
+        report_path=report_path,
+    )
+    additions = [event]
+    if complete_step:
+        additions.append(
+            _process_event(
+                state,
+                "step_completed",
+                step_id=step_id,
+                round_number=round_number,
+                source=source,
+                sequence=sequence + 1,
+                title="步骤完成" if not failed else "步骤中断",
+                result=result,
+            )
+        )
+    for addition in additions:
+        _emit_process_event(addition)
+    return append_process_events(list(state.get("process_events", [])), *additions)
 
 
 def _messages(state: ResearchLoopState) -> list[ConversationMessage]:
@@ -1792,6 +1979,11 @@ def build_research_workflow(
                     "pending_tool_result": None,
                     "analysis_messages": [message.model_dump(mode="json") for message in initial_messages],
                     "provider_call_groups": {provider_id: group.model_dump(mode="json")},
+                    "process_call_steps": {
+                        preflight.call_id: (
+                            f"{_cursor(state).episode_id or state['thread_id']}-system-preflight"
+                        )
+                    },
                     "call_evidence": [],
                     "model_round": 0,
                     "tool_calls_used": 0,
@@ -1881,6 +2073,13 @@ def build_research_workflow(
             "tool_queue": queue,
             "tool_cursor": 0,
             "tool_records": records,
+            "process_call_steps": {
+                ToolCall.model_validate(item).call_id: (
+                    f"{_cursor(state).episode_id or state['thread_id']}-"
+                    f"plan-{ToolCall.model_validate(item).step_id}"
+                )
+                for item in queue
+            },
             "tool_results": [],
             "pending_tool_result": None,
             "events": _event(
@@ -1950,11 +2149,29 @@ def build_research_workflow(
             results = list(state.get("tool_results", []))
             if not any(item["call"]["call_id"] == call.call_id for item in results):
                 results.append(rebound_reference)
+            process_history, started = _action_started_events(
+                {**state, "tool_records": records}, call
+            )
+            completed = _process_event(
+                state,
+                "action_completed",
+                step_id=started.step_id,
+                round_number=started.round,
+                source=started.source,
+                sequence=started.sequence + 1,
+                title=started.title,
+                action_id=started.action_id,
+                tool_name=call.name,
+                result="复用已校验的相同数据、函数版本和参数结果",
+            )
+            _emit_process_event(completed)
+            process_history = append_process_events(process_history, completed)
             return {
                 "tool_records": records,
                 "tool_results": results,
                 "control": "advance",
                 "pending_tool_result": None,
+                "process_events": process_history,
                 "events": _event(
                     state,
                     f"复用函数结果：{_function_label(call.name)}",
@@ -2000,10 +2217,14 @@ def build_research_workflow(
         record.attempts += 1
         record.started_at = _now()
         records[call.call_id] = record.model_dump(mode="json")
+        process_history, _started = _action_started_events(
+            {**state, "tool_records": records}, call
+        )
         return {
             "tool_records": records,
             "budget": budget.model_dump(mode="json"),
             "control": "run",
+            "process_events": process_history,
             "loop_cursor": _cursor(state).model_copy(
                 update={
                     "episode_status": "executing",
@@ -2265,7 +2486,14 @@ def build_research_workflow(
                 requires_user=permission_or_data,
             )
             if scope is not None and call is not None and plan_error and call.name != "data_quality":
-                return _dynamic_tool_error_update(state, call=call, packet=packet)
+                update = _dynamic_tool_error_update(state, call=call, packet=packet)
+                update["process_events"] = _action_finished_events(
+                    state,
+                    call,
+                    result=_short(packet.message, 120),
+                    failed=True,
+                )
+                return update
             outcome = (
                 "retry"
                 if transient
@@ -2284,12 +2512,20 @@ def build_research_workflow(
                 and call.name != "data_quality"
                 and outcome in {"need_user", "fail"}
             ):
-                return _dynamic_tool_error_update(
+                update = _dynamic_tool_error_update(
                     state,
                     call=call,
                     packet=packet,
                     force_user=True,
                 )
+                update["process_events"] = _action_finished_events(
+                    state,
+                    call,
+                    result=_short(packet.message, 120),
+                    failed=True,
+                    complete_step=True,
+                )
+                return update
             records = dict(state.get("tool_records", {}))
             if call is not None and call.call_id in records:
                 record = ToolCallRecord.model_validate(records[call.call_id])
@@ -2304,6 +2540,17 @@ def build_research_workflow(
                 "feedback_packets": _append_feedback(state, packet),
                 "pending_tool_result": None,
                 "stop_reason": packet.message if outcome in {"need_user", "fail"} else None,
+                "process_events": (
+                    _action_finished_events(
+                        state,
+                        call,
+                        result=_short(packet.message, 120),
+                        failed=True,
+                        complete_step=outcome in {"need_user", "fail"} or scope is None,
+                    )
+                    if call is not None
+                    else list(state.get("process_events", []))
+                ),
                 "events": _event(
                     state,
                     f"函数执行失败：{_function_label(call.name)} · {_short(packet.message, 36)}",
@@ -2350,7 +2597,15 @@ def build_research_workflow(
         except Exception as exc:  # noqa: BLE001 - result-validator boundary
             packet = exception_feedback(exc, source="tool_result_validator", step_id=call.call_id, retryable=True)
             if scope is not None and call.name != "data_quality":
-                return _dynamic_tool_error_update(state, call=call, packet=packet)
+                update = _dynamic_tool_error_update(state, call=call, packet=packet)
+                update["process_events"] = _action_finished_events(
+                    state,
+                    call,
+                    result=_short(packet.message, 120),
+                    failed=True,
+                    complete_step=False,
+                )
+                return update
             records = dict(state.get("tool_records", {}))
             record = ToolCallRecord.model_validate(records[call.call_id])
             record.status = "failed"
@@ -2362,6 +2617,13 @@ def build_research_workflow(
                 "control": "revise",
                 "tool_records": records,
                 "pending_tool_result": None,
+                "process_events": _action_finished_events(
+                    state,
+                    call,
+                    result=_short(packet.message, 120),
+                    failed=True,
+                    complete_step=scope is None,
+                ),
                 "feedback_packets": _append_feedback(state, packet),
                 "events": _event(
                     state,
@@ -2385,6 +2647,13 @@ def build_research_workflow(
         result_cache[call.work_id] = result_reference
         while len(result_cache) > MAX_TOOL_RESULT_CACHE:
             result_cache.pop(next(iter(result_cache)))
+        process_history = _action_finished_events(
+            state,
+            call,
+            result=_process_result_summary(result),
+            complete_step=scope is None,
+            report_path=_process_report_path(result),
+        )
         return {
             "phase": "executing_tools",
             "control": "advance",
@@ -2392,6 +2661,7 @@ def build_research_workflow(
             "tool_result_cache": result_cache,
             "tool_results": [*state.get("tool_results", []), result_reference],
             "pending_tool_result": None,
+            "process_events": process_history,
             "events": _event(
                 state,
                 f"函数结果校验通过：{_function_label(call.name)}",
@@ -2540,6 +2810,38 @@ def build_research_workflow(
         )
         if any(group.origin != "system_preflight" and set(group.child_call_ids).intersection(batch_ids) for group in groups.values()):
             budget.no_progress_rounds = 0 if new_evidence else budget.no_progress_rounds + 1
+        process_history = list(state.get("process_events", []))
+        call_steps = state.get("process_call_steps", {})
+        batch_step_ids = list(
+            dict.fromkeys(call_steps.get(call.call_id) for call in batch if call_steps.get(call.call_id))
+        )
+        for step_id in batch_step_ids:
+            if any(
+                item.get("step_id") == step_id and item.get("event_type") == "step_completed"
+                for item in process_history
+            ):
+                continue
+            related = [call for call in batch if call_steps.get(call.call_id) == step_id]
+            sample = related[0]
+            _resolved_step, round_number, source, _basis = _call_process_context(state, sample)
+            completed = _process_event(
+                state,
+                "step_completed",
+                step_id=step_id,
+                round_number=round_number,
+                source=source,
+                title="步骤完成",
+                result=f"{len(related)} 个行动已完成",
+                sequence=(
+                    max(
+                        (int(item.get("sequence", 0)) for item in process_history),
+                        default=0,
+                    )
+                    + 1
+                ),
+            )
+            _emit_process_event(completed)
+            process_history = append_process_events(process_history, completed)
         if budget.no_progress_rounds >= 2:
             packet = budget_feedback(budget, code="no_new_evidence", message="连续两轮没有新增分析证据。")
             return {
@@ -2554,6 +2856,7 @@ def build_research_workflow(
                 "provider_call_groups": {key: value.model_dump(mode="json") for key, value in groups.items()},
                 "call_evidence": evidence,
                 "budget": budget.model_dump(mode="json"),
+                "process_events": process_history,
             }
         return {
             "phase": "executing_tools",
@@ -2565,6 +2868,7 @@ def build_research_workflow(
             "provider_call_groups": {key: value.model_dump(mode="json") for key, value in groups.items()},
             "call_evidence": evidence,
             "budget": budget.model_dump(mode="json"),
+            "process_events": process_history,
         }
 
     def _selector_protocol_retry(
@@ -2600,6 +2904,27 @@ def build_research_workflow(
             budget.no_progress_rounds >= 2
             or budget.model_rounds_used >= scope.max_model_rounds
         )
+        process_history = list(state.get("process_events", []))
+        current = next(
+            (
+                ProcessEvent.model_validate(item)
+                for item in reversed(process_history)
+                if item.get("event_type") == "thinking_started"
+            ),
+            None,
+        )
+        if current is not None:
+            completed = _process_event(
+                state,
+                "step_completed",
+                step_id=current.step_id,
+                round_number=current.round,
+                source=current.source,
+                title="模型响应无效",
+                result=_short(packet.message, 120),
+            )
+            _emit_process_event(completed)
+            process_history = append_process_events(process_history, completed)
         return {
             "phase": "awaiting_user" if needs_user else "executing_tools",
             "control": "need_user" if needs_user else "select",
@@ -2609,6 +2934,7 @@ def build_research_workflow(
             "model_round": budget.model_rounds_used,
             "user_interrupt_kind": "response_error" if needs_user else None,
             "stop_reason": packet.message if needs_user else None,
+            "process_events": process_history,
             "events": _event(
                 state,
                 f"拒绝非法模型工具回合：{packet.code}",
@@ -2676,6 +3002,26 @@ def build_research_workflow(
                 "user_interrupt_kind": "response_error",
             }
         budget.model_rounds_used += 1
+        round_number = budget.model_rounds_used
+        flow_token = _cursor(state).episode_id or str(
+            state.get("revision_cycle_id") or state["thread_id"]
+        )
+        process_step_id = f"{flow_token}-model-round-{round_number}"
+        thinking_started = _process_event(
+            state,
+            "thinking_started",
+            step_id=process_step_id,
+            round_number=round_number,
+            source="model",
+            title=f"第 {round_number} 步",
+            content="正在根据已有证据选择下一步行动",
+        )
+        _emit_process_event(thinking_started)
+        process_history = append_process_events(
+            list(state.get("process_events", [])),
+            thinking_started,
+        )
+        state = {**state, "process_events": process_history}
         try:
             skill = skills.get(scope.skill_name)
             turn = dynamic_agent.select(scope=scope, skill=skill, messages=messages)
@@ -2696,13 +3042,37 @@ def build_research_workflow(
             )
         except Exception as exc:  # noqa: BLE001 - model tool-selection boundary
             packet = exception_feedback(exc, source="plan_validator", retryable=True, requires_user=True)
+            completed = _process_event(
+                state,
+                "step_completed",
+                step_id=process_step_id,
+                round_number=round_number,
+                source="model",
+                title="模型调用失败",
+                result=_short(packet.message, 120),
+            )
+            _emit_process_event(completed)
+            process_history = append_process_events(process_history, completed)
             return {
                 "phase": "awaiting_user",
                 "control": "need_user",
                 "feedback_packets": _append_feedback(state, packet),
                 "stop_reason": packet.message,
                 "user_interrupt_kind": "response_error",
+                "process_events": process_history,
             }
+        thinking_ready = _process_event(
+            state,
+            "thinking_ready",
+            step_id=process_step_id,
+            round_number=round_number,
+            source="model",
+            title="思考过程",
+            content=turn.content.strip() or "本轮未提供思考过程说明",
+        )
+        _emit_process_event(thinking_ready)
+        process_history = append_process_events(process_history, thinking_ready)
+        state = {**state, "process_events": process_history}
         if not turn.tool_calls:
             messages.append(ModelMessage(role="assistant", content=turn.content))
             completed_calls = [
@@ -2712,6 +3082,17 @@ def build_research_workflow(
             ]
             completed_calls.sort(key=lambda call: int(call.step_id[1:]))
             plan = execution.build_dynamic_plan(scope=scope, calls=completed_calls)
+            completed = _process_event(
+                state,
+                "step_completed",
+                step_id=process_step_id,
+                round_number=round_number,
+                source="model",
+                title="分析决策完成",
+                result=_short(turn.content, 120),
+            )
+            _emit_process_event(completed)
+            process_history = append_process_events(process_history, completed)
             return {
                 "phase": "evaluating",
                 "control": "evaluate",
@@ -2720,6 +3101,7 @@ def build_research_workflow(
                 "pending_analysis_text": turn.content,
                 "model_round": budget.model_rounds_used,
                 "budget": budget.model_dump(mode="json"),
+                "process_events": process_history,
                 "events": _event(
                     state,
                     f"动态分析完成选择：{budget.model_rounds_used} 轮",
@@ -2784,6 +3166,7 @@ def build_research_workflow(
         calls: list[ToolCall] = []
         groups = dict(state.get("provider_call_groups", {}))
         records = dict(state.get("tool_records", {}))
+        process_call_steps = dict(state.get("process_call_steps", {}))
         compile_packets: list[FeedbackPacket] = []
         next_sequence = max(
             (int(ToolCall.model_validate(record["call"]).step_id[1:]) for record in records.values()),
@@ -2822,6 +3205,9 @@ def build_research_workflow(
                         call=call.model_dump(mode="json")
                     ).model_dump(mode="json")
                 calls.extend(proposal_calls)
+                process_call_steps.update(
+                    {call.call_id: process_step_id for call in proposal_calls}
+                )
                 records.update(proposal_records)
                 next_sequence = proposal_sequence
                 groups[provider_id] = ToolCallGroupRecord(
@@ -2861,6 +3247,17 @@ def build_research_workflow(
             budget.no_progress_rounds += 1
             needs_user = budget.no_progress_rounds >= 2
             packet = compile_packets[-1]
+            completed = _process_event(
+                state,
+                "step_completed",
+                step_id=process_step_id,
+                round_number=round_number,
+                source="model",
+                title="行动无法执行",
+                result=_short(packet.message, 120),
+            )
+            _emit_process_event(completed)
+            process_history = append_process_events(process_history, completed)
             validate_analysis_message_protocol(
                 messages,
                 groups,
@@ -2874,6 +3271,7 @@ def build_research_workflow(
                 "feedback_packets": _append_feedback(state, packet),
                 "budget": budget.model_dump(mode="json"),
                 "user_interrupt_kind": "plan_error" if needs_user else None,
+                "process_events": process_history,
             }
 
         if budget.tool_calls_used + len(calls) > scope.max_tool_calls:
@@ -2905,6 +3303,17 @@ def build_research_workflow(
                 groups,
                 allow_pending_current_batch=False,
             )
+            completed = _process_event(
+                state,
+                "step_completed",
+                step_id=process_step_id,
+                round_number=round_number,
+                source="model",
+                title="行动超过预算",
+                result=_short(packet.message, 120),
+            )
+            _emit_process_event(completed)
+            process_history = append_process_events(process_history, completed)
             return {
                 "phase": "awaiting_user",
                 "control": "need_user",
@@ -2914,6 +3323,7 @@ def build_research_workflow(
                 "provider_call_groups": groups,
                 "tool_records": records,
                 "budget": budget.model_dump(mode="json"),
+                "process_events": process_history,
             }
         budget.tool_calls_used += len(calls)
         payloads = [call.model_dump(mode="json") for call in calls]
@@ -2930,6 +3340,8 @@ def build_research_workflow(
             "tool_cursor": 0,
             "tool_records": records,
             "provider_call_groups": groups,
+            "process_call_steps": process_call_steps,
+            "process_events": process_history,
             "analysis_messages": [message.model_dump(mode="json") for message in messages],
             "model_round": budget.model_rounds_used,
             "tool_calls_used": budget.tool_calls_used,

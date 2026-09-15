@@ -41,10 +41,12 @@ from app.research.graph.migrations import safe_incompatible_state
 from app.research.graph.narration import (
     HUMAN_GATE_NODES,
     SILENT_NODES,
+    ThinkingStep,
     narrate_event,
     narrate_node,
     progress_message,
 )
+from app.research.graph.process_events import ProcessEvent, process_event_message
 from app.research.graph.tool_result_store import FileToolResultStore, InMemoryToolResultStore, ToolResultStore
 from app.research.graph.workflow import build_research_workflow, validate_analysis_message_protocol
 from app.research.schemas.study import StudyConfig, StudyInputDescriptor
@@ -132,12 +134,30 @@ class ResearchCoordinator:
         thread_id: str,
         progress: Callable[[int, str], None] | None = None,
     ) -> None:
-        for update in self.graph.stream(
+        existing = self.graph.get_state(self._config(thread_id))
+        emitted_process_events: set[str] = {
+            str(item.get("event_id"))
+            for item in (existing.values or {}).get("process_events", [])
+            if isinstance(item, dict) and item.get("event_id")
+        }
+        for chunk in self.graph.stream(
             graph_input,
             config=self._config(thread_id),
-            stream_mode="updates",
+            stream_mode=["updates", "custom"],
         ):
-            if not progress or not isinstance(update, dict):
+            if not progress or not isinstance(chunk, tuple) or len(chunk) != 2:
+                continue
+            mode, update = chunk
+            if mode == "custom":
+                try:
+                    event = ProcessEvent.model_validate(update)
+                except (TypeError, ValueError):
+                    continue
+                if event.event_id not in emitted_process_events:
+                    progress(min(99, max(1, event.sequence)), process_event_message(event))
+                    emitted_process_events.add(event.event_id)
+                continue
+            if mode != "updates" or not isinstance(update, dict):
                 continue
             for node_name in update:
                 if str(node_name).startswith("__"):
@@ -150,6 +170,20 @@ class ResearchCoordinator:
                     continue
                 value, step = narrate_node(str(node_name))
                 node_update = update.get(node_name)
+                emitted_for_node = False
+                if isinstance(node_update, dict):
+                    for payload in node_update.get("process_events", []):
+                        try:
+                            event = ProcessEvent.model_validate(payload)
+                        except (TypeError, ValueError):
+                            continue
+                        if event.event_id in emitted_process_events:
+                            continue
+                        progress(min(99, max(1, event.sequence)), process_event_message(event))
+                        emitted_process_events.add(event.event_id)
+                        emitted_for_node = True
+                if emitted_for_node:
+                    continue
                 source_event = ""
                 if isinstance(node_update, dict):
                     events = node_update.get("events")
@@ -236,6 +270,8 @@ class ResearchCoordinator:
             "provider_call_groups": {},
             "call_evidence": [],
             "pending_analysis_text": "",
+            "process_events": [],
+            "process_call_steps": {},
             "post_analysis_action": None,
             "evaluation": None,
             "eda_summary": None,
@@ -270,6 +306,8 @@ class ResearchCoordinator:
             base.setdefault("episode_history", [])
             base.setdefault("episode_summaries", [])
             base.setdefault("agenda_fingerprints", [])
+            base.setdefault("process_events", [])
+            base.setdefault("process_call_steps", {})
             base.setdefault("automatic_approval_enabled", False)
             base["pending_user_message"] = message
             base["pending_message_id"] = message_id
@@ -500,6 +538,19 @@ class ResearchCoordinator:
                 if existing.values.get("graph_schema_version") != GRAPH_SCHEMA_VERSION:
                     return existing
             if not has_compatible_thread and route_before_graph:
+                if progress:
+                    progress(
+                        5,
+                        progress_message(
+                            ThinkingStep(
+                                "route",
+                                "判断处理方式",
+                                "根据当前问题、会话状态和可用数据选择直接回答或研究流程",
+                                "running",
+                            ),
+                            "桌面入口路由",
+                        ),
+                    )
                 routed_decision = self._route_initial_turn(
                     question=text,
                     study_config=study_config,
@@ -508,6 +559,26 @@ class ResearchCoordinator:
                     imported=imported_state,
                     current_turn_id=resolved_turn_id,
                 )
+                if progress:
+                    route_detail = (
+                        "直接回答，不启动研究"
+                        if routed_decision.intent in {"discussion", "explain_result"}
+                        else "进入研究流程并继续生成可确认方案"
+                    )
+                    progress(
+                        9,
+                        progress_message(
+                            ThinkingStep(
+                                "answer" if routed_decision.intent in {"discussion", "explain_result"} else "route",
+                                "整理直接回复"
+                                if routed_decision.intent in {"discussion", "explain_result"}
+                                else "进入研究流程",
+                                route_detail,
+                                "running",
+                            ),
+                            "桌面入口路由完成",
+                        ),
+                    )
                 if routed_decision.intent in {"discussion", "explain_result"}:
                     return self._direct_dialogue_snapshot(
                         thread_id=session_id,
