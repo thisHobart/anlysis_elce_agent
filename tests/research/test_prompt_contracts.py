@@ -342,6 +342,37 @@ def test_recorded_planning_prompt_version_cannot_drift_from_the_prompt_in_use():
     assert EDAPlan.model_fields["planning_prompt_version"].default == PLANNING_PROMPT_VERSION
 
 
+def test_dialogue_can_see_selected_but_unparsed_data_without_widening_its_domain():
+    gateway = CaptureGateway()
+
+    with pytest.raises(RuntimeError, match="captured DialogueDecision"):
+        ModelResearchDialogue(gateway=gateway).decide(
+            question="你好，先介绍一下你能讨论什么",
+            status="idle",
+            config=None,
+            has_executable_data=True,
+            plan=None,
+            data_profile=None,
+            quality_report=None,
+            summary=None,
+            evaluation=None,
+            history=[],
+            available_skills=[],
+        )
+
+    payload = _payload(gateway.calls[0])
+    assert payload["has_executable_data"] is True
+    assert payload["study"]["target"] is None
+    assert payload["skill_contract"]["uploaded_data_without_execution_request"] == "discussion"
+    for phrase in (
+        "对问候简短回应",
+        "概念、方法、分析想法",
+        "明确无关的问题",
+        "只有用户明确要求对实际数据进行计算或研究",
+    ):
+        assert phrase in DIALOGUE_SYSTEM_PROMPT
+
+
 def test_capability_context_locates_methods_and_report_content(synthetic_study: Path):
     """The report stopped carrying methods and thresholds; the model must know where they went."""
 

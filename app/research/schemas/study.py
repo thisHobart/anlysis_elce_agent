@@ -114,6 +114,70 @@ class AnalysisSettings(BaseModel):
         return self.model_copy(update={"output_directory": path.resolve()})
 
 
+class StudyInputDescriptor(BaseModel):
+    """Lightweight, serializable input selection that never reads data contents."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_path: Path
+    actuals_path: Path | None = None
+    forecasts_path: Path | None = None
+    output_directory: Path | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    study_name: str | None = Field(default=None, min_length=1, max_length=128)
+    market: str | None = Field(default=None, min_length=1, max_length=128)
+    timezone: str | None = None
+    frequency: str | None = None
+
+    @field_validator("target_path", "actuals_path", "forecasts_path")
+    @classmethod
+    def validate_input_file(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
+        resolved = value.resolve()
+        if not resolved.is_file():
+            raise ValueError(f"文件不存在：{resolved}")
+        if resolved.suffix.casefold() not in {".csv", ".parquet", ".pq"}:
+            raise ValueError(f"只支持 CSV/Parquet 文件：{resolved}")
+        return resolved
+
+    @field_validator("output_directory")
+    @classmethod
+    def resolve_output_directory(cls, value: Path | None) -> Path | None:
+        return value.resolve() if value is not None else None
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_optional_timezone(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"unknown timezone: {value}") from exc
+        return value
+
+    @field_validator("frequency")
+    @classmethod
+    def validate_optional_frequency(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            offset = pd.tseries.frequencies.to_offset(value)
+        except ValueError as exc:
+            raise ValueError(f"invalid pandas frequency: {value}") from exc
+        if offset.nanos <= 0:
+            raise ValueError("frequency must be positive")
+        return value
+
+    @model_validator(mode="after")
+    def validate_window(self) -> StudyInputDescriptor:
+        if self.start_time is not None and self.end_time is not None and self.start_time > self.end_time:
+            raise ValueError("start_time must not be after end_time")
+        return self
+
+
 class StudyConfig(BaseModel):
     """Top-level contract consumed by the EDA pipeline."""
 

@@ -49,6 +49,10 @@ class ArtifactLayout:
         return self.evidence / "eda_summary.json"
 
     @property
+    def call_evidence(self) -> Path:
+        return self.evidence / "call_evidence.json"
+
+    @property
     def agent_evaluation(self) -> Path:
         return self.evidence / "agent_evaluation.json"
 

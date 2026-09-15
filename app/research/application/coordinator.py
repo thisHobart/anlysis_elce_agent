@@ -13,6 +13,7 @@ from langgraph.types import Command
 
 from app.llm.factory import build_model_gateway
 from app.research.agent.context import MAX_PERSISTED_CONVERSATION_MESSAGES
+from app.research.agent.dynamic import DynamicAnalysisAgent
 from app.research.agent.orchestrator import MainResearchAgent, ModelResearchDialogue
 from app.research.agent.retrieval import select_persisted_conversation_history
 from app.research.agent.schemas import (
@@ -44,13 +45,13 @@ from app.research.graph.narration import (
     progress_message,
 )
 from app.research.graph.tool_result_store import FileToolResultStore, InMemoryToolResultStore, ToolResultStore
-from app.research.graph.workflow import build_research_workflow
-from app.research.schemas.study import StudyConfig
+from app.research.graph.workflow import build_research_workflow, validate_analysis_message_protocol
+from app.research.schemas.study import StudyConfig, StudyInputDescriptor
 from app.research.skills.registry import SkillRegistry
 from app.research.tools.eda.functions import build_eda_tool_registry
 from app.research.tools.registry import ToolRegistry
 
-GRAPH_SCHEMA_VERSION = 11
+GRAPH_SCHEMA_VERSION = 13
 GRAPH_RECURSION_LIMIT = 1000
 MAX_RECALLED_CONVERSATION_MESSAGES = max(1, MAX_PERSISTED_CONVERSATION_MESSAGES - 2)
 
@@ -73,6 +74,7 @@ class ResearchCoordinator:
         checkpoint_path: str | Path | None = None,
         checkpointer_handle: CheckpointerHandle | None = None,
         result_store: ToolResultStore | None = None,
+        dynamic_agent: DynamicAnalysisAgent | None = None,
     ) -> None:
         self.skills = skills or SkillRegistry.default()
         self.skill_load_errors = list(self.skills.load_errors)
@@ -85,6 +87,11 @@ class ResearchCoordinator:
             )
         self.main_agent = main_agent
         self.eda_subagent = eda_subagent
+        if dynamic_agent is None:
+            planner_gateway = getattr(getattr(eda_subagent, "model_planner", None), "gateway", None)
+            if planner_gateway is not None and hasattr(planner_gateway, "invoke_tool_turn"):
+                dynamic_agent = DynamicAnalysisAgent(gateway=planner_gateway, tools=self.tools)
+        self.dynamic_agent = dynamic_agent
         self.planning = EDAPlanningService(eda_subagent)
         self.execution = execution or EDAExecutionService(registry=self.tools, skills=self.skills)
         self.checkpointer_handle = checkpointer_handle or (
@@ -103,6 +110,7 @@ class ResearchCoordinator:
             tools=self.tools,
             checkpointer=self.checkpointer_handle.saver,
             result_store=self.result_store,
+            dynamic_agent=self.dynamic_agent,
         )
         self.workflow = self.graph
         self._lock = RLock()
@@ -162,6 +170,7 @@ class ResearchCoordinator:
         conversation: list[ConversationMessage | dict[str, Any]] | None,
         approval_timeout_seconds: int,
         automatic_approval_enabled: bool,
+        study_input: StudyInputDescriptor | None = None,
         imported: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         base = {
@@ -191,11 +200,15 @@ class ResearchCoordinator:
                 )
             ),
             "study_config": study_config.model_dump(mode="json") if study_config is not None else None,
+            "study_input": study_input.model_dump(mode="json") if study_input is not None else None,
+            "has_executable_data": study_config is not None or study_input is not None,
+            "pending_research_action": None,
             "data_profile": None,
             "quality_report": None,
             "active_skill": None,
             "decision": None,
             "current_plan": None,
+            "research_scope": None,
             "plan_history": [],
             "plan_fingerprints": [],
             "planning_failure_fingerprints": [],
@@ -213,6 +226,14 @@ class ResearchCoordinator:
             "tool_result_cache": {},
             "tool_results": [],
             "pending_tool_result": None,
+            "analysis_messages": [],
+            "model_round": 0,
+            "tool_calls_used": 0,
+            "current_tool_batch": [],
+            "provider_call_groups": {},
+            "call_evidence": [],
+            "pending_analysis_text": "",
+            "post_analysis_action": None,
             "evaluation": None,
             "eda_summary": None,
             "feedback_packets": [],
@@ -253,6 +274,9 @@ class ResearchCoordinator:
             base["study_config"] = study_config.model_dump(mode="json") if study_config is not None else base.get(
                 "study_config"
             )
+            if study_input is not None:
+                base["study_input"] = study_input.model_dump(mode="json")
+            base["has_executable_data"] = bool(base.get("study_config") or base.get("study_input"))
             base["messages"] = _conversation_payloads(
                 select_persisted_conversation_history(
                     base.get("messages", []),
@@ -345,6 +369,7 @@ class ResearchCoordinator:
         message_id: str | None = None,
         turn_id: str | None = None,
         study_config: StudyConfig | None = None,
+        study_input: StudyInputDescriptor | None = None,
         conversation: list[ConversationMessage | dict[str, Any]] | None = None,
         approval_timeout_seconds: int = 30,
         automatic_approval_enabled: bool = False,
@@ -375,6 +400,7 @@ class ResearchCoordinator:
                     message_id=resolved_message_id,
                     turn_id=resolved_turn_id,
                     study_config=study_config,
+                    study_input=study_input,
                     conversation=recalled_conversation,
                     approval_timeout_seconds=approval_timeout_seconds,
                     automatic_approval_enabled=automatic_approval_enabled,
@@ -411,7 +437,15 @@ class ResearchCoordinator:
                         "pending_user_message": text,
                         "pending_message_id": resolved_message_id,
                         "pending_turn_id": resolved_turn_id,
-                        "study_config": study_config.model_dump(mode="json") if study_config else None,
+                        "study_config": study_config.model_dump(mode="json") if study_config else snapshot.values.get(
+                            "study_config"
+                        ),
+                        "study_input": study_input.model_dump(mode="json") if study_input else snapshot.values.get(
+                            "study_input"
+                        ),
+                        "has_executable_data": bool(
+                            study_config or study_input or snapshot.values.get("study_config") or snapshot.values.get("study_input")
+                        ),
                     }
                     if conversation is not None:
                         update["messages"] = _conversation_payloads(recalled_conversation)
@@ -489,6 +523,11 @@ class ResearchCoordinator:
             values = dict(raw.values or {})
             if values.get("graph_schema_version") != GRAPH_SCHEMA_VERSION:
                 raise ValueError("旧版本研究循环已失效，请新建对话并重新提交研究问题。")
+            validate_analysis_message_protocol(
+                values.get("analysis_messages", []),
+                values.get("provider_call_groups", {}),
+                allow_pending_current_batch=True,
+            )
             if "execute_tool" in getattr(raw, "next", ()):
                 cursor = int(values.get("tool_cursor", 0))
                 queue = values.get("tool_queue", [])

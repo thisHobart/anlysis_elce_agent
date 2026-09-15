@@ -9,6 +9,7 @@ told three times.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -16,11 +17,13 @@ from typing import Any
 from app.research.agent.schemas import AgentEvaluation, EDAPlan
 from app.research.evaluation.issues import issue_line
 from app.research.evaluation.wording import stationarity_text
+from app.research.evidence import CallEvidenceLedger
 from app.research.reporting import readings
 from app.research.reporting.capabilities import FIGURE_TITLES
 from app.research.reporting.readings import format_statistic
 from app.research.schemas.results import DataQualityReport
 from app.research.schemas.study import StudyConfig
+from app.research.tools.catalog import FUNCTION_CATALOG
 
 DECISION_LABELS = {
     "accept": "研究已收敛",
@@ -588,11 +591,82 @@ def _render(sections: list[tuple[str, str, list[Block]]]) -> list[str]:
     return lines
 
 
+def _repeated_call_blocks(
+    evidence: CallEvidenceLedger,
+    figure_names: set[str],
+) -> list[Block]:
+    """Expose repeated function runs by call id so parameters and charts never overwrite."""
+
+    blocks: list[Block] = []
+    for function_name in dict.fromkeys(item.function for item in evidence.successful_calls()):
+        runs = evidence.calls_for(function_name)
+        if len(runs) < 2:
+            continue
+        rows = []
+        related_figures: list[str] = []
+        for run in runs:
+            call_id = run.call_id
+            rows.append(
+                [
+                    call_id,
+                    json.dumps(run.arguments, ensure_ascii=False, sort_keys=True),
+                    run.status,
+                    str(run.output_hash or "")[:12],
+                ]
+            )
+            suffix = f"__{call_id[:8]}"
+            related_figures.extend(sorted(name for name in figure_names if name.endswith(suffix)))
+        if not rows:
+            continue
+        lines = _text(
+            f"该函数共执行 {len(rows)} 次；下表逐次保留参数与证据，综合结论只比较口径一致的结果。"
+        )
+        lines.extend(_table(["调用 ID", "参数", "状态", "结果哈希"], rows))
+        for figure_name in related_figures:
+            base_name = figure_name.split("__", 1)[0]
+            lines.extend(
+                [
+                    "",
+                    f"![{FIGURE_TITLES.get(base_name, base_name)} · {figure_name}](figures/{figure_name}.svg)",
+                ]
+            )
+        catalog = FUNCTION_CATALOG.get(function_name)
+        blocks.append(Block(title=catalog.title if catalog else function_name, lines=lines))
+    return blocks
+
+
+def _execution_issue_blocks(evidence: CallEvidenceLedger) -> list[Block]:
+    """Keep failed and cancelled calls visible without treating them as findings."""
+
+    rows = []
+    for call in evidence.calls:
+        if call.status not in {"failed", "cancelled"}:
+            continue
+        error = call.error or {}
+        rows.append(
+            [
+                call.call_id,
+                call.function,
+                json.dumps(call.arguments, ensure_ascii=False, sort_keys=True),
+                call.status,
+                error.get("code") or "—",
+                error.get("message") or "未生成有效结果。",
+            ]
+        )
+    if not rows:
+        return []
+    return _block(
+        "失败或取消的调用",
+        _text("以下调用只作为执行限制记录，不参与数值结论、综合摘要或图表。"),
+        _table(["调用 ID", "函数", "参数", "状态", "错误代码", "说明"], rows),
+    )
+
+
 def build_agent_eda_report(
     *,
     config: StudyConfig,
     quality: DataQualityReport,
-    summary: dict[str, Any],
+    evidence: CallEvidenceLedger,
     plan: EDAPlan,
     evaluation: AgentEvaluation,
     figure_names: set[str],
@@ -601,6 +675,11 @@ def build_agent_eda_report(
 ) -> str:
     """Compose the full report; only sections backed by real evidence are emitted."""
 
+    summary = evidence.analysis_view(
+        config=config,
+        research_question=plan.question,
+        selected_variables=list(plan.selected_variables),
+    )
     unit = config.target.unit if config.target.unit not in {"", "unknown"} else ""
     in_scope = {config.target.name, *(summary.get("selected_variables") or [])}
     focus_steps = [step.title for step in plan.enabled_steps if step.function != "data_quality"]
@@ -654,6 +733,16 @@ def build_agent_eda_report(
             "可预测性基线",
             "后续模型必须超过的误差底线，以及建模前的预处理建议。",
             _readiness(summary, figure_names, unit),
+        ),
+        (
+            "重复参数调用",
+            "同一函数以不同参数多次执行时，每次调用的证据和图表均以调用 ID 单独保留。",
+            _repeated_call_blocks(evidence, figure_names),
+        ),
+        (
+            "执行记录与限制",
+            "失败和取消调用保留在权威调用账本中，但不会伪装为分析证据。",
+            _execution_issue_blocks(evidence),
         ),
     ]
     lines = [*header, *_render(sections)]

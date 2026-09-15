@@ -9,7 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from app.research.agent.context import compact_episode_context
-from app.research.agent.schemas import ConversationMessage, EDAPlan, ResearchDataProfile, ResearchProposal
+from app.research.agent.schemas import (
+    ConversationMessage,
+    EDAPlan,
+    EDAResearchScope,
+    ResearchDataProfile,
+    ResearchProposal,
+    ResearchScopeProposal,
+)
 from app.research.agent.subagents.eda import EDASubagent
 from app.research.data.alignment import AlignmentResult, align_loaded_series
 from app.research.data.loader import LoadedSeries, _read_frame, load_series_from_frame
@@ -159,11 +166,74 @@ def _proposal_message(plan: EDAPlan, profile: ResearchDataProfile) -> str:
     )
 
 
+def _scope_message(scope: EDAResearchScope, profile: ResearchDataProfile) -> str:
+    metadata_note = ""
+    if profile.target_unit.casefold() in {"", "unknown", "unspecified"} or "unspecified" in profile.market.casefold():
+        metadata_note = " 当前市场或单位元数据尚不完整，业务解释前需要确认。"
+    return (
+        f"我已检查 {profile.aligned_rows:,} 个对齐时间点，目标 {profile.target_name} 的覆盖率为 "
+        f"{profile.target_coverage_rate:.2%}。请确认研究目标、数据范围和动态分析预算；确认后，"
+        "分析 Agent 会根据每一步证据选择下一项方法。"
+        f"{metadata_note}"
+    )
+
+
+def _history_payloads(conversation: list[ConversationMessage | dict[str, Any]] | None) -> list[dict[str, Any]]:
+    return [
+        {
+            "message_id": str(item.message_id if isinstance(item, ConversationMessage) else item.get("message_id", "")),
+            "turn_id": item.turn_id if isinstance(item, ConversationMessage) else item.get("turn_id"),
+            "episode_id": item.episode_id if isinstance(item, ConversationMessage) else item.get("episode_id"),
+            "role": str(item.role if isinstance(item, ConversationMessage) else item.get("role", "user")),
+            "content": str(item.content if isinstance(item, ConversationMessage) else item.get("content", "")),
+            "created_at": str(item.created_at if isinstance(item, ConversationMessage) else item.get("created_at", "")),
+        }
+        for item in (conversation or [])
+    ]
+
+
 class EDAPlanningService:
     """Application service that supplies data evidence to the EDA Subagent."""
 
     def __init__(self, subagent: EDASubagent) -> None:
         self.subagent = subagent
+
+    def propose_scope(
+        self,
+        *,
+        question: str,
+        config_path: str | Path | None = None,
+        study_config: StudyConfig | None = None,
+        conversation: list[ConversationMessage | dict[str, Any]] | None = None,
+        progress: ProgressCallback | None = None,
+        skill: SkillDefinition,
+    ) -> ResearchScopeProposal:
+        callback = progress or noop_progress
+        callback(5, "解析数据字段与时间轴")
+        config = resolve_config(config_path=config_path, study_config=study_config)
+        callback(20, "加载并对齐数据")
+        prepared = prepare_research_data(config)
+        inputs = input_file_manifest(config)
+        current_data_fingerprint = study_fingerprint(config, inputs)
+        snapshot = freeze_research_data(prepared, fingerprint=current_data_fingerprint, input_manifest=inputs)
+        callback(65, "生成动态研究范围")
+        scope = self.subagent.propose_scope(
+            question,
+            config,
+            prepared.quality,
+            history=_history_payloads(conversation),
+            skill=skill,
+            data_fingerprint=current_data_fingerprint,
+        )
+        profile = _data_profile(prepared)
+        callback(100, "研究范围已生成，等待用户确认")
+        return ResearchScopeProposal(
+            scope=scope,
+            assistant_message=_scope_message(scope, profile),
+            data_profile=profile,
+            quality_report=prepared.quality,
+            data_summary=snapshot.summary if snapshot is not None else None,
+        )
 
     def propose(
         self,
@@ -189,21 +259,7 @@ class EDAPlanningService:
         # run reads are the same rows even if the sources move in between.
         snapshot = freeze_research_data(prepared, fingerprint=current_data_fingerprint, input_manifest=inputs)
         callback(65, "EDA Subagent 分析问题与数据画像")
-        history = [
-            {
-                "message_id": str(
-                    item.message_id if isinstance(item, ConversationMessage) else item.get("message_id", "")
-                ),
-                "turn_id": item.turn_id if isinstance(item, ConversationMessage) else item.get("turn_id"),
-                "episode_id": item.episode_id if isinstance(item, ConversationMessage) else item.get("episode_id"),
-                "role": str(item.role if isinstance(item, ConversationMessage) else item.get("role", "user")),
-                "content": str(item.content if isinstance(item, ConversationMessage) else item.get("content", "")),
-                "created_at": str(
-                    item.created_at if isinstance(item, ConversationMessage) else item.get("created_at", "")
-                ),
-            }
-            for item in (conversation or [])
-        ]
+        history = _history_payloads(conversation)
         episode_memory = compact_episode_context(
             episode_summaries or [],
             data_fingerprint=current_data_fingerprint,

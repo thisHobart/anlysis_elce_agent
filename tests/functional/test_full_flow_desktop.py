@@ -19,6 +19,9 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from app.desktop.main_window import MainWindow
 from app.desktop.p2_review import P2ReviewDialog
 from app.desktop.session import SessionRunRecord, SessionStore
+from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
+from app.research.agent.subagents.eda import EDASubagent
+from app.research.application.coordinator import ResearchCoordinator
 from app.research.forecasting.contracts import ForecastPlan, ForecastSnapshotSpec
 from app.research.full_flow import (
     FlowRunReference,
@@ -298,13 +301,39 @@ def test_chat_request_reuses_limited_p1_and_reaches_p3_card(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    window = MainWindow(session_store=SessionStore(tmp_path / "sessions.json"))
+    class CombinedNewsForecastDialogue:
+        enabled = True
+        model_name = "combined-news-forecast-route-test"
+
+        def decide(self, **_kwargs):
+            return DialogueDecision(intent="new_news_analysis", post_analysis_action="forecast")
+
+    class UnusedPlanner:
+        enabled = True
+        model_name = "combined-news-forecast-route-test"
+
+    coordinator = ResearchCoordinator(
+        main_agent=MainResearchAgent(model_dialogue=CombinedNewsForecastDialogue()),
+        eda_subagent=EDASubagent(model_planner=UnusedPlanner()),
+    )
+    window = MainWindow(
+        agent=coordinator,
+        session_store=SessionStore(tmp_path / "sessions.json"),
+    )
     workspace = window.workspace
     session = workspace.current_session
     p1_root = tmp_path / "p1-existing"
     p1_report = _touch(p1_root / "report.md")
-    target = _touch(tmp_path / "target.parquet")
+    target = tmp_path / "target.csv"
+    target.write_text(
+        "timestamp,price\n"
+        "2026-09-12T00:00:00+08:00,100\n"
+        "2026-09-12T01:00:00+08:00,105\n"
+        "2026-09-12T02:00:00+08:00,98\n",
+        encoding="utf-8",
+    )
     session.region_id = "shandong"
+    session.region_market = "Shandong"
     session.region_timezone = "Asia/Shanghai"
     session.source_kind = "database"
     session.inputs["target"].path = str(target)
@@ -388,8 +417,16 @@ def test_chat_request_reuses_limited_p1_and_reaches_p3_card(
 
     def run_immediately(*, kind, operation, success_handler, failure_handler=None):
         del failure_handler
-        assert kind in {"full_flow_p2", "full_flow_p1_synthesis", "full_flow_p3_prepare"}
+        assert kind in {"dialogue", "full_flow_p2", "full_flow_p1_synthesis", "full_flow_p3_prepare"}
         success_handler(operation(lambda *_args: None))
+        if kind == "dialogue" and workspace._pending_news_request is not None:
+            pending_question, prepare_forecast = workspace._pending_news_request
+            workspace._pending_news_request = None
+            workspace._submit_news_analysis_request(
+                pending_question,
+                prepare_forecast=prepare_forecast,
+                record_user_message=False,
+            )
         if workspace._pending_full_flow_resume:
             workspace._pending_full_flow_resume = False
             workspace._resume_full_flow()
@@ -402,7 +439,13 @@ def test_chat_request_reuses_limited_p1_and_reaches_p3_card(
     monkeypatch.setattr(workspace, "_start_worker", run_immediately)
     try:
         workspace.submit_question("根据已经分析的数据，开始新闻分析最后电价预测")
+        _wait_for(
+            qt_app,
+            lambda: calls == ["p2", "p1_synthesis", "p3_prepare"] or session.status == "failed",
+            timeout=5.0,
+        )
 
+        assert session.status != "failed", session.messages[-1].content
         assert calls == ["p2", "p1_synthesis", "p3_prepare"]
         assert session.status == "awaiting_plan_approval"
         assert session.pending_forecast_question is None

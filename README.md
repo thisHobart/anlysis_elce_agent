@@ -222,4 +222,5 @@ $env:QT_QPA_PLATFORM="offscreen"
 [docs/phase1-acceptance.md](docs/phase1-acceptance.md)。P2 当前状态见
 [docs/phase2-status.md](docs/phase2-status.md)，目标与门禁见
 [docs/phase2-news-price-analysis-proposal.md](docs/phase2-news-price-analysis-proposal.md)，长文本三方案实现、功能测试与 MVP 选型见
-[docs/p2-long-context-strategy-evaluation.md](docs/p2-long-context-strategy-evaluation.md)；新闻研究链路已有独立实现和真实来源语料，但尚未通过真实模型生产准入，也未接入桌面流程或生产新闻接口。
+[docs/p2-long-context-strategy-evaluation.md](docs/p2-long-context-strategy-evaluation.md)。工具调用与工具暴露这条链路上出现过的问题和处置原则汇总在
+[docs/tool-calling-issues.md](docs/tool-calling-issues.md)；新闻研究链路已有独立实现和真实来源语料，但尚未通过真实模型生产准入，也未接入桌面流程或生产新闻接口。

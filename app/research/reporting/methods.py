@@ -124,14 +124,10 @@ def _protocol_rules(protocol: ResearchProtocol | None) -> dict[str, str]:
     }
 
 
-def _evidence_location(function_name: str) -> str:
-    spec = FUNCTION_CATALOG[function_name]
+def _evidence_location(function_name: str, call_id: str) -> str:
     if function_name == "data_quality":
         return "evidence/data_quality.json"
-    pointer = f"/{spec.result_key}"
-    if spec.evidence_field:
-        pointer += f"/{spec.evidence_field}"
-    return f"evidence/eda_summary.json#{pointer}"
+    return f"evidence/call_evidence.json#/calls/{call_id}"
 
 
 def build_method_document(
@@ -149,12 +145,13 @@ def build_method_document(
     ):
         raise ValueError("研究方法说明使用的协议版本与锁定计划不一致")
     rules = _protocol_rules(protocol)
-    trace_by_function = {str(item.get("function")): item for item in execution_trace}
+    trace_by_step = {str(item.get("step_id")): item for item in execution_trace}
     methods: list[ExecutedMethod] = []
     criterion_ids: set[str] = set()
     for step in plan.enabled_steps:
         spec = FUNCTION_CATALOG[step.function]
-        trace = trace_by_function.get(step.function, {})
+        trace = trace_by_step.get(step.step_id, {})
+        call_id = str(trace.get("call_id") or "未记录")
         criterion_ids.update(CRITERIA_BY_FUNCTION.get(step.function, ()))
         methods.append(
             ExecutedMethod(
@@ -169,8 +166,8 @@ def build_method_document(
                 parameters=dict(trace.get("parameters") or step.parameters),
                 interpretation_rule=rules.get(step.function, "当前 Skill 未声明额外判读规则。"),
                 report_location=REPORT_LOCATIONS.get(step.function),
-                evidence_location=_evidence_location(step.function),
-                call_id=str(trace.get("call_id") or "未记录"),
+                evidence_location=_evidence_location(step.function, call_id),
+                call_id=call_id,
                 work_id=str(trace.get("work_id") or "未记录"),
                 duration_ms=(float(trace["duration_ms"]) if trace.get("duration_ms") is not None else None),
                 output_hash=str(trace.get("output_hash") or "未记录"),

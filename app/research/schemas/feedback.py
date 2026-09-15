@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 FeedbackSource = Literal[
     "user",
+    "data_loader",
     "skill_validator",
     "plan_validator",
     "tool_executor",

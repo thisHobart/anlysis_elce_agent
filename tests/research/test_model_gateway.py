@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 
 import pytest
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from pydantic import BaseModel
 
 from app.config import Settings
@@ -15,8 +15,10 @@ from app.llm.gateway import (
     ModelOutputTruncatedError,
     ModelProtocolError,
     ModelResponseError,
+    ModelToolCall,
     ModelTransientError,
 )
+from app.llm.langchain_support import transport_messages
 from app.llm.openai_compatible import ResearchModelGateway
 
 TOOLS = [
@@ -327,6 +329,70 @@ def test_research_function_calls_are_proposed_without_execution():
     assert model.parallel_tool_calls is True
 
 
+def test_optional_tool_turn_preserves_call_id_without_forcing_a_call():
+    gateway = ResearchModelGateway(_settings())
+    model = RecordingModel()
+    gateway._model = model
+
+    turn = gateway.invoke_tool_turn(messages=_messages(), tools=TOOLS)
+
+    assert turn.content == ""
+    assert turn.tool_calls[0].call_id == "call-1"
+    assert model.tool_choice is None
+    assert model.parallel_tool_calls is True
+
+
+def test_optional_tool_turn_can_finish_with_text_and_no_call():
+    gateway = ResearchModelGateway(_settings())
+    model = RecordingModel(content="证据已经足够。")
+    model.response.tool_calls = []
+    gateway._model = model
+
+    turn = gateway.invoke_tool_turn(messages=_messages(), tools=TOOLS)
+
+    assert turn.content == "证据已经足够。"
+    assert turn.tool_calls == []
+    assert model.tool_choice is None
+
+
+def test_assistant_tool_calls_and_tool_results_round_trip_to_transport_messages():
+    messages = [
+        ModelMessage(
+            role="assistant",
+            tool_calls=[
+                ModelToolCall(
+                    name="price_descriptive_distribution",
+                    arguments={},
+                    call_id="provider-call-7",
+                )
+            ],
+        ),
+        ModelMessage(role="tool", content='{"status":"completed"}', tool_call_id="provider-call-7"),
+    ]
+
+    converted = transport_messages(messages)
+
+    assert isinstance(converted[0], AIMessage)
+    assert converted[0].tool_calls[0]["id"] == "provider-call-7"
+    assert isinstance(converted[1], ToolMessage)
+    assert converted[1].tool_call_id == "provider-call-7"
+
+
+def test_non_assistant_messages_cannot_carry_tool_calls():
+    with pytest.raises(ValueError, match="assistant"):
+        ModelMessage(
+            role="user",
+            content="test",
+            tool_calls=[
+                ModelToolCall(
+                    name="price_descriptive_distribution",
+                    arguments={},
+                    call_id="provider-call-8",
+                )
+            ],
+        )
+
+
 def test_prompt_json_applies_local_schema_and_whitelist_to_research_function_selection():
     class PromptToolModel(RecordingModel):
         def with_structured_output(self, schema, *, method, include_raw):
@@ -371,6 +437,51 @@ def test_prompt_json_applies_local_schema_and_whitelist_to_research_function_sel
     assert isinstance(model.last_messages[0], SystemMessage)
     assert "研究函数选择兼容协议" in model.last_messages[0].content
     assert "price_descriptive_distribution" in model.last_messages[0].content
+
+
+def test_prompt_json_optional_tool_turn_is_locally_validated_and_ids_are_turn_scoped():
+    class PromptTurnModel(RecordingModel):
+        def with_structured_output(self, schema, *, method, include_raw):
+            self.method = method
+            self.include_raw = include_raw
+
+            class Bound:
+                def invoke(_self, messages):
+                    self.last_messages = messages
+                    payload = {
+                        "content": "",
+                        "calls": [
+                            {
+                                "name": "price_descriptive_distribution",
+                                "arguments": {},
+                            }
+                        ],
+                    }
+                    return {
+                        "raw": SimpleNamespace(
+                            content='{"content":"","calls":[{"name":"price_descriptive_distribution","arguments":{}}]}',
+                            additional_kwargs={},
+                            tool_calls=[],
+                            response_metadata={},
+                        ),
+                        "parsed": schema.model_validate(payload),
+                        "parsing_error": None,
+                    }
+
+            return Bound()
+
+    gateway = ResearchModelGateway(_settings(llm_structured_output_method="prompt_json"))
+    model = PromptTurnModel()
+    gateway._model = model
+
+    first = gateway.invoke_tool_turn(messages=_messages("first"), tools=TOOLS)
+    second = gateway.invoke_tool_turn(messages=_messages("second"), tools=TOOLS)
+
+    assert first.finish_reason == "prompt_json"
+    assert first.tool_calls[0].name == "price_descriptive_distribution"
+    assert first.tool_calls[0].call_id.startswith("prompt-json-")
+    assert first.tool_calls[0].call_id != second.tool_calls[0].call_id
+    assert model.bound_tools is None
 
 
 def test_prompt_json_research_function_selection_rejects_names_outside_whitelist():

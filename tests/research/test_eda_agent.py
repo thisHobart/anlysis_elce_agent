@@ -23,7 +23,7 @@ from app.research.application.planning import prepare_research_data
 from app.research.data.loader import ResearchDataError
 from app.research.data.snapshot import input_file_manifest, study_fingerprint
 from app.research.data.sources.materialize import snapshot_root
-from app.research.evaluation.eda import evaluate_agent_run
+from app.research.evaluation.eda import evaluate_compatibility_summary as evaluate_agent_run
 from app.research.planning.contracts import EDAPlanDraft
 from app.research.schemas.results import QualityIssue
 from app.research.schemas.study import load_study_config

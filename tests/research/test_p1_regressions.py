@@ -183,9 +183,8 @@ def test_a_b_a_evidence_cycle_stops_on_membership_not_only_adjacent(
 
     evaluations = 0
 
-    def always_revise(*, plan, quality, summary):
+    def always_revise(*, plan, **_kwargs):
         nonlocal evaluations
-        del quality, summary
         evaluations += 1
         return AgentEvaluation(
             decision="revise",
@@ -224,9 +223,8 @@ def test_unchanged_agenda_stops_before_iteration_budget(
 ):
     evaluations = 0
 
-    def same_agenda(*, plan, quality, summary):
+    def same_agenda(*, plan, **_kwargs):
         nonlocal evaluations
-        del quality, summary
         evaluations += 1
         return AgentEvaluation(
             decision="revise",

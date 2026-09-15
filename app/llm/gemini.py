@@ -24,6 +24,7 @@ from app.llm.gateway import (
     ModelResponseError,
     ModelThinkingError,
     ModelToolCall,
+    ModelToolTurn,
     StructuredResult,
 )
 from app.llm.langchain_support import (
@@ -314,6 +315,55 @@ class GeminiModelGateway:
             raise ModelResponseError(f"Gemini 调用了未提供的研究函数：{', '.join(unknown)}")
         self._audit(budget, response=response, outcome="completed")
         return calls
+
+    def invoke_tool_turn(
+        self,
+        *,
+        messages: list[ModelMessage],
+        tools: list[dict[str, Any]],
+        purpose: ModelRequestPurpose | str = ModelRequestPurpose.GENERIC,
+    ) -> ModelToolTurn:
+        if not tools:
+            raise ModelConfigurationError("没有可提供给 Gemini 的研究函数。")
+        allowed_names = tool_names(tools)
+        if not allowed_names:
+            raise ModelConfigurationError("研究函数定义缺少 name。")
+        budget = self._budget(messages, purpose=purpose, tools=tools)
+        prepared = transport_messages(messages)
+        response: Any | None = None
+        try:
+            runnable = self._get_model().bind_tools(tools)
+            response = self._bind_output_limit(runnable, budget).invoke(prepared)
+            self._guard_thinking(response)
+            ensure_complete_response(response)
+            calls = normalized_calls(getattr(response, "tool_calls", None))
+            content = visible_text(response)
+        except (ModelConfigurationError, ModelThinkingError, ModelOutputTruncatedError) as exc:
+            self._audit(budget, response=response, outcome="failed", error=exc)
+            raise
+        except ValidationError as exc:
+            self._audit(budget, response=response, outcome="failed", error=exc)
+            raise ModelResponseError(f"Gemini 函数参数无法解析：{exc}") from exc
+        except Exception as exc:
+            self._audit(budget, response=response, outcome="failed", error=exc)
+            if is_output_truncation_error(exc):
+                raise ModelOutputTruncatedError(f"Gemini 输出达到 token 限制：{exc}") from exc
+            if compat.is_rejected_request(exc):
+                raise ModelProtocolError(f"当前 Gemini 模型不支持原生函数调用：{exc}") from exc
+            raise ModelGatewayError(f"Gemini 函数选择失败：{type(exc).__name__}: {exc}") from exc
+        unknown = sorted({call.name for call in calls} - allowed_names)
+        if unknown:
+            raise ModelResponseError(f"Gemini 调用了未提供的研究函数：{', '.join(unknown)}")
+        if any(not call.call_id for call in calls):
+            raise ModelResponseError("Gemini 函数调用缺少 provider call_id。")
+        finish_reason = response_metadata(response).get("finish_reason")
+        turn = ModelToolTurn(
+            content=content,
+            tool_calls=calls,
+            finish_reason=str(finish_reason) if finish_reason is not None else None,
+        )
+        self._audit(budget, response=response, outcome="completed")
+        return turn
 
     def _guard_thinking(self, response: Any) -> None:
         if self.settings.llm_thinking_policy == "reject":

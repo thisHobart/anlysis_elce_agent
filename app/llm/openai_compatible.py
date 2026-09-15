@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from app.config import Settings, get_settings
 from app.llm import compat
@@ -25,6 +26,7 @@ from app.llm.gateway import (
     ModelResponseError,
     ModelThinkingError,
     ModelToolCall,
+    ModelToolTurn,
     ModelTransientError,
     StructuredResult,
 )
@@ -85,6 +87,21 @@ class _PromptToolCalls(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     calls: list[_PromptToolCall] = Field(min_length=1)
+
+
+class _PromptToolTurn(BaseModel):
+    """Compatibility envelope for one optional tool-selection turn."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = ""
+    calls: list[_PromptToolCall] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_turn(self) -> _PromptToolTurn:
+        if not self.content.strip() and not self.calls:
+            raise ValueError("content 和 calls 不能同时为空")
+        return self
 
 
 def _prompt_tool_call_messages(
@@ -552,6 +569,89 @@ class ResearchModelGateway:
         self._audit(budget, response=response, outcome="completed")
         return validated
 
+    def invoke_tool_turn(
+        self,
+        *,
+        messages: list[ModelMessage],
+        tools: list[dict[str, Any]],
+        purpose: ModelRequestPurpose | str = ModelRequestPurpose.GENERIC,
+    ) -> ModelToolTurn:
+        """Return one optional-tool assistant turn while preserving provider call ids."""
+
+        if not tools:
+            raise ModelConfigurationError("没有可提供给大模型的研究函数。")
+        allowed_names = tool_names(tools)
+        if not allowed_names:
+            raise ModelConfigurationError("研究函数定义缺少 name。")
+        if self.settings.llm_structured_output_method == "prompt_json":
+            result = self.invoke_structured(
+                messages=_prompt_tool_call_messages(messages, tools),
+                schema=_PromptToolTurn,
+                purpose=purpose,
+            )
+            history_key = json.dumps(
+                [message.model_dump(mode="json") for message in messages],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            calls = [
+                ModelToolCall(
+                    name=call.name,
+                    arguments=call.arguments,
+                    call_id=(
+                        "prompt-json-"
+                        + hashlib.sha256(
+                            f"{history_key}:{index}:{call.model_dump_json()}".encode()
+                        ).hexdigest()[:20]
+                    ),
+                )
+                for index, call in enumerate(result.calls, start=1)
+            ]
+            return ModelToolTurn(
+                content=result.content,
+                tool_calls=self._validate_tool_calls(calls, allowed_names),
+                finish_reason="prompt_json",
+            )
+        budget = self._budget(messages, purpose=purpose, tools=tools)
+        prepared = transport_messages(messages)
+        response: Any | None = None
+        try:
+            response = self._degrade(
+                lambda: self._bind_request_options(self._bound_tools_for_turn(tools), budget).invoke(prepared),
+                allowed=(self._degradable_client_features() | compat.OPTIONAL_TOOL_CALL_FEATURES),
+            )
+            self._guard_thinking(response)
+            ensure_complete_response(response)
+            calls = normalized_calls(getattr(response, "tool_calls", None))
+            content = visible_text(response)
+        except (ModelConfigurationError, ModelThinkingError, ModelOutputTruncatedError) as exc:
+            self._audit(budget, response=response, outcome="failed", error=exc)
+            raise
+        except ValidationError as exc:
+            self._audit(budget, response=response, outcome="failed", error=exc)
+            raise ModelResponseError(f"大模型函数参数无法解析：{exc}") from exc
+        except Exception as exc:
+            self._audit(budget, response=response, outcome="failed", error=exc)
+            if is_output_truncation_error(exc):
+                raise ModelOutputTruncatedError(f"模型输出达到 token 限制：{exc}") from exc
+            if compat.is_transient_failure(exc):
+                raise ModelTransientError(f"模型端点暂时不可用：{type(exc).__name__}: {exc}") from exc
+            if compat.is_rejected_request(exc):
+                raise self._protocol_error("Function Calling", exc) from exc
+            raise ModelGatewayError(f"大模型函数选择失败：{type(exc).__name__}: {exc}") from exc
+        validated = self._validate_tool_calls(calls, allowed_names)
+        if any(not call.call_id for call in validated):
+            raise ModelResponseError("大模型函数调用缺少 provider call_id。")
+        finish_reason = response_metadata(response).get("finish_reason")
+        turn = ModelToolTurn(
+            content=content,
+            tool_calls=validated,
+            finish_reason=str(finish_reason) if finish_reason is not None else None,
+        )
+        self._audit(budget, response=response, outcome="completed")
+        return turn
+
     @staticmethod
     def _validate_tool_calls(
         calls: list[ModelToolCall],
@@ -566,6 +666,12 @@ class ResearchModelGateway:
 
     def _bound_tools(self, tools: list[dict[str, Any]]) -> Any:
         options: dict[str, Any] = {"tool_choice": "required"}
+        if "parallel_tool_calls" not in self._disabled:
+            options["parallel_tool_calls"] = True
+        return self._get_model().bind_tools(tools, **options)
+
+    def _bound_tools_for_turn(self, tools: list[dict[str, Any]]) -> Any:
+        options: dict[str, Any] = {}
         if "parallel_tool_calls" not in self._disabled:
             options["parallel_tool_calls"] = True
         return self._get_model().bind_tools(tools, **options)

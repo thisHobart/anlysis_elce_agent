@@ -6,7 +6,7 @@ import inspect
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.config import Settings, get_settings
 from app.llm.budget import ModelRequestPurpose
@@ -32,7 +32,7 @@ from app.research.agent.errors import (
 )
 from app.research.agent.prompts import DIALOGUE_PROMPT_VERSION, DIALOGUE_SYSTEM_PROMPT
 from app.research.agent.retrieval import select_conversation_context
-from app.research.agent.schemas import ConversationMessage, EDAPlan, EDAToolName
+from app.research.agent.schemas import ConversationMessage, EDAPlan, EDAResearchScope, EDAToolName
 from app.research.planning.variables import (
     VariableSelectionMode,
     eligible_exogenous_variables,
@@ -50,6 +50,7 @@ DialogueIntent = Literal[
     "revise_plan",
     "explain_result",
     "execute_plan",
+    "new_news_analysis",
     "new_forecast_plan",
     "execute_forecast_plan",
 ]
@@ -82,6 +83,16 @@ class DialogueDecision(BaseModel):
     max_lag: int | None = Field(default=None, ge=0)
     comparison_id: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]{0,31}$")
     segments: list[SegmentDefinition] | None = None
+    post_analysis_action: Literal["forecast"] | None = None
+
+    @model_validator(mode="after")
+    def validate_post_analysis_action(self) -> DialogueDecision:
+        if self.post_analysis_action is not None and self.intent not in {
+            "new_plan",
+            "new_news_analysis",
+        }:
+            raise ValueError("post_analysis_action 只适用于分析后继续预测的路由")
+        return self
 
 
 def _compact_comparisons(value: Any) -> dict[str, Any]:
@@ -395,6 +406,7 @@ class ModelResearchDialogue:
         status: str,
         config: StudyConfig | None,
         plan: EDAPlan | None,
+        scope: EDAResearchScope | None = None,
         data_profile: dict[str, Any] | None,
         quality_report: dict[str, Any] | None,
         summary: dict[str, Any] | None,
@@ -406,6 +418,7 @@ class ModelResearchDialogue:
         episode_goal: str | None = None,
         latest_run: dict[str, Any] | None = None,
         current_turn_id: str | None = None,
+        has_executable_data: bool | None = None,
     ) -> DialogueDecision:
         if not self.enabled:
             raise ResearchModelUnavailableError("大模型尚未配置，无法处理研究对话。")
@@ -438,11 +451,12 @@ class ModelResearchDialogue:
             },
             "question": question,
             "session_status": status,
-            "has_executable_data": config is not None,
+            "has_executable_data": config is not None if has_executable_data is None else has_executable_data,
             "conversation_history": [item.model_dump(mode="json") for item in recent_history],
             "earlier_related_turns": [item.as_payload() for item in earlier_related_turns],
             "episode_memory": compact_episode_context(episode_summaries or []),
             "current_plan": plan.model_dump(mode="json") if plan is not None else None,
+            "research_scope": scope.model_dump(mode="json") if scope is not None else None,
             "study": {
                 "name": config.study.name if config is not None else None,
                 "market": config.study.market if config is not None else None,
@@ -469,11 +483,12 @@ class ModelResearchDialogue:
                 for function_name, metadata in FUNCTION_METADATA.items()
             },
             "intent_rules": {
-                "discussion": "方法讨论或当前方案说明，返回文字解释",
-                "new_plan": "根据数据和问题创建确定性分析方案",
+                "discussion": "电价领域问答、问候、方法讨论、必要澄清、当前方案说明或无关问题引导",
+                "new_plan": "用户明确要求计算实际数据时，根据数据和问题创建分析任务",
                 "revise_plan": "按用户反馈生成当前方案的变更",
                 "explain_result": "引用已有结构化证据解释结果",
                 "execute_plan": "用户明确确认运行当前方案",
+                "new_news_analysis": "用户明确要求分析与电价相关的新闻或政策事件",
                 "new_forecast_plan": "用户只要求山东次日省级实时电价预测；参数由本地固定",
                 "execute_forecast_plan": "用户明确确认运行已冻结的预测方案",
             },
@@ -487,6 +502,8 @@ class ModelResearchDialogue:
             },
             "skill_contract": {
                 "new_plan_skill_name": "choose_from_available_skills",
+                "uploaded_data_without_execution_request": "discussion",
+                "domain": "electricity_price_only",
             },
         }
 

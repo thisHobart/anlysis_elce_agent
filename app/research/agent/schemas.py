@@ -69,6 +69,37 @@ class EDAPlanStep(BaseModel):
     function_version: str = Field(min_length=1)
 
 
+class EDAResearchScope(BaseModel):
+    """One immutable, user-approved boundary for dynamic EDA tool selection."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scope_id: str = Field(default_factory=lambda: uuid4().hex[:12], min_length=1)
+    revision: int = Field(default=1, ge=1)
+    question: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+    study_name: str = Field(min_length=1)
+    data_fingerprint: str = Field(pattern=r"^[a-f0-9]{12}$")
+    skill_name: str = Field(min_length=1)
+    skill_version: str = Field(min_length=1)
+    authorized_functions: list[EDAToolName] = Field(default_factory=list)
+    authorized_variables: list[str] = Field(default_factory=list)
+    initial_strategy: list[str] = Field(min_length=1, max_length=5)
+    max_model_rounds: int = Field(default=8, ge=1, le=32)
+    max_tool_calls: int = Field(default=16, ge=1, le=64)
+    max_attempts_per_call: int = Field(default=2, ge=1, le=5)
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> EDAResearchScope:
+        if "data_quality" in self.authorized_functions:
+            raise ValueError("data_quality 是系统前置核验，不属于动态授权函数")
+        if len(self.authorized_functions) != len(set(self.authorized_functions)):
+            raise ValueError("authorized_functions must be unique")
+        if len(self.authorized_variables) != len(set(self.authorized_variables)):
+            raise ValueError("authorized_variables must be unique")
+        return self
+
+
 class EDAPlan(BaseModel):
     """An editable and reproducible EDA plan proposed for one question."""
 
@@ -182,11 +213,9 @@ class EDAPlan(BaseModel):
     @model_validator(mode="after")
     def validate_steps(self) -> EDAPlan:
         ids = [step.step_id for step in self.steps]
-        tools = [step.function for step in self.steps]
         if len(ids) != len(set(ids)):
             raise ValueError("plan step ids must be unique")
-        if len(tools) != len(set(tools)):
-            raise ValueError("each research function may appear at most once")
+        tools = [step.function for step in self.steps]
         if len(self.deferred_functions) != len(set(self.deferred_functions)):
             raise ValueError("deferred research functions must not contain duplicates")
         if self.variable_selection_stage == "screening" and self.variable_selection_mode != "auto_recommend":
@@ -211,8 +240,12 @@ class EDAPlan(BaseModel):
             spec = FUNCTION_CATALOG[step.function]
             if "methods" in step.parameters:
                 raise ValueError(f"atomic function {step.function} must not contain methods")
-            if spec.uses_variables and step.enabled and step.parameters.get("variables") != selected:
-                raise ValueError(f"{step.function} variables must match plan.selected_variables")
+            if spec.uses_variables and step.enabled:
+                step_variables = step.parameters.get("variables")
+                if not isinstance(step_variables, list) or not step_variables:
+                    raise ValueError(f"{step.function} requires variables")
+                if not set(step_variables).issubset(selected):
+                    raise ValueError(f"{step.function} variables must stay inside plan.selected_variables")
             if spec.uses_max_lag and step.enabled and step.parameters.get("max_lag") is None:
                 raise ValueError(f"{step.function} requires max_lag")
         return self
@@ -331,6 +364,18 @@ class ResearchProposal(BaseModel):
     data_summary: DataSummary | None = None
 
 
+class ResearchScopeProposal(BaseModel):
+    """Desktop-facing dynamic research scope plus the data evidence behind it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scope: EDAResearchScope
+    assistant_message: str
+    data_profile: ResearchDataProfile
+    quality_report: DataQualityReport
+    data_summary: DataSummary | None = None
+
+
 class ResearchTurnResult(BaseModel):
     """One routed conversational turn returned to the desktop controller."""
 
@@ -365,6 +410,7 @@ class EvaluationCheck(BaseModel):
     scope: AgendaScope = "inherent"
     remediable: bool = False
     remediation: str | None = None
+    evidence_call_ids: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def migrate_remediable_scope(self) -> EvaluationCheck:
@@ -386,6 +432,7 @@ class HypothesisAssessment(BaseModel):
     evidence: str
     scope: AgendaScope = "inherent"
     remediation: str | None = None
+    evidence_call_ids: list[str] = Field(default_factory=list)
 
 
 class AgentEvaluation(BaseModel):

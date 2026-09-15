@@ -116,7 +116,20 @@ def transport_messages(messages: list[ModelMessage]) -> list[Any]:
         elif message.role == "user":
             converted.append(HumanMessage(content=message.content))
         elif message.role == "assistant":
-            converted.append(AIMessage(content=message.content))
+            converted.append(
+                AIMessage(
+                    content=message.content,
+                    tool_calls=[
+                        {
+                            "name": call.name,
+                            "args": call.arguments,
+                            "id": call.call_id,
+                            "type": "tool_call",
+                        }
+                        for call in message.tool_calls
+                    ],
+                )
+            )
         else:
             converted.append(
                 ToolMessage(content=message.content, tool_call_id=message.tool_call_id or "")

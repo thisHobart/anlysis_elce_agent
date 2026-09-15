@@ -16,7 +16,7 @@ from app.research.agent.errors import (
     ResearchModelOutputTruncatedError,
     SkillVersionMismatchError,
 )
-from app.research.agent.schemas import EDAPlan
+from app.research.agent.schemas import EDAPlan, EDAResearchScope
 from app.research.data.loader import ResearchDataError
 from app.research.graph.contracts import AuthorizationEnvelope, LoopBudget
 from app.research.schemas.feedback import FeedbackPacket, FeedbackSource
@@ -48,6 +48,15 @@ def plan_fingerprint(plan: EDAPlan) -> str:
         },
     )
     return canonical_hash(payload)
+
+
+def scope_fingerprint(scope: EDAResearchScope) -> str:
+    return canonical_hash(
+        scope.model_dump(
+            mode="json",
+            exclude={"scope_id", "revision", "created_at"},
+        )
+    )
 
 
 def evidence_fingerprint(tool_results: list[dict[str, Any]]) -> str:
@@ -103,6 +112,68 @@ def authorization_envelope(
             for step in plan.enabled_steps
         },
     )
+
+
+def scope_authorization_envelope(
+    scope: EDAResearchScope,
+    *,
+    approved_at: str,
+) -> AuthorizationEnvelope:
+    """Freeze the maximum dynamic tool boundary approved by the user."""
+
+    fingerprint = scope_fingerprint(scope)
+    return AuthorizationEnvelope(
+        approved_plan_id=scope.scope_id,
+        approved_plan_fingerprint=fingerprint,
+        approved_at=approved_at,
+        question_hash=canonical_hash(scope.question.strip()),
+        max_steps=scope.max_tool_calls,
+        skill_name=scope.skill_name,
+        skill_version=scope.skill_version,
+        data_fingerprint=scope.data_fingerprint,
+        functions=list(scope.authorized_functions),
+        variables=list(scope.authorized_variables),
+        max_lag_by_function={},
+        segment_parameters_by_function={},
+        approved_parameters_by_function={},
+        authorization_kind="dynamic_scope",
+        approved_scope_id=scope.scope_id,
+        approved_scope_fingerprint=fingerprint,
+        max_model_rounds=scope.max_model_rounds,
+        max_tool_calls=scope.max_tool_calls,
+        max_attempts_per_call=scope.max_attempts_per_call,
+    )
+
+
+def validate_scope_authorization(
+    scope: EDAResearchScope,
+    envelope: AuthorizationEnvelope,
+) -> None:
+    if envelope.authorization_kind != "dynamic_scope":
+        raise PlanCompatibilityError("当前审批不是动态研究范围授权")
+    violations = []
+    if envelope.approved_scope_id != scope.scope_id:
+        violations.append("研究范围 ID 不一致")
+    if envelope.approved_scope_fingerprint != scope_fingerprint(scope):
+        violations.append("研究范围指纹发生变化")
+    if envelope.data_fingerprint != scope.data_fingerprint:
+        violations.append("研究数据指纹发生变化")
+    if envelope.skill_name != scope.skill_name or envelope.skill_version != scope.skill_version:
+        violations.append("Skill 或 Skill 版本发生变化")
+    if canonical_hash(scope.question.strip()) != envelope.question_hash:
+        violations.append("研究问题发生变化")
+    if set(envelope.functions) != set(scope.authorized_functions):
+        violations.append("授权函数范围发生变化")
+    if set(envelope.variables) != set(scope.authorized_variables):
+        violations.append("授权变量范围发生变化")
+    if envelope.max_model_rounds != scope.max_model_rounds:
+        violations.append("模型轮次预算发生变化")
+    if envelope.max_tool_calls != scope.max_tool_calls:
+        violations.append("工具调用预算发生变化")
+    if envelope.max_attempts_per_call != scope.max_attempts_per_call:
+        violations.append("单次调用重试预算发生变化")
+    if violations:
+        raise PlanCompatibilityError("；".join(violations))
 
 
 def validate_automatic_revision(plan: EDAPlan, envelope: AuthorizationEnvelope) -> FeedbackPacket | None:

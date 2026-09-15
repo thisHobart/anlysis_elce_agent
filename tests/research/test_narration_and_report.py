@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 from pathlib import Path
@@ -22,6 +23,8 @@ from app.research.graph.narration import (
 )
 from app.research.planning.compiler import EDAPlanCompiler
 from app.research.planning.contracts import EDAPlanDraft
+from app.research.reporting.agent_report import build_agent_eda_report
+from app.research.reporting.report_charts import build_report_figures
 from app.research.schemas.study import load_study_config
 from app.research.skills.registry import SkillRegistry
 from app.research.tools.catalog import FUNCTION_CATALOG, STAGE_TITLES
@@ -312,6 +315,7 @@ def test_desktop_package_is_grouped_by_review_action(forecastability_result):
     }
     assert {path.name for path in (root / "evidence").iterdir()} == {
         "data_quality.json",
+        "call_evidence.json",
         "eda_summary.json",
         "agent_evaluation.json",
     }
@@ -326,9 +330,33 @@ def test_desktop_package_is_grouped_by_review_action(forecastability_result):
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     output_paths = {item["path"] for item in manifest["outputs"]}
     assert "methods.md" in output_paths
+    assert "evidence/call_evidence.json" in output_paths
     assert "evidence/eda_summary.json" in output_paths
     assert "provenance/execution_trace.json" in output_paths
     assert "data/aligned_data.parquet" in output_paths
+
+    ledger = json.loads((root / "evidence" / "call_evidence.json").read_text(encoding="utf-8"))
+    summary = json.loads((root / "evidence" / "eda_summary.json").read_text(encoding="utf-8"))
+    assert ledger["call_order"] == [
+        call_id
+        for call_id, _item in sorted(
+            ledger["calls"].items(),
+            key=lambda pair: pair[1]["sequence"],
+        )
+    ]
+    assert set(summary["call_evidence"]) == set(ledger["calls"])
+    for call_id, projected in summary["call_evidence"].items():
+        canonical = ledger["calls"][call_id]
+        assert projected["arguments"] == canonical["arguments"]
+        assert projected["value"] == canonical["value"]
+        assert projected["output_hash"] == canonical["output_hash"]
+
+
+def test_report_and_chart_consumers_require_call_level_evidence():
+    assert "evidence" in inspect.signature(build_agent_eda_report).parameters
+    assert "summary" not in inspect.signature(build_agent_eda_report).parameters
+    assert "evidence" in inspect.signature(build_report_figures).parameters
+    assert "summary" not in inspect.signature(build_report_figures).parameters
 
 
 def test_methods_document_exactly_matches_executed_functions_and_evidence(forecastability_result):

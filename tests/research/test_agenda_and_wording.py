@@ -10,7 +10,7 @@ from app.config import Settings
 from app.research.agent.schemas import EDAPlan
 from app.research.application.planning import prepare_research_data
 from app.research.evaluation.agenda import resolve_agenda_item
-from app.research.evaluation.eda import evaluate_agent_run
+from app.research.evaluation.eda import evaluate_compatibility_summary as evaluate_agent_run
 from app.research.planning.compiler import (
     FUNCTION_AGENDA_HYPOTHESES,
     FUNCTION_AGENDA_ITEM_IDS,

@@ -171,6 +171,7 @@ QLabel#dataSub, QLabel#dataMark { color: #98A2B3; font-size: 12px; }
 QLabel#dataStatus { font-size: 12px; }
 QLabel#dataStatus[dataState="ready"] { color: #0F766E; }
 QLabel#dataStatus[dataState="exploring"] { color: #3F51B5; }
+QLabel#dataStatus[dataState="selected"] { color: #64748B; }
 QLabel#dataStatus[dataState="unavailable"] { color: #BE123C; }
 QLabel#dataMark[dataState="settled"] { color: #0F766E; }
 QLabel#dataMark[dataState="waiting"] { color: #C9CDD4; }

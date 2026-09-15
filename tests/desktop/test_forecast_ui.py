@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -28,7 +29,9 @@ from app.desktop.workspace import (
     _is_news_analysis_request,
     _requests_news_forecast,
 )
-from app.research.agent.orchestrator import DialogueDecision
+from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
+from app.research.agent.subagents.eda import EDASubagent
+from app.research.application.coordinator import ResearchCoordinator
 from app.research.forecasting.contracts import ForecastPlan, ForecastSnapshotSpec
 from app.research.graph.contracts import InterruptPayload, ResearchLoopSnapshot
 
@@ -233,12 +236,33 @@ def test_old_forecast_algorithm_plan_requires_a_new_plan(tmp_path: Path):
 
 
 def test_unselected_region_never_enters_forecast_branch(qt_app: QApplication, tmp_path: Path):
+    class ForecastDialogue:
+        enabled = True
+        model_name = "forecast-route-test"
+
+        def decide(self, **_kwargs):
+            return DialogueDecision(intent="new_forecast_plan")
+
+    class UnusedPlanner:
+        enabled = True
+        model_name = "forecast-route-test"
+
+    coordinator = ResearchCoordinator(
+        main_agent=MainResearchAgent(model_dialogue=ForecastDialogue()),
+        eda_subagent=EDASubagent(model_planner=UnusedPlanner()),
+    )
     window = MainWindow(
+        agent=coordinator,
         session_store=SessionStore(tmp_path / "sessions.json"),
         region_profiles={},
     )
     try:
         window.workspace.submit_question("预测山东明天实时电价")
+
+        deadline = time.monotonic() + 5
+        while window.workspace.current_session.status != "failed" and time.monotonic() < deadline:
+            qt_app.processEvents()
+            time.sleep(0.01)
 
         session = window.workspace.current_session
         assert session.current_plan is None
@@ -247,6 +271,7 @@ def test_unselected_region_never_enters_forecast_branch(qt_app: QApplication, tm
         assert not window.workspace.is_busy
     finally:
         window.close()
+        coordinator.close()
         qt_app.processEvents()
 
 

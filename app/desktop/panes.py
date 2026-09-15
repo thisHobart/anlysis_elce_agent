@@ -45,7 +45,7 @@ from app.desktop.message_widgets import (
     ToolMessageWidget,
 )
 from app.desktop.session import DataPanelState, ResearchSession, SessionMessage, TraceEvent
-from app.research.agent.schemas import EDAPlan
+from app.research.agent.schemas import EDAPlan, EDAResearchScope
 from app.research.data.sources.summary import DataSummary, VariableLabel
 from app.research.forecasting.contracts import ForecastPlan
 from app.research.graph.narration import narrate_event
@@ -337,8 +337,12 @@ class ConversationPane(QFrame):
                 message.payload.get("detail", message.content),
                 status=message.payload.get("status", "running"),
             )
-        elif message.kind in {"plan", "data_plan"} and message.payload.get("plan"):
-            plan = EDAPlan.model_validate(message.payload["plan"])
+        elif message.kind in {"plan", "data_plan"} and (message.payload.get("plan") or message.payload.get("scope")):
+            plan = (
+                EDAResearchScope.model_validate(message.payload["scope"])
+                if message.payload.get("scope")
+                else EDAPlan.model_validate(message.payload["plan"])
+            )
             # A conversation saved before data and analysis were confirmed together
             # has no stored dataset description, so those rows read 「待定」.
             widget = DataPlanMessageWidget(plan, summary=message.payload.get("data_summary"))
@@ -670,13 +674,19 @@ class DataPanel(QFrame):
     region_selected = Signal(str)
 
     EMPTY_TEXT = "还没取数。请从上方选择地区；也可以直接提问讨论研究方法。"
+    SELECTED_TEXT = "数据已选择，尚未检查。只有进入实际数据分析后才会读取。"
     EXPLORING_TEXT = "正在看有哪些数据能用…"
     EXPLORING_NOTE = "现在只是在看有什么数据，还没开始取。找完会先给你确认。"
     UNAVAILABLE_TITLE = "现在取不到数据"
     UNAVAILABLE_BODY = "和数据服务器连不上。稍等一下再试；一直不行就找运维看看，或者先用本地文件继续。"
     UNAVAILABLE_HISTORY_TITLE = "上次用的数据"
     UNAVAILABLE_NOTE = "上次取的数据还在，可以直接接着分析，只是不是最新的。"
-    STATUS_TEXT: ClassVar[dict[str, str]] = {"ready": "已就绪", "exploring": "正在找数据", "unavailable": "取不到"}
+    STATUS_TEXT: ClassVar[dict[str, str]] = {
+        "selected": "待检查",
+        "ready": "已就绪",
+        "exploring": "正在找数据",
+        "unavailable": "取不到",
+    }
     SPINNER_FRAMES = ("◐", "◓", "◑", "◒")
 
     def __init__(self) -> None:
@@ -707,10 +717,11 @@ class DataPanel(QFrame):
         layout.addLayout(header)
 
         self.empty_view = self._build_empty_view()
+        self.selected_view = self._build_selected_view()
         self.exploring_view = self._build_exploring_view()
         self.ready_view = self._build_ready_view()
         self.unavailable_view = self._build_unavailable_view()
-        for view in (self.empty_view, self.exploring_view, self.ready_view, self.unavailable_view):
+        for view in (self.empty_view, self.selected_view, self.exploring_view, self.ready_view, self.unavailable_view):
             layout.addWidget(view)
         layout.addStretch(1)
 
@@ -750,6 +761,16 @@ class DataPanel(QFrame):
         note.setObjectName("dataSub")
         note.setWordWrap(True)
         layout.addWidget(note)
+        return view
+
+    def _build_selected_view(self) -> QWidget:
+        view = QWidget(self)
+        layout = QVBoxLayout(view)
+        layout.setContentsMargins(2, 4, 2, 0)
+        label = QLabel(self.SELECTED_TEXT)
+        label.setObjectName("dataSub")
+        label.setWordWrap(True)
+        layout.addWidget(label)
         return view
 
     def _build_ready_view(self) -> QWidget:
@@ -850,6 +871,7 @@ class DataPanel(QFrame):
         self._state = state
         self._summary = summary
         self.empty_view.setVisible(state == "empty")
+        self.selected_view.setVisible(state == "selected")
         self.exploring_view.setVisible(state == "exploring")
         self.ready_view.setVisible(state == "ready")
         self.unavailable_view.setVisible(state == "unavailable")
@@ -929,7 +951,12 @@ class DataPanel(QFrame):
         self._refresh_status()
 
     def _refresh_status(self) -> None:
-        marks = {"ready": "✓", "exploring": self.SPINNER_FRAMES[self._spinner_index], "unavailable": "⚠"}
+        marks = {
+            "selected": "○",
+            "ready": "✓",
+            "exploring": self.SPINNER_FRAMES[self._spinner_index],
+            "unavailable": "⚠",
+        }
         text = self.STATUS_TEXT.get(self._state, "")
         self.status_label.setText(f"{marks[self._state]} {text}" if text else "")
         self.status_label.setProperty("dataState", self._state)

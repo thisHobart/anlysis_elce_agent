@@ -21,7 +21,7 @@ class CancelDialogue:
     model_name = "cancel-test-model"
 
     def decide(self, **kwargs):
-        if kwargs.get("config") is None:
+        if not kwargs.get("has_executable_data"):
             return DialogueDecision(intent="discussion", response="先准备数据。")
         return DialogueDecision(intent="new_plan", skill_name="price-exogenous-eda")
 

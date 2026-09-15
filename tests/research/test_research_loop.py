@@ -152,18 +152,43 @@ def test_forecast_intent_is_handed_off_without_an_unbacked_confirmation(
     assert snapshot.values["assistant_message"] == ""
 
 
-def test_combined_analysis_and_forecast_starts_with_an_analysis_plan(
-    synthetic_study: Path,
-):
-    class IncorrectForecastDialogue(LoopDialogue):
+def test_news_intent_is_handed_off_after_model_routing(synthetic_study: Path):
+    class NewsDialogue(LoopDialogue):
         def decide(self, **_kwargs):
             return DialogueDecision(
-                intent="new_forecast_plan",
-                response="请确认是否执行该预测方案。",
+                intent="new_news_analysis",
+                post_analysis_action="forecast",
             )
 
     coordinator = ResearchCoordinator(
-        main_agent=MainResearchAgent(model_dialogue=IncorrectForecastDialogue()),
+        main_agent=MainResearchAgent(model_dialogue=NewsDialogue()),
+        eda_subagent=EDASubagent(model_planner=LoopPlanner()),
+    )
+    snapshot = coordinator.submit_user_message(
+        session_id="news-handoff",
+        message="分析电价相关新闻后继续预测",
+        study_config=load_study_config(synthetic_study),
+    )
+
+    assert snapshot.interrupt is None
+    assert snapshot.phase == "awaiting_user"
+    assert snapshot.values["control"] == "news_analysis_request"
+    assert snapshot.values["post_analysis_action"] == "forecast"
+
+
+def test_combined_analysis_and_forecast_route_is_owned_by_the_model(
+    synthetic_study: Path,
+):
+    class CombinedDialogue(LoopDialogue):
+        def decide(self, **_kwargs):
+            return DialogueDecision(
+                intent="new_plan",
+                skill_name="price-exogenous-eda",
+                post_analysis_action="forecast",
+            )
+
+    coordinator = ResearchCoordinator(
+        main_agent=MainResearchAgent(model_dialogue=CombinedDialogue()),
         eda_subagent=EDASubagent(model_planner=LoopPlanner()),
     )
     snapshot = coordinator.submit_user_message(
@@ -175,10 +200,10 @@ def test_combined_analysis_and_forecast_starts_with_an_analysis_plan(
     assert snapshot.interrupt is not None
     assert snapshot.interrupt.kind == "plan_approval"
     assert snapshot.values["current_plan"]["skill_name"] == "price-exogenous-eda"
+    assert snapshot.values["post_analysis_action"] == "forecast"
 
 
-def accepting_evaluation(*, plan, quality, summary):
-    del plan, quality, summary
+def accepting_evaluation(**_kwargs):
     return AgentEvaluation(
         decision="accept",
         summary="证据通过确定性评估。",
@@ -429,9 +454,8 @@ def test_evaluator_revision_auto_executes_once_without_second_approval(
 ):
     calls = 0
 
-    def evaluating(*, plan, quality, summary):
+    def evaluating(*, plan, **_kwargs):
         nonlocal calls
-        del quality, summary
         calls += 1
         if calls == 1:
             return AgentEvaluation(
@@ -741,8 +765,7 @@ def test_second_evaluation_revision_exhausts_loop_to_need_user(
     synthetic_study: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    def always_revise(*, plan, quality, summary):
-        del quality, summary
+    def always_revise(*, plan, **_kwargs):
         return AgentEvaluation(
             decision="revise",
             summary="仍需修订。",
@@ -1382,9 +1405,8 @@ def test_function_queue_size_does_not_reduce_iteration_limit(
 ):
     evaluations = 0
 
-    def revise_each_round(*, plan, quality, summary):
+    def revise_each_round(*, plan, **_kwargs):
         nonlocal evaluations
-        del quality, summary
         evaluations += 1
         return AgentEvaluation(
             decision="revise",
@@ -1480,8 +1502,7 @@ def test_no_new_evidence_stops_automatic_loop(synthetic_study: Path, monkeypatch
         created_at="2026-01-01T00:00:00+00:00",
     )
 
-    def same_evidence(*, plan, quality, summary):
-        del plan, quality, summary
+    def same_evidence(**_kwargs):
         return AgentEvaluation(
             decision="revise",
             summary="相同证据。",

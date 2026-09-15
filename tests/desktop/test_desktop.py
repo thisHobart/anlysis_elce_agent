@@ -21,7 +21,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QLabel
 from app.config import Settings
 from app.desktop.input_config import build_runtime_study, parse_chat_time_range
 from app.desktop.main_window import MainWindow
-from app.desktop.message_widgets import ResultMessageWidget, ThinkingMessageWidget
+from app.desktop.message_widgets import DataPlanMessageWidget, ResultMessageWidget, ThinkingMessageWidget
 from app.desktop.panes import ConversationPane, TracePanel
 from app.desktop.report_view import ReportBrowser, ReportWindow
 from app.desktop.session import (
@@ -34,6 +34,7 @@ from app.desktop.session import (
     TraceEvent,
 )
 from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
+from app.research.agent.schemas import EDAResearchScope
 from app.research.agent.subagents.eda import EDASubagent
 from app.research.application.coordinator import ResearchCoordinator
 from app.research.data.inference import infer_study_context
@@ -156,7 +157,7 @@ class DesktopModelDialogue:
                 intent="explain_result",
                 response="已有确定性证据只支持描述性关系，不构成因果结论。",
             )
-        if kwargs.get("config") is None:
+        if not kwargs.get("has_executable_data"):
             return DialogueDecision(intent="discussion", response="先检查时间轴和季节性，再选择具体 EDA 方法。")
         return DialogueDecision(intent="new_plan", skill_name="price-exogenous-eda")
 
@@ -165,6 +166,34 @@ SAMPLE_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" width="760" height="300">'
     '<rect width="760" height="300" fill="#EEF0FB"/></svg>'
 )
+
+
+def test_dynamic_scope_card_shows_tools_variables_and_budget(qt_app: QApplication):
+    scope = EDAResearchScope(
+        question="分析电价与负荷",
+        objective="识别电价结构及负荷关系",
+        study_name="scope-ui-test",
+        data_fingerprint="a" * 12,
+        skill_name="price-exogenous-eda",
+        skill_version="1.0.0",
+        authorized_functions=[
+            "price_descriptive_distribution",
+            "relationship_scipy_pearson_pairwise",
+        ],
+        authorized_variables=["load", "wind"],
+        initial_strategy=["先建立电价画像，再根据证据判断是否分析负荷关系。"],
+    )
+
+    widget = DataPlanMessageWidget(scope)
+    texts = [label.text() for label in widget.findChildren(QLabel)]
+
+    assert widget.approved_plan() == scope
+    assert any("研究目标" in text and scope.objective in text for text in texts)
+    assert any("最多 8 轮决策、16 次基础调用" in text for text in texts)
+    assert any("每次最多尝试 2 次" in text for text in texts)
+    assert any("变量范围" in text and "load" in text and "wind" in text for text in texts)
+    widget.deleteLater()
+    qt_app.processEvents()
 
 
 def test_report_reader_renders_markdown_figures_inside_the_app(qt_app: QApplication, tmp_path: Path):
@@ -429,6 +458,32 @@ def select_desktop_data(window: MainWindow, desktop_study: Path) -> None:
             for name in ("market_prices.csv", "measurements.csv", "predictions.csv")
         ),
     )
+
+
+def test_selecting_local_files_does_not_parse_or_fingerprint_them(
+    qt_app: QApplication,
+    desktop_study: Path,
+    model_agent: ResearchCoordinator,
+    tmp_path: Path,
+):
+    window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
+    try:
+        with patch.object(
+            window.workspace,
+            "_current_dataset_fingerprint",
+            side_effect=AssertionError("file contents must not be read while selecting inputs"),
+        ):
+            select_desktop_data(window, desktop_study)
+        qt_app.processEvents()
+
+        assert window.workspace.current_session.data_state == "selected"
+        assert window.workspace.current_session.data_summary is None
+        assert all(
+            item.status == "selected"
+            for item in window.workspace.current_session.inputs.values()
+        )
+    finally:
+        window.close()
 
 
 def test_trace_keeps_every_loaded_data_file_visible(

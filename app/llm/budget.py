@@ -19,6 +19,7 @@ class ModelRequestPurpose(StrEnum):
     DIALOGUE = "dialogue"
     EDA_PLANNING = "eda_planning"
     EDA_PLANNING_RECOVERY = "eda_planning_recovery"
+    EDA_ANALYSIS = "eda_analysis"
     RESULT_EXPLANATION = "result_explanation"
     NEWS_EXTRACTION = "news_extraction"
     GENERIC = "generic"

@@ -31,7 +31,7 @@ SessionStatus = Literal[
 ]
 InputRole = Literal["target", "actuals", "forecasts"]
 InputStatus = Literal["empty", "selected", "loading", "ready", "warning", "failed", "changed"]
-DataPanelState = Literal["empty", "exploring", "ready", "unavailable"]
+DataPanelState = Literal["empty", "selected", "exploring", "ready", "unavailable"]
 DataSourceKind = Literal["database", "file"]
 MessageKind = Literal[
     "text",
@@ -150,7 +150,7 @@ class SessionRunRecord(BaseModel):
     memory_status: Literal["active", "stale"] = "active"
 
 
-SESSION_SCHEMA_VERSION = 20
+SESSION_SCHEMA_VERSION = 21
 """Projection schema written by this build; bump it whenever stored sessions change shape."""
 
 
@@ -173,6 +173,7 @@ class ResearchSession(BaseModel):
     messages: list[SessionMessage] = Field(default_factory=list)
     trace: list[TraceEvent] = Field(default_factory=list)
     current_plan: dict[str, Any] | None = None
+    research_scope: dict[str, Any] | None = None
     plan_stale: bool = False
     plan_feedback_deadline: str | None = None
     plan_feedback_remaining_seconds: int | None = None
@@ -325,6 +326,10 @@ def _migrate_19_to_20(session: ResearchSession) -> None:
     )
 
 
+def _migrate_20_to_21(session: ResearchSession) -> None:
+    """Add the separately persisted dynamic research-scope projection."""
+
+
 SESSION_MIGRATIONS: dict[int, Callable[[ResearchSession], None]] = {
     **{version: _carry_forward for version in range(1, 7)},
     7: _migrate_7_to_8,
@@ -340,6 +345,7 @@ SESSION_MIGRATIONS: dict[int, Callable[[ResearchSession], None]] = {
     17: _migrate_17_to_18,
     18: _migrate_18_to_19,
     19: _migrate_19_to_20,
+    20: _migrate_20_to_21,
 }
 
 
@@ -354,6 +360,10 @@ def _apply_session_invariants(
 
     if session.graph_event_sequence == 0 and session.graph_event_count:
         session.graph_event_sequence = session.graph_event_count
+    if session.research_scope and not scope_is_executable(session.research_scope, skill_versions):
+        session.research_scope = None
+        session.plan_stale = True
+        session.status = "idle"
     if session.current_plan and not plan_is_executable(session.current_plan, skill_versions):
         session.current_plan = None
         session.plan_stale = True
@@ -365,6 +375,16 @@ def _apply_session_invariants(
             else None
         )
         if isinstance(stored_plan, dict) and not plan_is_executable(stored_plan, skill_versions):
+            message.kind = "notice"
+            message.content = STALE_PLAN_NOTICE
+            message.payload = {}
+            continue
+        stored_scope = (
+            message.payload.get("scope")
+            if message.kind in {"plan", "data_plan"}
+            else None
+        )
+        if isinstance(stored_scope, dict) and not scope_is_executable(stored_scope, skill_versions):
             message.kind = "notice"
             message.content = STALE_PLAN_NOTICE
             message.payload = {}
@@ -419,6 +439,32 @@ def plan_is_executable(plan: dict[str, Any], skill_versions: dict[str, str] | No
         if spec is None or spec.version != step["function_version"]:
             return False
     return True
+
+
+def scope_is_executable(
+    scope: dict[str, Any],
+    skill_versions: dict[str, str] | None = None,
+) -> bool:
+    """Reject a stored dynamic scope when its Skill or function catalog moved."""
+
+    required = {
+        "scope_id",
+        "data_fingerprint",
+        "skill_name",
+        "skill_version",
+        "authorized_functions",
+        "authorized_variables",
+    }
+    if not required.issubset(scope):
+        return False
+    if skill_versions is not None:
+        installed = skill_versions.get(str(scope["skill_name"]))
+        if installed is None or installed != scope["skill_version"]:
+            return False
+    functions = scope.get("authorized_functions")
+    if not isinstance(functions, list) or "data_quality" in functions:
+        return False
+    return all(isinstance(name, str) and name in FUNCTION_CATALOG for name in functions)
 
 
 def migrate_session(

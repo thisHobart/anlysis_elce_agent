@@ -19,6 +19,7 @@ from app.config import get_settings
 from app.desktop.input_config import (
     FILE_FILTERS,
     build_runtime_study,
+    build_study_input_descriptor,
     parse_chat_time_range,
     validate_input_path,
 )
@@ -42,8 +43,10 @@ from app.research.agent.orchestrator import requests_analysis_before_forecast
 from app.research.agent.schemas import (
     ConversationMessage,
     EDAPlan,
+    EDAResearchScope,
     ResearchDataProfile,
     ResearchProposal,
+    ResearchScopeProposal,
 )
 from app.research.application.coordinator import ResearchCoordinator
 from app.research.data.snapshot import input_file_manifest, study_fingerprint
@@ -275,8 +278,9 @@ class ResearchWorkspace(QSplitter):
         self._active_interrupt_id: str | None = None
         self._active_state_revision: int | None = None
         self._active_interrupt_kind: str | None = None
-        self._pending_execute_plan: EDAPlan | None = None
+        self._pending_execute_plan: EDAPlan | EDAResearchScope | None = None
         self._pending_forecast_request: str | None = None
+        self._pending_news_request: tuple[str, bool] | None = None
         self._pre_trace_sizes: list[int] | None = None
         self._p2_reviewer_name = ""
         self._plan_feedback_timer = QTimer(self)
@@ -419,6 +423,7 @@ class ResearchWorkspace(QSplitter):
             and not has_user_message
             and not has_file
             and session.current_plan is None
+            and session.research_scope is None
             and session.run_id is None
         )
 
@@ -454,7 +459,10 @@ class ResearchWorkspace(QSplitter):
                 )
             if resolved_flow is None and self.agent.has_thread(session_id) and not selected_session.read_only:
                 self._loop_completed(self.agent.get_snapshot(session_id))
-            elif self.current_session.status == "awaiting_plan_approval" and self.current_session.current_plan:
+            elif (
+                self.current_session.status == "awaiting_plan_approval"
+                and (self.current_session.current_plan or self.current_session.research_scope)
+            ):
                 self.current_session.plan_feedback_deadline = None
                 self.current_session.plan_feedback_remaining_seconds = 0
                 if self.conversation.current_plan_widget is not None:
@@ -535,9 +543,12 @@ class ResearchWorkspace(QSplitter):
         self.current_session.analysis_start_time = None
         self.current_session.analysis_end_time = None
         self._cancel_plan_feedback_window()
-        self._invalidate_plan_for_data_change(self._current_dataset_fingerprint())
+        # Selecting a file is deliberately metadata-only.  The main Agent must
+        # first choose an executable research route before file contents are
+        # parsed and fingerprinted.
+        self._invalidate_plan_for_data_change(None)
         self._add_trace("input", "改用本地文件", "completed", "、".join(chosen))
-        self._set_data_state("empty", None)
+        self._set_data_state("selected", None)
         self._persist_and_render()
 
     def refetch_dataset(self) -> None:
@@ -753,7 +764,10 @@ class ResearchWorkspace(QSplitter):
             "source_kind": session.source_kind,
             "region": session.region_label,
             "dataset_fingerprint": session.dataset_fingerprint or "(none)",
-            "plan_data_fingerprint": (session.current_plan or {}).get("data_fingerprint") or "(none)",
+            "plan_data_fingerprint": (
+                session.current_plan or session.research_scope or {}
+            ).get("data_fingerprint")
+            or "(none)",
         }
         files = [
             f"{role}: {session.inputs[role].path}"
@@ -793,7 +807,7 @@ class ResearchWorkspace(QSplitter):
         """
 
         session = self.current_session
-        current_plan = session.current_plan or {}
+        current_plan = session.current_plan or session.research_scope or {}
         anchor = (
             current_plan.get("source_data_fingerprint")
             if current_plan.get("plan_kind") == "forecast"
@@ -812,7 +826,7 @@ class ResearchWorkspace(QSplitter):
         session.touch()
         self.context.data_panel.set_state(state, summary)
 
-    def _summary_from_proposal(self, proposal: ResearchProposal) -> DataSummary:
+    def _summary_from_proposal(self, proposal: ResearchProposal | ResearchScopeProposal) -> DataSummary:
         """Take the words written when the data was frozen, or derive them if it was not.
 
         The frozen wording is preferred because it names the moment the data was
@@ -843,9 +857,10 @@ class ResearchWorkspace(QSplitter):
             run.memory_status = "stale"
         if self.agent.has_thread(session.session_id):
             self.agent.delete_thread(session.session_id)
-        if session.current_plan is not None:
+        if session.current_plan is not None or session.research_scope is not None:
             session.plan_stale = True
             session.current_plan = None
+            session.research_scope = None
             session.status = "idle"
             self._set_plan_message_state("stale")
             session.messages.append(
@@ -870,7 +885,6 @@ class ResearchWorkspace(QSplitter):
         if self.is_busy:
             return
         session = self.current_session
-        analysis_then_forecast = requests_analysis_before_forecast(question)
         current_is_forecast = (session.current_plan or {}).get("plan_kind") == "forecast"
         if current_is_forecast and session.status == "awaiting_plan_approval" and _is_forecast_text_approval(question):
             self._append_message(SessionMessage(role="user", kind="text", content=question, turn_id=uuid4().hex))
@@ -880,15 +894,6 @@ class ResearchWorkspace(QSplitter):
             self._explain_forecast_result(question)
             return
         if self._handle_full_flow_input(question):
-            return
-        if _is_news_analysis_request(question):
-            self._submit_news_analysis_request(
-                question,
-                prepare_forecast=_requests_news_forecast(question),
-            )
-            return
-        if _is_forecast_request(question, has_price_context=bool(session.inputs["target"].path)):
-            self._submit_forecast_request(question)
             return
         if (session.current_plan or {}).get("plan_kind") == "forecast":
             self._append_message(SessionMessage(role="user", kind="text", content=question, turn_id=uuid4().hex))
@@ -936,10 +941,10 @@ class ResearchWorkspace(QSplitter):
                     "completed",
                     f"{new_start} — {new_end}",
                 )
-        study_config = None
+        study_input = None
         if session.can_analyze:
             try:
-                study_config = build_runtime_study(
+                study_input = build_study_input_descriptor(
                     session,
                     output_directory=self.research_output_directory,
                 )
@@ -947,13 +952,11 @@ class ResearchWorkspace(QSplitter):
                 self._fail_before_task(str(exc))
                 return
         self._task_previous_status = session.status
-        if analysis_then_forecast:
-            session.pending_forecast_question = question
         session.status = "understanding"
         if session.can_analyze and session.data_state != "ready":
-            # Only first-time inspection changes the data card. A question about
-            # an existing snapshot keeps its settled source, range and fetch time.
-            self._set_data_state("exploring", session.data_summary or _known_so_far(study_config))
+            # File contents are not inspected until the main Agent confirms an
+            # actual analysis route.  Keep selection distinct from data loading.
+            self._set_data_state("selected", session.data_summary)
         elif session.data_state != "ready":
             # Nothing to read yet: say so plainly and offer the way out of it.
             self._set_data_state("unavailable", session.data_summary)
@@ -967,7 +970,7 @@ class ResearchWorkspace(QSplitter):
                 message=question,
                 message_id=user_message.message_id,
                 turn_id=user_message.turn_id,
-                study_config=study_config,
+                study_input=study_input,
                 conversation=conversation,
                 approval_timeout_seconds=self.plan_feedback_seconds,
                 automatic_approval_enabled=self.auto_execute_plan,
@@ -1024,6 +1027,7 @@ class ResearchWorkspace(QSplitter):
         session.full_flow_output_directory = str(flow.output_directory)
         session.pending_forecast_question = question if prepare_forecast else None
         session.current_plan = None
+        session.research_scope = None
         session.plan_stale = False
         session.status = "running"
         session.derive_title(question)
@@ -1088,6 +1092,7 @@ class ResearchWorkspace(QSplitter):
         if self.agent.has_thread(session.session_id):
             self.agent.delete_thread(session.session_id)
         session.current_plan = None
+        session.research_scope = None
         session.plan_stale = False
         session.run_id = None
         session.artifact_directory = None
@@ -1712,9 +1717,10 @@ class ResearchWorkspace(QSplitter):
 
         session = self.current_session
         self._cancel_plan_feedback_window()
-        if session.current_plan is not None:
+        if session.current_plan is not None or session.research_scope is not None:
             self._set_plan_message_state("stale")
             session.current_plan = None
+            session.research_scope = None
         if self.agent.has_thread(session.session_id):
             self.agent.delete_thread(session.session_id)
         session.derive_title(question)
@@ -2005,6 +2011,20 @@ class ResearchWorkspace(QSplitter):
         self._persist_and_render(keep_timeline=True)
 
     def _legacy_graph_import(self, session: ResearchSession) -> dict[str, Any]:
+        graph_plan: dict[str, Any] | None = None
+        graph_scope: dict[str, Any] | None = None
+        try:
+            if session.current_plan and session.current_plan.get("plan_kind") != "forecast":
+                graph_plan = EDAPlan.model_validate(session.current_plan).model_dump(mode="json")
+        except (TypeError, ValueError):
+            # Completed legacy runs remain readable even when their former
+            # approval object predates the current executable EDA schema.
+            graph_plan = None
+        try:
+            if session.research_scope:
+                graph_scope = EDAResearchScope.model_validate(session.research_scope).model_dump(mode="json")
+        except (TypeError, ValueError):
+            graph_scope = None
         latest_record = next(
             (run for run in reversed(session.runs) if not session.run_id or run.run_id == session.run_id),
             session.runs[-1] if session.runs else None,
@@ -2060,11 +2080,14 @@ class ResearchWorkspace(QSplitter):
                 }
             )
         return {
-            "current_plan": session.current_plan,
-            "plan_history": [session.current_plan] if session.current_plan else [],
+            "current_plan": graph_plan,
+            "research_scope": graph_scope,
+            "plan_history": [
+                item for item in (graph_scope, graph_plan) if item is not None
+            ],
             "data_profile": session.data_profile,
             "quality_report": session.quality_report,
-            "data_fingerprint": (session.current_plan or {}).get("data_fingerprint"),
+            "data_fingerprint": (graph_plan or graph_scope or {}).get("data_fingerprint"),
             "eda_summary": session.latest_eda_summary if latest_is_eda else None,
             "evaluation": latest_evaluation,
             "latest_run": latest_run,
@@ -2087,6 +2110,15 @@ class ResearchWorkspace(QSplitter):
             # The Graph recognizes intent; the desktop owns the fixed forecast
             # snapshots and must create the card before any approval is accepted.
             self._pending_forecast_request = str(values.get("latest_turn") or values.get("user_request") or "").strip()
+            session.status = "understanding"
+            self._persist_and_render(keep_timeline=True)
+            return
+        if forecast_control == "news_analysis_request":
+            question = str(values.get("latest_turn") or values.get("user_request") or "").strip()
+            self._pending_news_request = (
+                question,
+                values.get("post_analysis_action") == "forecast",
+            )
             session.status = "understanding"
             self._persist_and_render(keep_timeline=True)
             return
@@ -2114,8 +2146,15 @@ class ResearchWorkspace(QSplitter):
                 success_handler=self._loop_completed,
             )
             return
-        if values.get("current_plan"):
-            session.current_plan = dict(values["current_plan"])
+        if "current_plan" in values:
+            session.current_plan = (
+                dict(values["current_plan"]) if values.get("current_plan") else None
+            )
+        if "research_scope" in values:
+            session.research_scope = (
+                dict(values["research_scope"]) if values.get("research_scope") else None
+            )
+        if session.current_plan is not None or session.research_scope is not None:
             session.plan_stale = False
         session.data_profile = values.get("data_profile")
         session.quality_report = values.get("quality_report")
@@ -2124,6 +2163,40 @@ class ResearchWorkspace(QSplitter):
 
         interrupt_payload = snapshot.interrupt
         if interrupt_payload and interrupt_payload.kind == "plan_approval":
+            scope_payload = interrupt_payload.scope or values.get("research_scope")
+            if scope_payload:
+                scope = EDAResearchScope.model_validate(scope_payload)
+                existing = next(
+                    (
+                        message
+                        for message in reversed(session.messages)
+                        if message.kind in {"plan", "data_plan"}
+                        and message.payload.get("scope", {}).get("scope_id") == scope.scope_id
+                    ),
+                    None,
+                )
+                if existing is None:
+                    if any(message.kind in {"plan", "data_plan"} for message in session.messages):
+                        self._set_plan_message_state("stale")
+                    profile = values.get("data_profile") or {}
+                    quality = DataQualityReport.model_validate(values["quality_report"])
+                    stored_summary = values.get("data_summary")
+                    proposal = ResearchScopeProposal(
+                        scope=scope,
+                        assistant_message=(
+                            str(values.get("assistant_message") or "").strip()
+                            or "研究范围已通过确定性校验，等待你的修改或确认。"
+                        ),
+                        data_profile=ResearchDataProfile.model_validate(profile),
+                        quality_report=quality,
+                        data_summary=parse_summary(stored_summary) if stored_summary else None,
+                    )
+                    self._scope_proposal_completed(proposal)
+                    return
+                session.status = "awaiting_plan_approval"
+                self._restore_approval_timer(snapshot)
+                self._persist_and_render(keep_timeline=True)
+                return
             plan = EDAPlan.model_validate(interrupt_payload.plan or values["current_plan"])
             existing = next(
                 (
@@ -2206,13 +2279,18 @@ class ResearchWorkspace(QSplitter):
             )
             self._set_plan_message_state("completed")
 
-        if (
-            added_run
-            and interrupt_payload is not None
-            and interrupt_payload.kind == "result"
-            and session.pending_forecast_question
-        ):
-            self._pending_forecast_request = session.pending_forecast_question
+        if added_run and interrupt_payload is not None and interrupt_payload.kind == "result":
+            if values.get("post_analysis_action") == "forecast":
+                self._pending_forecast_request = str(
+                    (values.get("loop_cursor") or {}).get("episode_goal")
+                    or values.get("latest_turn")
+                    or values.get("user_request")
+                    or ""
+                ).strip()
+            elif session.pending_forecast_question:
+                # Compatibility with conversations created before the route was
+                # represented in DialogueDecision.
+                self._pending_forecast_request = session.pending_forecast_question
             session.pending_forecast_question = None
 
         if interrupt_payload and interrupt_payload.kind in {
@@ -2424,6 +2502,35 @@ class ResearchWorkspace(QSplitter):
             self.conversation.current_plan_widget.set_explicit_approval()
         self._persist_and_render(keep_timeline=True)
 
+    def _scope_proposal_completed(self, proposal: ResearchScopeProposal) -> None:
+        session = self.current_session
+        self._complete_active_tool("数据检查完成")
+        self._apply_quality_to_inputs(proposal)
+        summary = self._summary_from_proposal(proposal)
+        self._set_data_state("ready", summary)
+        self._warn_about_unnamed_variables(summary)
+        if not (
+            session.messages
+            and session.messages[-1].role == "assistant"
+            and session.messages[-1].kind == "text"
+            and session.messages[-1].content == proposal.assistant_message
+        ):
+            self._append_message(
+                SessionMessage(role="assistant", kind="text", content=proposal.assistant_message)
+            )
+        self._append_scope_message(proposal.scope, proposal.data_profile.exogenous_names)
+        session.research_scope = proposal.scope.model_dump(mode="json")
+        session.current_plan = None
+        session.plan_stale = False
+        session.data_profile = proposal.data_profile.model_dump(mode="json")
+        session.quality_report = proposal.quality_report.model_dump(mode="json")
+        session.status = "awaiting_plan_approval"
+        if self.auto_execute_plan:
+            self._start_plan_feedback_window()
+        elif self.conversation.current_plan_widget is not None:
+            self.conversation.current_plan_widget.set_explicit_approval()
+        self._persist_and_render(keep_timeline=True)
+
     def _append_plan_message(self, plan: EDAPlan, available_variables: list[str]) -> None:
         """Confirm the data and the analysis in one card, never as two decisions."""
 
@@ -2436,6 +2543,29 @@ class ResearchWorkspace(QSplitter):
                 content="开始之前，跟你确认一下",
                 payload={
                     "plan": plan.model_dump(mode="json"),
+                    "available_variables": available_variables,
+                    "data_summary": summary_payload(session.data_summary),
+                    "state": "awaiting",
+                },
+            )
+        )
+
+    def _append_scope_message(
+        self,
+        scope: EDAResearchScope,
+        available_variables: list[str],
+    ) -> None:
+        """Confirm one dynamic authorization boundary, not a fixed function queue."""
+
+        session = self.current_session
+        session.dataset_fingerprint = scope.data_fingerprint
+        self._append_message(
+            SessionMessage(
+                role="assistant",
+                kind="data_plan",
+                content="开始之前，跟你确认一下研究范围",
+                payload={
+                    "scope": scope.model_dump(mode="json"),
                     "available_variables": available_variables,
                     "data_summary": summary_payload(session.data_summary),
                     "state": "awaiting",
@@ -2463,7 +2593,11 @@ class ResearchWorkspace(QSplitter):
 
     def _start_plan_feedback_window(self, seconds: int | None = None) -> None:
         session = self.current_session
-        if not self.auto_execute_plan or session.status != "awaiting_plan_approval" or session.current_plan is None:
+        if (
+            not self.auto_execute_plan
+            or session.status != "awaiting_plan_approval"
+            or (session.current_plan is None and session.research_scope is None)
+        ):
             return
         duration = max(1, int(seconds or self.plan_feedback_seconds))
         self._plan_feedback_timer.stop()
@@ -2496,7 +2630,7 @@ class ResearchWorkspace(QSplitter):
         if (
             not self.auto_execute_plan
             or session.status != "awaiting_plan_approval"
-            or session.current_plan is None
+            or (session.current_plan is None and session.research_scope is None)
             or self.is_busy
         ):
             return
@@ -2535,14 +2669,18 @@ class ResearchWorkspace(QSplitter):
         if (
             self.auto_execute_plan
             and session.status == "awaiting_plan_approval"
-            and session.current_plan
+            and (session.current_plan or session.research_scope)
             and not self.is_busy
         ):
             self._start_plan_feedback_window(session.plan_feedback_remaining_seconds)
 
     def _plan_feedback_tick(self) -> None:
         session = self.current_session
-        if not self.auto_execute_plan or session.status != "awaiting_plan_approval" or session.current_plan is None:
+        if (
+            not self.auto_execute_plan
+            or session.status != "awaiting_plan_approval"
+            or (session.current_plan is None and session.research_scope is None)
+        ):
             self._cancel_plan_feedback_window()
             return
         remaining = self._remaining_plan_feedback_seconds()
@@ -2562,7 +2700,10 @@ class ResearchWorkspace(QSplitter):
         self._add_trace("plan", "确认超时，自动执行方案", "completed", "未收到修改意见")
         self._resume_graph(action="timeout_accept", task_kind="execute", foreground_timeout=True)
 
-    def _apply_quality_to_inputs(self, proposal: ResearchProposal) -> None:
+    def _apply_quality_to_inputs(
+        self,
+        proposal: ResearchProposal | ResearchScopeProposal,
+    ) -> None:
         session = self.current_session
         by_role: dict[str, list[VariableEvidence]] = {"target": [], "actuals": [], "forecasts": []}
         for name, report in proposal.quality_report.series.items():
@@ -2602,12 +2743,20 @@ class ResearchWorkspace(QSplitter):
         if isinstance(approved_plan, ForecastPlan):
             self._run_forecast_plan(approved_plan)
             return
-        approved_plan = EDAPlan.model_validate(approved_plan)
+        is_scope = isinstance(approved_plan, EDAResearchScope) or (
+            isinstance(approved_plan, dict) and "scope_id" in approved_plan
+        )
+        research_scope = EDAResearchScope.model_validate(approved_plan) if is_scope else None
+        eda_plan = None if research_scope is not None else EDAPlan.model_validate(approved_plan)
         self._cancel_plan_feedback_window()
         session = self.current_session
-        session.current_plan = approved_plan.model_dump(mode="json")
+        if research_scope is not None:
+            session.research_scope = research_scope.model_dump(mode="json")
+            session.current_plan = None
+        else:
+            session.current_plan = eda_plan.model_dump(mode="json")
         session.status = "running"
-        self._set_plan_message_state("running", plan=approved_plan)
+        self._set_plan_message_state("running", plan=research_scope or eda_plan)
         plan_widget = self.conversation.current_plan_widget
         if plan_widget is not None:
             plan_widget.set_running()
@@ -2621,9 +2770,14 @@ class ResearchWorkspace(QSplitter):
         self._start_thinking("compute", "启动方案执行", "按锁定的执行计划逐项分析")
         self._add_trace(
             "plan",
-            "方案已确认",
+            "研究范围已确认" if research_scope is not None else "方案已确认",
             "completed",
-            f"共 {len(approved_plan.enabled_steps)} 项分析待执行",
+            (
+                f"允许模型在 {research_scope.max_model_rounds} 轮内动态选择，"
+                f"最多执行 {research_scope.max_tool_calls} 次基础调用"
+                if research_scope is not None
+                else f"共 {len(eda_plan.enabled_steps)} 项分析待执行"
+            ),
         )
         self._start_worker(
             kind="execute",
@@ -2640,7 +2794,7 @@ class ResearchWorkspace(QSplitter):
                     else self.agent.submit_user_message(
                         session_id=session.session_id,
                         message="按这个执行",
-                        study_config=build_runtime_study(
+                        study_input=build_study_input_descriptor(
                             session,
                             output_directory=self.research_output_directory,
                         ),
@@ -2991,6 +3145,7 @@ class ResearchWorkspace(QSplitter):
     def _task_cancelled(self) -> None:
         self._pending_execute_plan = None
         self._pending_forecast_request = None
+        self._pending_news_request = None
         self._pending_full_flow_resume = False
         session = self.current_session
         session.pending_forecast_question = None
@@ -3021,6 +3176,7 @@ class ResearchWorkspace(QSplitter):
     def _task_failed(self, detail: str) -> None:
         self._pending_execute_plan = None
         self._pending_forecast_request = None
+        self._pending_news_request = None
         session = self.current_session
         session.pending_forecast_question = None
         self._record_forecast_terminal("failed", detail)
@@ -3239,6 +3395,8 @@ class ResearchWorkspace(QSplitter):
         self._pending_execute_plan = None
         pending_forecast = self._pending_forecast_request
         self._pending_forecast_request = None
+        pending_news = self._pending_news_request
+        self._pending_news_request = None
         pending_full_flow = self._pending_full_flow_resume
         self._pending_full_flow_resume = False
         self._thread = None
@@ -3257,24 +3415,24 @@ class ResearchWorkspace(QSplitter):
             QTimer.singleShot(0, lambda plan=pending_plan: self.run_plan(plan))
         elif pending_full_flow:
             QTimer.singleShot(0, self._resume_full_flow)
+        elif pending_news is not None:
+            question, prepare_forecast = pending_news
+            QTimer.singleShot(
+                0,
+                lambda: self._submit_news_analysis_request(
+                    question,
+                    prepare_forecast=prepare_forecast,
+                    record_user_message=False,
+                ),
+            )
         elif pending_forecast:
-            if _is_news_analysis_request(pending_forecast):
-                QTimer.singleShot(
-                    0,
-                    lambda question=pending_forecast: self._submit_news_analysis_request(
-                        question,
-                        prepare_forecast=True,
-                        record_user_message=False,
-                    ),
-                )
-            else:
-                QTimer.singleShot(
-                    0,
-                    lambda question=pending_forecast: self._submit_forecast_request(
-                        question,
-                        record_user_message=False,
-                    ),
-                )
+            QTimer.singleShot(
+                0,
+                lambda question=pending_forecast: self._submit_forecast_request(
+                    question,
+                    record_user_message=False,
+                ),
+            )
 
     def _set_busy(self, busy: bool) -> None:
         self.history.set_busy(busy)
@@ -3379,7 +3537,7 @@ class ResearchWorkspace(QSplitter):
         self,
         state: str,
         *,
-        plan: EDAPlan | ForecastPlan | None = None,
+        plan: EDAPlan | EDAResearchScope | ForecastPlan | None = None,
     ) -> None:
         message = next(
             (
@@ -3393,7 +3551,8 @@ class ResearchWorkspace(QSplitter):
             return
         message.payload["state"] = state
         if plan is not None:
-            message.payload["plan"] = plan.model_dump(mode="json")
+            key = "scope" if isinstance(plan, EDAResearchScope) else "plan"
+            message.payload[key] = plan.model_dump(mode="json")
 
     @staticmethod
     def _agent_conversation(

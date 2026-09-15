@@ -21,6 +21,7 @@ import scipy
 import statsmodels
 
 from app.research.data.snapshot import sha256_file
+from app.research.evidence import CallEvidenceLedger
 from app.research.reporting.layout import ArtifactLayout
 from app.research.reporting.methods import build_method_document, render_methods_markdown
 from app.research.schemas.results import DataQualityReport
@@ -82,6 +83,32 @@ def _write_figures(directory: Path, figures: dict[str, Any]) -> dict[str, Path]:
         path.write_text(markup, encoding="utf-8")
         paths[key] = path
     return paths
+
+
+def _build_evidence_figures(
+    *,
+    aligned_frame: Any,
+    config: StudyConfig,
+    evidence: CallEvidenceLedger,
+) -> dict[str, str]:
+    """Keep legacy figures and add call-specific figures for repeated functions."""
+
+    from app.research.reporting.report_charts import build_report_figures
+
+    figures = build_report_figures(aligned_frame, config, evidence)
+    for function_name in dict.fromkeys(item.function for item in evidence.successful_calls()):
+        runs = evidence.calls_for(function_name)
+        if len(runs) < 2:
+            continue
+        for run in runs:
+            call_id = run.call_id
+            for key, markup in build_report_figures(
+                aligned_frame,
+                config,
+                evidence.only(call_id),
+            ).items():
+                figures[f"{key}__{call_id[:8]}"] = markup
+    return figures
 
 
 def _output_manifest(directory: Path) -> list[dict[str, Any]]:
@@ -163,7 +190,8 @@ def write_agent_research_package(
     *,
     config: StudyConfig,
     quality: DataQualityReport,
-    summary: dict[str, Any],
+    evidence: CallEvidenceLedger,
+    compatibility_summary: dict[str, Any],
     aligned_frame: pandas.DataFrame,
     input_manifest: list[dict[str, Any]],
     fingerprint: str,
@@ -179,7 +207,6 @@ def write_agent_research_package(
     """Persist an Agent conversation, approved plan, evidence and evaluation."""
 
     from app.research.reporting.agent_report import build_agent_eda_report
-    from app.research.reporting.report_charts import build_report_figures
 
     created_at = datetime.now(UTC)
     resolved_run_id = run_id or f"agent-{created_at.strftime('%Y%m%dT%H%M%S%fZ')}-{fingerprint}"
@@ -210,7 +237,11 @@ def write_agent_research_package(
     layout = ArtifactLayout(staging)
     try:
         layout.create_directories()
-        figures = build_report_figures(aligned_frame, config, summary)
+        figures = _build_evidence_figures(
+            aligned_frame=aligned_frame,
+            config=config,
+            evidence=evidence,
+        )
         figure_paths = _write_figures(layout.figures, figures)
 
         _write_json(layout.study_context, config.model_dump(mode="json"))
@@ -218,7 +249,8 @@ def write_agent_research_package(
         _write_json(layout.research_plan, plan.model_dump(mode="json"))
         _write_json(layout.execution_trace, execution_trace)
         _write_json(layout.data_quality, quality.model_dump(mode="json"))
-        _write_json(layout.eda_summary, summary)
+        _write_json(layout.call_evidence, evidence.artifact_payload())
+        _write_json(layout.eda_summary, compatibility_summary)
         _write_json(layout.agent_evaluation, evaluation.model_dump(mode="json"))
         if loop_context is not None:
             _write_json(layout.research_loop, loop_context)
@@ -237,7 +269,7 @@ def write_agent_research_package(
             build_agent_eda_report(
                 config=config,
                 quality=quality,
-                summary=summary,
+                evidence=evidence,
                 plan=plan,
                 evaluation=evaluation,
                 figure_names=set(figure_paths),

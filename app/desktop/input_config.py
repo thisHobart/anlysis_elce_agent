@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Literal
 
 from app.desktop.session import InputRole, ResearchSession
-from app.research.data.inference import infer_study_context
-from app.research.schemas.study import StudyConfig
+from app.research.data.inference import resolve_study_input
+from app.research.schemas.study import StudyConfig, StudyInputDescriptor
 
 ROLE_LABELS: dict[InputRole, str] = {
     "target": "目标电价",
@@ -101,8 +101,12 @@ def validate_input_path(role: InputRole, path: str | Path) -> Path:
     return resolved
 
 
-def build_runtime_study(session: ResearchSession, *, output_directory: Path | None = None) -> StudyConfig:
-    """Infer the internal execution contract from the three desktop data roles."""
+def build_study_input_descriptor(
+    session: ResearchSession,
+    *,
+    output_directory: Path | None = None,
+) -> StudyInputDescriptor:
+    """Capture validated desktop selections without reading any selected file."""
 
     if not session.inputs["target"].path:
         raise ValueError("执行 EDA 前至少需要选择目标电价文件")
@@ -117,36 +121,30 @@ def build_runtime_study(session: ResearchSession, *, output_directory: Path | No
         if session.inputs["forecasts"].path
         else None
     )
-    config = infer_study_context(
+    overrides: dict[str, str] = {}
+    if session.source_kind == "database" and session.region_id and session.region_market:
+        overrides = {
+            "study_name": f"{session.region_id}_actual_price_study",
+            "market": session.region_market,
+            "timezone": session.region_timezone,
+        }
+        frequency = session.database_fetch_details.get("frequency")
+        if frequency:
+            overrides["frequency"] = str(frequency)
+    return StudyInputDescriptor(
         target_path=target,
         actuals_path=actuals,
         forecasts_path=forecasts,
         output_directory=output_directory,
+        start_time=(datetime.fromisoformat(session.analysis_start_time) if session.analysis_start_time else None),
+        end_time=(datetime.fromisoformat(session.analysis_end_time) if session.analysis_end_time else None),
+        **overrides,
     )
-    study_updates = {
-        "start_time": (
-            datetime.fromisoformat(session.analysis_start_time)
-            if session.analysis_start_time
-            else None
-        ),
-        "end_time": (
-            datetime.fromisoformat(session.analysis_end_time)
-            if session.analysis_end_time
-            else None
-        ),
-    }
-    config = config.model_copy(update={"study": config.study.model_copy(update=study_updates)})
-    if session.source_kind == "database":
-        config = config.model_copy(
-            update={
-                "study": config.study.model_copy(
-                    update={
-                        "name": f"{session.region_id}_actual_price_study",
-                        "market": session.region_market,
-                        "timezone": session.region_timezone,
-                        "frequency": session.database_fetch_details.get("frequency", config.study.frequency),
-                    }
-                )
-            }
-        )
-    return config
+
+
+def build_runtime_study(session: ResearchSession, *, output_directory: Path | None = None) -> StudyConfig:
+    """Compatibility helper that resolves a descriptor at an execution boundary."""
+
+    return resolve_study_input(
+        build_study_input_descriptor(session, output_directory=output_directory)
+    )

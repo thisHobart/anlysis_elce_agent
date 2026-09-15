@@ -25,12 +25,16 @@ class ResearchLoopState(TypedDict, total=False):
     explanation_request: str
     messages: list[dict[str, Any]]
     study_config: dict[str, Any] | None
+    study_input: dict[str, Any] | None
+    has_executable_data: bool
+    pending_research_action: str | None
     data_profile: dict[str, Any] | None
     data_summary: dict[str, Any] | None
     quality_report: dict[str, Any] | None
     active_skill: dict[str, Any] | None
     decision: dict[str, Any] | None
     current_plan: dict[str, Any] | None
+    research_scope: dict[str, Any] | None
     plan_history: list[dict[str, Any]]
     plan_fingerprints: list[str]
     planning_failure_fingerprints: list[str]
@@ -48,6 +52,14 @@ class ResearchLoopState(TypedDict, total=False):
     tool_result_cache: dict[str, dict[str, Any]]
     tool_results: list[dict[str, Any]]
     pending_tool_result: dict[str, Any] | None
+    analysis_messages: list[dict[str, Any]]
+    model_round: int
+    tool_calls_used: int
+    current_tool_batch: list[dict[str, Any]]
+    provider_call_groups: dict[str, dict[str, Any]]
+    call_evidence: list[dict[str, Any]]
+    pending_analysis_text: str
+    post_analysis_action: str | None
     evaluation: dict[str, Any] | None
     eda_summary: dict[str, Any] | None
     feedback_packets: list[dict[str, Any]]

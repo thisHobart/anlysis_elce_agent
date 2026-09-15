@@ -21,9 +21,10 @@ from PySide6.QtWidgets import (
 )
 
 from app.desktop.report_view import open_report
-from app.research.agent.schemas import AgentRunResult, EDAPlan
+from app.research.agent.schemas import AgentRunResult, EDAPlan, EDAResearchScope
 from app.research.data.sources.summary import DataSummary, parse_summary
 from app.research.forecasting.contracts import ForecastPlan
+from app.research.tools.catalog import FUNCTION_CATALOG
 
 STATUS_MARK = {
     "running": "◐",
@@ -412,7 +413,12 @@ class DataPlanMessageWidget(QFrame):
     ACTION_SECTION = "要做的事"
     FOOTNOTE = "点「可以开始」之后，这批数据会先固定下来。后面数据库再更新，也不会影响这一轮的结论。"
 
-    def __init__(self, plan: EDAPlan, *, summary: DataSummary | dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        plan: EDAPlan | EDAResearchScope,
+        *,
+        summary: DataSummary | dict[str, Any] | None = None,
+    ) -> None:
         super().__init__()
         self.setObjectName("planMessage")
         self.setMinimumWidth(560)
@@ -452,13 +458,51 @@ class DataPlanMessageWidget(QFrame):
         action_heading = QLabel(self.ACTION_SECTION)
         action_heading.setObjectName("planStage")
         layout.addWidget(action_heading)
-        for step in plan.enabled_steps:
-            row = QLabel(plan.step_text(step))
-            row.setObjectName("planStep")
-            row.setWordWrap(True)
-            row.setToolTip(step.description)
-            self.step_checks[step.step_id] = row
-            layout.addWidget(row)
+        if isinstance(plan, EDAResearchScope):
+            objective = QLabel(f"研究目标　{escape(plan.objective)}")
+            objective.setObjectName("planStep")
+            objective.setWordWrap(True)
+            layout.addWidget(objective)
+            for index, strategy in enumerate(plan.initial_strategy, start=1):
+                row = QLabel(f"{index}. {escape(strategy)}")
+                row.setObjectName("planStep")
+                row.setWordWrap(True)
+                self.step_checks[f"strategy-{index}"] = row
+                layout.addWidget(row)
+            categories = sorted(
+                {
+                    {
+                        "price": "电价自身规律",
+                        "exogenous": "影响因素质量",
+                        "relationship": "电价与因素关系",
+                    }.get(FUNCTION_CATALOG[name].category, "数据核验")
+                    for name in plan.authorized_functions
+                }
+            )
+            scope_row = QLabel(
+                f"可用方法　{'、'.join(categories) or '仅系统数据质量核验'}；"
+                f"最多 {plan.max_model_rounds} 轮决策、"
+                f"{plan.max_tool_calls} 次基础调用；"
+                f"每次最多尝试 {plan.max_attempts_per_call} 次"
+            )
+            scope_row.setObjectName("planHint")
+            scope_row.setWordWrap(True)
+            layout.addWidget(scope_row)
+            variables = "、".join(plan.authorized_variables[:8]) or "不使用外生变量"
+            if len(plan.authorized_variables) > 8:
+                variables += f" 等 {len(plan.authorized_variables)} 项"
+            variable_row = QLabel(f"变量范围　{escape(variables)}")
+            variable_row.setObjectName("planHint")
+            variable_row.setWordWrap(True)
+            layout.addWidget(variable_row)
+        else:
+            for step in plan.enabled_steps:
+                row = QLabel(plan.step_text(step))
+                row.setObjectName("planStep")
+                row.setWordWrap(True)
+                row.setToolTip(step.description)
+                self.step_checks[step.step_id] = row
+                layout.addWidget(row)
 
         self.feedback_hint = QLabel(self.FOOTNOTE)
         self.feedback_hint.setObjectName("planHint")
@@ -484,7 +528,7 @@ class DataPlanMessageWidget(QFrame):
         actions.addWidget(self.run_button)
         layout.addLayout(actions)
 
-    def approved_plan(self) -> EDAPlan:
+    def approved_plan(self) -> EDAPlan | EDAResearchScope:
         return self.plan
 
     def set_feedback_countdown(self, seconds: int) -> None:

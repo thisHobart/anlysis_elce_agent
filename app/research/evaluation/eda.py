@@ -21,9 +21,11 @@ from app.research.evaluation.criteria import (
 )
 from app.research.evaluation.issues import issue_line
 from app.research.evaluation.wording import GROUP_LABELS, stationarity_text, transform_text
+from app.research.evidence import CallEvidenceLedger
 from app.research.planning.variables import build_variable_recommendations
 from app.research.schemas.feedback import FeedbackPacket
 from app.research.schemas.results import DataQualityReport
+from app.research.schemas.study import StudyConfig
 from app.research.tools.catalog import FUNCTION_CATALOG
 
 
@@ -837,13 +839,14 @@ def _assess_hypotheses(plan: EDAPlan, summary: dict[str, Any]) -> list[Hypothesi
     return list(assessments.values())
 
 
-def evaluate_agent_run(
+def _evaluate_agent_summary(
     *,
     plan: EDAPlan,
     quality: DataQualityReport,
     summary: dict[str, Any],
+    evidence: CallEvidenceLedger | None = None,
 ) -> AgentEvaluation:
-    """Check evidence coverage and produce concise, non-causal findings."""
+    """Internal evaluator over a view derived from canonical call evidence."""
 
     checks: list[EvaluationCheck] = []
     findings: list[str] = []
@@ -1494,6 +1497,27 @@ def evaluate_agent_run(
                 created_at=plan.created_at,
             )
         )
+    if evidence is not None:
+        quality_call_ids = [item.call_id for item in evidence.calls_for("data_quality")]
+        analytical_call_ids = [
+            item.call_id for item in evidence.successful_calls() if item.function != "data_quality"
+        ]
+        checks = [
+            item.model_copy(
+                update={
+                    "evidence_call_ids": (
+                        quality_call_ids
+                        if item.name in {"目标数据可用性", "目标覆盖率", "数据质量"}
+                        else analytical_call_ids
+                    )
+                }
+            )
+            for item in checks
+        ]
+        hypothesis_assessments = [
+            item.model_copy(update={"evidence_call_ids": analytical_call_ids})
+            for item in hypothesis_assessments
+        ]
     return AgentEvaluation(
         decision=decision,
         summary=decision_text,
@@ -1506,3 +1530,36 @@ def evaluate_agent_run(
         feedback_packets=feedback_packets,
         agenda_fingerprint=agenda_fingerprint,
     )
+
+
+def evaluate_agent_run(
+    *,
+    plan: EDAPlan,
+    quality: DataQualityReport,
+    evidence: CallEvidenceLedger,
+    config: StudyConfig,
+) -> AgentEvaluation:
+    """Evaluate one run exclusively from its validated call-level evidence."""
+
+    summary = evidence.analysis_view(
+        config=config,
+        research_question=plan.question,
+        selected_variables=list(plan.selected_variables),
+    )
+    return _evaluate_agent_summary(
+        plan=plan,
+        quality=quality,
+        summary=summary,
+        evidence=evidence,
+    )
+
+
+def evaluate_compatibility_summary(
+    *,
+    plan: EDAPlan,
+    quality: DataQualityReport,
+    summary: dict[str, Any],
+) -> AgentEvaluation:
+    """Legacy test/import adapter; production finalization never calls this path."""
+
+    return _evaluate_agent_summary(plan=plan, quality=quality, summary=summary)

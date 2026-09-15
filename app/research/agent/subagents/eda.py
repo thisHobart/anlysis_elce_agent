@@ -33,13 +33,16 @@ from app.research.agent.prompts import (
     PLANNING_MINIMAL_RECOVERY_SYSTEM_PROMPT,
     PLANNING_PROMPT_VERSION,
     PLANNING_SYSTEM_PROMPT,
+    SCOPE_PLANNING_PROMPT_VERSION,
+    SCOPE_PLANNING_SYSTEM_PROMPT,
 )
 from app.research.agent.retrieval import select_conversation_context
-from app.research.agent.schemas import EDAPlan
+from app.research.agent.schemas import EDAPlan, EDAResearchScope
 from app.research.planning.compiler import EDAPlanCompiler, max_lag_limit
 from app.research.planning.contracts import (
     EDAPlanDraft,
     EDAPlanIntent,
+    EDAResearchScopeIntent,
     MinimalEDAPlanIntent,
 )
 from app.research.planning.variables import eligible_exogenous_variables, screening_function_set
@@ -250,6 +253,92 @@ class ModelEDAPlanner:
     def model_name(self) -> str:
         return self.gateway.model_name
 
+    def propose_scope(
+        self,
+        question: str,
+        config: StudyConfig,
+        quality: DataQualityReport,
+        *,
+        skill: SkillDefinition,
+        history: list[dict[str, Any]] | None = None,
+        data_fingerprint: str,
+    ) -> EDAResearchScope:
+        """Generate the wording for an approval scope without preselecting a tool queue."""
+
+        if not self.enabled:
+            raise ResearchModelUnavailableError("大模型尚未配置，无法生成研究范围。")
+        eligible_variables = eligible_exogenous_variables(config, quality)
+        authorized_functions = [name for name in skill.allowed_functions if name != "data_quality"]
+        recent_history, earlier_related_turns = select_conversation_context(
+            history or [],
+            question=question,
+            recent_turns=self.recent_turns,
+            retrieved_turns=self.retrieved_turns,
+        )
+        payload = {
+            "prompt_version": SCOPE_PLANNING_PROMPT_VERSION,
+            "question": question,
+            "study": {
+                "name": config.study.name,
+                "market": config.study.market,
+                "frequency": config.study.frequency,
+                "timezone": config.study.timezone,
+                "target": config.target.name,
+            },
+            "data_fingerprint": data_fingerprint,
+            "eligible_variables": eligible_variables,
+            "quality_issues": [issue.model_dump(mode="json") for issue in quality.issues],
+            "active_skill": skill.prompt_context(),
+            "available_functions": _compact_function_cards(authorized_functions),
+            "conversation_history": recent_history,
+            "earlier_related_turns": [turn.as_payload() for turn in earlier_related_turns],
+            "scope_contract": {
+                "functions": "all_registered_read_only_functions_in_active_skill",
+                "variables": "all_quality_eligible_exogenous_variables",
+                "model_rounds": 8,
+                "tool_calls": 16,
+                "attempts_per_call": 2,
+            },
+        }
+        messages = [
+            ModelMessage(role="system", content=SCOPE_PLANNING_SYSTEM_PROMPT),
+            ModelMessage(role="user", content=json.dumps(payload, ensure_ascii=False)),
+        ]
+        try:
+            kwargs: dict[str, Any] = {
+                "messages": messages,
+                "schema": EDAResearchScopeIntent,
+            }
+            if _accepts_keyword(self.gateway.invoke_structured, "purpose"):
+                kwargs["purpose"] = ModelRequestPurpose.EDA_PLANNING
+            intent = self.gateway.invoke_structured(**kwargs)
+            resolved = (
+                intent
+                if isinstance(intent, EDAResearchScopeIntent)
+                else EDAResearchScopeIntent.model_validate(intent)
+            )
+        except ModelOutputTruncatedError as exc:
+            raise ResearchModelOutputTruncatedError(f"大模型研究范围输出达到长度限制：{exc}") from exc
+        except ModelContextLimitError as exc:
+            raise ResearchModelContextLimitError(f"大模型研究范围请求超过上下文限制：{exc}") from exc
+        except ModelTransientError as exc:
+            raise ResearchModelTransientError(f"大模型研究范围调用暂时失败：{exc}") from exc
+        except ModelResponseError as exc:
+            raise ResearchModelSchemaError(f"大模型返回的研究范围无法解析：{exc}") from exc
+        except (ModelConfigurationError, ModelGatewayError) as exc:
+            raise ResearchModelUnavailableError(f"大模型研究范围调用失败：{exc}") from exc
+        return EDAResearchScope(
+            question=question.strip(),
+            objective=resolved.objective,
+            study_name=config.study.name,
+            data_fingerprint=data_fingerprint,
+            skill_name=skill.name,
+            skill_version=skill.version,
+            authorized_functions=authorized_functions,
+            authorized_variables=eligible_variables,
+            initial_strategy=resolved.initial_strategy,
+        )
+
     def propose(
         self,
         question: str,
@@ -426,6 +515,42 @@ class EDASubagent:
     def __init__(self, *, model_planner: Any | None = None, compiler: EDAPlanCompiler | None = None) -> None:
         self.model_planner = model_planner or ModelEDAPlanner()
         self.compiler = compiler or EDAPlanCompiler()
+
+    def propose_scope(
+        self,
+        question: str,
+        config: StudyConfig,
+        quality: DataQualityReport,
+        *,
+        history: list[dict[str, Any]] | None = None,
+        skill: SkillDefinition,
+        data_fingerprint: str,
+    ) -> EDAResearchScope:
+        proposer = getattr(self.model_planner, "propose_scope", None)
+        if not callable(proposer):
+            # Deterministic injected planners used by existing clients can still
+            # participate while the graph moves to scope-based approval.
+            draft = self.model_planner.propose(question, config, quality, history=history, skill=skill)
+            validated = draft if isinstance(draft, EDAPlanDraft) else EDAPlanDraft.model_validate(draft)
+            return EDAResearchScope(
+                question=question.strip(),
+                objective=validated.objective,
+                study_name=config.study.name,
+                data_fingerprint=data_fingerprint,
+                skill_name=skill.name,
+                skill_version=skill.version,
+                authorized_functions=[name for name in skill.allowed_functions if name != "data_quality"],
+                authorized_variables=eligible_exogenous_variables(config, quality),
+                initial_strategy=[step.rationale for step in validated.steps[:5]] or ["先核验数据，再按问题选择分析方法。"],
+            )
+        return proposer(
+            question,
+            config,
+            quality,
+            history=history,
+            skill=skill,
+            data_fingerprint=data_fingerprint,
+        )
 
     def propose(
         self,

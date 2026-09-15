@@ -169,6 +169,33 @@ def test_gemini_rejects_truncated_text_and_tool_calls_before_use():
         gateway.invoke_tool_calls(messages=messages, tools=tools)
 
 
+def test_gemini_optional_tool_turn_can_call_or_finish_without_tool_choice():
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "analyze", "parameters": {"type": "object"}},
+        }
+    ]
+    gateway = GeminiModelGateway(_settings())
+    model = GeminiResponseModel()
+    gateway._model = model
+
+    called = gateway.invoke_tool_turn(
+        messages=[ModelMessage(role="user", content="test")],
+        tools=tools,
+    )
+    assert called.tool_calls[0].call_id == "call-1"
+
+    model.response.tool_calls = []
+    model.response.content = "证据已经足够。"
+    completed = gateway.invoke_tool_turn(
+        messages=[ModelMessage(role="user", content="test")],
+        tools=tools,
+    )
+    assert completed.content == "证据已经足够。"
+    assert completed.tool_calls == []
+
+
 def test_gemini_output_limit_is_bound_per_request_purpose() -> None:
     gateway = GeminiModelGateway(_settings())
     model = BindableGeminiResponseModel()

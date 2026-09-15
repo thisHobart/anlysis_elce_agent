@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from app.research.evidence import CallEvidenceLedger
 from app.research.reporting import svg_charts as svg
 from app.research.reporting.capabilities import FIGURE_TITLES
 from app.research.schemas.study import StudyConfig
@@ -73,10 +74,22 @@ def _correlation_matrix_values(
 def build_report_figures(
     frame: pd.DataFrame,
     config: StudyConfig,
-    summary: dict[str, Any],
+    evidence: CallEvidenceLedger,
 ) -> dict[str, str]:
     """Render only the figures the executed evidence actually supports."""
 
+    selected_variables = list(
+        dict.fromkeys(
+            variable
+            for call in evidence.successful_calls()
+            for variable in (call.arguments.get("variables") or [])
+        )
+    )
+    summary = evidence.analysis_view(
+        config=config,
+        research_question="",
+        selected_variables=selected_variables,
+    )
     figures: dict[str, str] = {}
     unit = config.target.unit if config.target.unit not in {"", "unknown"} else ""
     price = summary.get("price") or {}

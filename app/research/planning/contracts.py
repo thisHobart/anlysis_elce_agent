@@ -52,6 +52,15 @@ class EDAPlanIntent(MinimalEDAPlanIntent):
     assumptions: list[str] = Field(default_factory=list, max_length=6)
 
 
+class EDAResearchScopeIntent(BaseModel):
+    """Model-owned wording for a user-approved dynamic research scope."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    objective: str = Field(min_length=1, max_length=200)
+    initial_strategy: list[str] = Field(min_length=1, max_length=5)
+
+
 class DraftStep(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

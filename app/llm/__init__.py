@@ -17,6 +17,8 @@ __all__ = [
     "ModelOutputTruncatedError",
     "ModelProtocolError",
     "ModelResponseError",
+    "ModelToolCall",
+    "ModelToolTurn",
     "ModelTransientError",
     "ResearchModelGateway",
     "build_model_gateway",
@@ -39,6 +41,8 @@ def __getattr__(name: str) -> Any:
         "ModelOutputTruncatedError",
         "ModelProtocolError",
         "ModelResponseError",
+        "ModelToolCall",
+        "ModelToolTurn",
         "ModelTransientError",
     }:
         return getattr(import_module("app.llm.gateway"), name)

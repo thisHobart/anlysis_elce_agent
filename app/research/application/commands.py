@@ -109,6 +109,7 @@ def resolve_text_action(
         "result": "followup",
         "response_error": "retry",
         "finalization_error": "retry",
+        "data_input_error": "retry",
     }
     default = contextual_defaults[kind]
     if default in available:

@@ -6,25 +6,9 @@ import inspect
 import json
 from typing import Any, Literal, Protocol, TypeVar
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 StructuredResult = TypeVar("StructuredResult", bound=BaseModel)
-
-
-class ModelMessage(BaseModel):
-    """Canonical message owned by the Agent, independent of an API wire format."""
-
-    role: Literal["system", "user", "assistant", "tool"]
-    content: str
-    tool_call_id: str | None = None
-
-    @model_validator(mode="after")
-    def _validate_tool_message(self) -> ModelMessage:
-        if self.role == "tool" and not self.tool_call_id:
-            raise ValueError("tool 消息必须包含 tool_call_id")
-        if self.role != "tool" and self.tool_call_id is not None:
-            raise ValueError("只有 tool 消息可以包含 tool_call_id")
-        return self
 
 
 class ModelToolCall(BaseModel):
@@ -45,6 +29,47 @@ class ModelToolCall(BaseModel):
             except ValueError:
                 return value
         return value
+
+
+class ModelMessage(BaseModel):
+    """Canonical message owned by the Agent, independent of an API wire format."""
+
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str = ""
+    tool_call_id: str | None = None
+    tool_calls: list[ModelToolCall] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_tool_message(self) -> ModelMessage:
+        if self.role == "tool" and not self.tool_call_id:
+            raise ValueError("tool 消息必须包含 tool_call_id")
+        if self.role != "tool" and self.tool_call_id is not None:
+            raise ValueError("只有 tool 消息可以包含 tool_call_id")
+        if self.tool_calls and self.role != "assistant":
+            raise ValueError("只有 assistant 消息可以包含 tool_calls")
+        if self.role == "assistant" and self.tool_calls and any(not call.call_id for call in self.tool_calls):
+            raise ValueError("assistant 工具调用必须保留 provider call_id")
+        if self.role != "assistant" and not self.content:
+            raise ValueError(f"{self.role} 消息内容不能为空")
+        if self.role == "assistant" and not self.content and not self.tool_calls:
+            raise ValueError("assistant 消息必须包含正文或工具调用")
+        return self
+
+
+class ModelToolTurn(BaseModel):
+    """One assistant turn that requests tools or completes with visible text."""
+
+    content: str = ""
+    tool_calls: list[ModelToolCall] = Field(default_factory=list)
+    finish_reason: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_turn(self) -> ModelToolTurn:
+        if not self.content.strip() and not self.tool_calls:
+            raise ValueError("模型工具回合必须包含正文或至少一个工具调用")
+        if self.tool_calls and any(not call.call_id for call in self.tool_calls):
+            raise ValueError("模型工具回合中的调用必须包含 provider call_id")
+        return self
 
 
 class ModelGatewayError(RuntimeError):
@@ -108,6 +133,14 @@ class ModelGateway(Protocol):
         tools: list[dict[str, Any]],
         purpose: Any = "generic",
     ) -> list[ModelToolCall]: ...
+
+    def invoke_tool_turn(
+        self,
+        *,
+        messages: list[ModelMessage],
+        tools: list[dict[str, Any]],
+        purpose: Any = "generic",
+    ) -> ModelToolTurn: ...
 
 
 def invoke_structured_for_purpose(

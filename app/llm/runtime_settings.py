@@ -32,6 +32,9 @@ class LLMOperationPolicies(BaseModel):
     eda_planning_recovery: OperationTokenPolicy = Field(
         default_factory=lambda: OperationTokenPolicy(target_output_tokens=1024, minimum_output_tokens=384)
     )
+    eda_analysis: OperationTokenPolicy = Field(
+        default_factory=lambda: OperationTokenPolicy(target_output_tokens=2048, minimum_output_tokens=384)
+    )
     result_explanation: OperationTokenPolicy = Field(
         default_factory=lambda: OperationTokenPolicy(target_output_tokens=2048, minimum_output_tokens=512)
     )
