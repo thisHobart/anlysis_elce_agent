@@ -66,6 +66,71 @@ def requests_analysis_before_forecast(question: str) -> bool:
     )
 
 
+def requests_explicit_data_analysis(question: str) -> bool:
+    """Conservatively recognize a request to calculate against selected data."""
+
+    compact = "".join(question.casefold().split())
+    discussion_cues = (
+        "为什么",
+        "是什么",
+        "怎么做",
+        "如何做",
+        "怎么分析",
+        "如何分析",
+        "哪些方法",
+        "什么方法",
+        "分析思路",
+        "研究思路",
+        "给些建议",
+        "通常",
+        "介绍一下",
+        "解释一下",
+        "想研究",
+    )
+    explicit_cues = (
+        "请分析",
+        "帮我分析",
+        "开始分析",
+        "进行分析",
+        "执行分析",
+        "直接分析",
+        "请计算",
+        "帮我计算",
+        "开始计算",
+        "执行计算",
+        "跑一下",
+        "运行分析",
+        "基于当前数据",
+        "分析这批数据",
+        "分析当前数据",
+        "分析实际数据",
+    )
+    starts_with_action = compact.startswith(("分析", "计算", "统计", "检验", "诊断"))
+    if any(cue in compact for cue in discussion_cues) and not any(
+        cue in compact for cue in ("开始执行", "立即执行", "直接计算", "实际计算")
+    ):
+        return False
+    return (
+        starts_with_action
+        or any(cue in compact for cue in explicit_cues)
+        or ("继续按" in compact and "分析" in compact)
+    )
+
+
+def guard_dialogue_route(decision: DialogueDecision, question: str) -> DialogueDecision:
+    """Fail closed when a model tries to start EDA from an ambiguous discussion turn."""
+
+    if decision.intent != "new_plan" or requests_explicit_data_analysis(question):
+        return decision
+    return DialogueDecision(
+        intent="discussion",
+        response=(
+            "我会先把这条消息当作电价问题讨论，不会仅因为已经选择了数据就启动计算。"
+            "如果你希望运行当前数据，请明确说“请分析当前数据”，并补充想回答的问题。"
+        ),
+    )
+
+
 class DialogueDecision(BaseModel):
     """Validated model decision for one user turn."""
 
@@ -523,9 +588,9 @@ class ModelResearchDialogue:
 
         try:
             try:
-                return invoke(payload)
+                return guard_dialogue_route(invoke(payload), question)
             except (ModelOutputTruncatedError, ModelContextLimitError):
-                return invoke(_compact_dialogue_retry_payload(payload))
+                return guard_dialogue_route(invoke(_compact_dialogue_retry_payload(payload)), question)
         except ModelOutputTruncatedError as exc:
             raise ResearchModelOutputTruncatedError(f"大模型对话输出达到长度限制：{exc}") from exc
         except ModelContextLimitError as exc:

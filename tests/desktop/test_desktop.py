@@ -623,6 +623,8 @@ def test_conversation_does_not_require_files_until_analysis(
         assert workspace.current_session.messages[-1].role == "assistant"
         assert "时间轴" in workspace.current_session.messages[-1].content
         assert "季节性" in workspace.current_session.messages[-1].content
+        assert not any(message.kind == "thinking" for message in workspace.current_session.messages)
+        assert not model_agent.has_thread(workspace.current_session.session_id)
     finally:
         window.close()
 
@@ -1242,9 +1244,10 @@ def test_continuous_conversation_runs_plan_and_answers_followup(
                 and session.messages[-1].kind == "text"
             ),
         )
-        assert len(session.messages) == before + 3
+        assert len(session.messages) == before + 2
         assert session.messages[-1].role == "assistant"
         assert "描述性" in session.messages[-1].content
+        assert all(message.kind != "thinking" for message in session.messages[before:])
         assert session.latest_eda_summary is not None
         assert session.latest_evaluation is not None
         assert len(session.runs) == 1

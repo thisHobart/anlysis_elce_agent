@@ -178,7 +178,13 @@ class ThinkingStepRow(QWidget):
 class ThinkingMessageWidget(QFrame):
     """Collapsible, live view of what the Agent is doing and why."""
 
-    def __init__(self, *, steps: list[dict[str, Any]] | None = None, state: str = "running") -> None:
+    def __init__(
+        self,
+        *,
+        steps: list[dict[str, Any]] | None = None,
+        state: str = "running",
+        mode: str = "research",
+    ) -> None:
         super().__init__()
         self.setObjectName("thinkingMessage")
         self.setMaximumWidth(680)
@@ -186,6 +192,7 @@ class ThinkingMessageWidget(QFrame):
         self._steps: list[dict[str, Any]] = []
         self._rows: list[ThinkingStepRow] = []
         self._collapsed = False
+        self._mode = mode
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 11, 14, 11)
         layout.setSpacing(8)
@@ -197,7 +204,7 @@ class ThinkingMessageWidget(QFrame):
         self.toggle_button.setFixedWidth(22)
         self.toggle_button.clicked.connect(self._toggle)
         header.addWidget(self.toggle_button)
-        self.title_label = QLabel("正在研究…")
+        self.title_label = QLabel("正在思考…" if mode == "dialogue" else "正在研究…")
         self.title_label.setObjectName("thinkingTitle")
         header.addWidget(self.title_label, 1)
         self.status_label = QLabel("")
@@ -224,7 +231,19 @@ class ThinkingMessageWidget(QFrame):
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> ThinkingMessageWidget:
-        return cls(steps=list(payload.get("steps", [])), state=str(payload.get("state", "running")))
+        return cls(
+            steps=list(payload.get("steps", [])),
+            state=str(payload.get("state", "running")),
+            mode=str(payload.get("mode", "research")),
+        )
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    def set_mode(self, mode: str) -> None:
+        self._mode = mode
+        self.title_label.setText("正在思考…" if mode == "dialogue" else "正在研究…")
 
     @property
     def steps(self) -> list[dict[str, Any]]:
@@ -303,12 +322,13 @@ class ThinkingMessageWidget(QFrame):
         for step in self._steps:
             if step.get("status") == "running":
                 step["status"] = "completed" if state == "completed" else state
+        completed_title = "思考过程" if self._mode == "dialogue" else "研究过程"
         titles = {
-            "completed": "研究过程",
+            "completed": completed_title,
             "failed": "研究中断",
             "stopped": "已终止",
         }
-        self.title_label.setText(titles.get(state, "研究过程"))
+        self.title_label.setText(titles.get(state, completed_title))
         self.status_label.setText(summary or f"{len(self._steps)} 步")
         self.set_collapsed(True)
 

@@ -831,12 +831,15 @@ def test_selected_data_is_not_parsed_until_the_main_agent_chooses_analysis(
         session_id="deferred-data-discussion",
         message="解释一个电价概念",
         study_input=descriptor,
+        route_before_graph=True,
     )
 
     assert discussed.interrupt is not None
     assert discussed.interrupt.kind == "result"
     assert discussed.values["study_config"] is None
     assert discussed.values["has_executable_data"] is True
+    assert discussed.values["direct_dialogue"] is True
+    assert not coordinator.has_thread("deferred-data-discussion")
 
 
 def test_analysis_route_resolves_selected_data_exactly_once(

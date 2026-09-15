@@ -117,7 +117,11 @@ def desktop_boundary_observation(
         for index in range(2, 61):
             _ask(qt_app, window, gateway, f"桌面压力对话 {index}")
         boundary_payload = _ask(qt_app, window, gateway, "蓝鲸调度参数是什么？")
-        graph_messages = list(coordinator.get_snapshot(session_id).values["messages"])
+        graph_messages = (
+            list(coordinator.get_snapshot(session_id).values["messages"])
+            if coordinator.has_thread(session_id)
+            else []
+        )
         desktop_messages = [item.model_dump(mode="json") for item in window.workspace.current_session.messages]
     finally:
         window.close()
@@ -136,7 +140,7 @@ def test_real_desktop_survives_sixty_one_turns_without_losing_its_archive(
 ) -> None:
     desktop_messages = desktop_boundary_observation["desktop_messages"]
 
-    assert len(desktop_boundary_observation["graph_messages"]) == 120
+    assert desktop_boundary_observation["graph_messages"] == []
     assert desktop_boundary_observation["restored_messages"] == desktop_messages
     assert sum(item["role"] == "user" and item["kind"] == "text" for item in desktop_messages) == 61
     assert sum(item["role"] == "assistant" and item["kind"] == "text" for item in desktop_messages) == 62

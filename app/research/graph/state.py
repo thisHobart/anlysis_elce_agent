@@ -33,6 +33,7 @@ class ResearchLoopState(TypedDict, total=False):
     quality_report: dict[str, Any] | None
     active_skill: dict[str, Any] | None
     decision: dict[str, Any] | None
+    routed_decision: dict[str, Any] | None
     current_plan: dict[str, Any] | None
     research_scope: dict[str, Any] | None
     plan_history: list[dict[str, Any]]

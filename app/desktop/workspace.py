@@ -960,7 +960,12 @@ class ResearchWorkspace(QSplitter):
         elif session.data_state != "ready":
             # Nothing to read yet: say so plainly and offer the way out of it.
             self._set_data_state("unavailable", session.data_summary)
-        self._start_thinking("read", "解析研究问题", "识别本轮的处理方式")
+        self._start_thinking(
+            "read",
+            "理解你的问题",
+            "判断直接回答还是进入研究",
+            mode="dialogue",
+        )
         conversation = self._agent_conversation(session, exclude_message_id=user_message.message_id)
         imported_state = self._legacy_graph_import(session) if not self.agent.has_thread(session.session_id) else None
         self._start_worker(
@@ -975,6 +980,7 @@ class ResearchWorkspace(QSplitter):
                 approval_timeout_seconds=self.plan_feedback_seconds,
                 automatic_approval_enabled=self.auto_execute_plan,
                 imported_state=imported_state,
+                route_before_graph=True,
                 progress=progress,
             ),
             success_handler=self._loop_completed,
@@ -2098,8 +2104,18 @@ class ResearchWorkspace(QSplitter):
 
     def _loop_completed(self, snapshot: ResearchLoopSnapshot) -> None:
         session = self.current_session
-        self._complete_active_tool("研究循环已到达用户交互点")
         values = snapshot.values
+        decision = values.get("decision") or {}
+        dialogue_only = bool(values.get("direct_dialogue")) or decision.get("intent") in {
+            "discussion",
+            "explain_result",
+        }
+        thinking_message_id = self._thinking_message_id
+        self._complete_active_tool(
+            "回复已生成" if dialogue_only else "研究循环已到达用户交互点"
+        )
+        if dialogue_only:
+            self._discard_active_thinking(thinking_message_id)
         self._active_interrupt_id = snapshot.interrupt.interrupt_id or None if snapshot.interrupt else None
         self._active_state_revision = snapshot.interrupt.state_revision if snapshot.interrupt else None
         self._active_interrupt_kind = snapshot.interrupt.kind if snapshot.interrupt else None
@@ -3366,6 +3382,14 @@ class ResearchWorkspace(QSplitter):
             step.stage,
             "running" if self._task_kind in {"execute", "forecast_execute"} else "understanding",
         )  # type: ignore[assignment]
+        if self._thinking_widget is not None and step.stage in {
+            "goal",
+            "design",
+            "confirm",
+            "compute",
+            "review",
+        }:
+            self._thinking_widget.set_mode("research")
         if message != self._last_progress_message:
             self._append_thinking_step(step.stage, step.title, step.detail, step.function_name)
             self._close_latest_running_trace("completed")
@@ -3455,14 +3479,14 @@ class ResearchWorkspace(QSplitter):
         self.current_session.touch()
         self.context.trace.add_event(event)
 
-    def _start_thinking(self, stage: str, title: str, detail: str) -> None:
+    def _start_thinking(self, stage: str, title: str, detail: str, *, mode: str = "research") -> None:
         """Open a live, collapsible view of what the Agent is doing this turn."""
 
         message = SessionMessage(
             role="assistant",
             kind="thinking",
-            content="研究过程",
-            payload={"steps": [], "state": "running"},
+            content="思考过程" if mode == "dialogue" else "研究过程",
+            payload={"steps": [], "state": "running", "mode": mode},
         )
         widget = self._append_message(message)
         self._thinking_widget = widget if isinstance(widget, ThinkingMessageWidget) else None
@@ -3507,8 +3531,23 @@ class ResearchWorkspace(QSplitter):
         if message is None:
             return
         message.payload["steps"] = self._thinking_widget.steps
+        message.payload["mode"] = self._thinking_widget.mode
         if state is not None:
             message.payload["state"] = state
+
+    def _discard_active_thinking(self, message_id: str | None = None) -> None:
+        """Remove transient dialogue routing UI once a direct answer is ready."""
+
+        message_id = message_id or self._thinking_message_id
+        if message_id is not None:
+            self.current_session.messages = [
+                message for message in self.current_session.messages if message.message_id != message_id
+            ]
+        self._thinking_widget = None
+        self._thinking_message_id = None
+        self._thinking_placeholder = False
+        self._thinking_function = None
+        self._render_current()
 
     def _complete_active_tool(self, detail: str) -> None:
         self._set_active_tool_status("completed", detail)

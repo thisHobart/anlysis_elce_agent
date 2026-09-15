@@ -662,26 +662,30 @@ def build_research_workflow(
                 ),
             }
         try:
-            skill_metadata = skills.metadata()
-            decision, _ = main_agent.decide(
-                question=_latest_turn(state),
-                status=state.get("phase", "idle"),
-                config=_config(state),
-                plan=_plan(state),
-                scope=_scope(state),
-                data_profile=state.get("data_profile"),
-                quality_report=state.get("quality_report"),
-                summary=state.get("eda_summary"),
-                evaluation=state.get("evaluation"),
-                history=_messages(state),
-                available_skills=skill_metadata,
-                episode_summaries=_scoped_episode_summaries(state),
-                active_gate=state.get("user_interrupt_kind") or state.get("return_to_gate"),
-                episode_goal=_episode_goal(state),
-                latest_run=state.get("latest_run"),
-                current_turn_id=state.get("active_turn_id"),
-                has_executable_data=bool(state.get("has_executable_data")),
-            )
+            routed = state.get("routed_decision")
+            if routed is not None:
+                decision = DialogueDecision.model_validate(routed)
+            else:
+                skill_metadata = skills.metadata()
+                decision, _ = main_agent.decide(
+                    question=_latest_turn(state),
+                    status=state.get("phase", "idle"),
+                    config=_config(state),
+                    plan=_plan(state),
+                    scope=_scope(state),
+                    data_profile=state.get("data_profile"),
+                    quality_report=state.get("quality_report"),
+                    summary=state.get("eda_summary"),
+                    evaluation=state.get("evaluation"),
+                    history=_messages(state),
+                    available_skills=skill_metadata,
+                    episode_summaries=_scoped_episode_summaries(state),
+                    active_gate=state.get("user_interrupt_kind") or state.get("return_to_gate"),
+                    episode_goal=_episode_goal(state),
+                    latest_run=state.get("latest_run"),
+                    current_turn_id=state.get("active_turn_id"),
+                    has_executable_data=bool(state.get("has_executable_data")),
+                )
             active_gate = state.get("user_interrupt_kind") or state.get("return_to_gate")
             if (
                 decision.intent == "execute_plan"
@@ -733,6 +737,7 @@ def build_research_workflow(
             ),
             "control": decision.intent if decision.intent != "discussion" else "reply",
             "decision": decision.model_dump(mode="json"),
+            "routed_decision": None,
             "post_analysis_action": decision.post_analysis_action,
             "events": _event(
                 state,

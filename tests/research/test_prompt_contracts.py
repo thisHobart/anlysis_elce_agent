@@ -9,7 +9,13 @@ import pytest
 
 from app.llm.budget import ModelRequestPurpose
 from app.llm.gateway import ModelMessage
-from app.research.agent.orchestrator import DIALOGUE_PROMPT_VERSION, ModelResearchDialogue, compact_evidence
+from app.research.agent.orchestrator import (
+    DIALOGUE_PROMPT_VERSION,
+    DialogueDecision,
+    ModelResearchDialogue,
+    compact_evidence,
+    guard_dialogue_route,
+)
 from app.research.agent.prompts import DIALOGUE_SYSTEM_PROMPT
 from app.research.agent.schemas import EDAPlan
 from app.research.agent.subagents.eda import PLANNING_PROMPT_VERSION, ModelEDAPlanner
@@ -371,6 +377,27 @@ def test_dialogue_can_see_selected_but_unparsed_data_without_widening_its_domain
         "只有用户明确要求对实际数据进行计算或研究",
     ):
         assert phrase in DIALOGUE_SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        ("为什么会出现负电价？", "discussion"),
+        ("想研究一下负荷与电价的关系，可以怎么做？", "discussion"),
+        ("请分析当前数据中的负荷与电价关系", "new_plan"),
+        ("分析这批数据的电价季节性", "new_plan"),
+    ],
+)
+def test_new_plan_requires_an_explicit_current_turn_execution_request(
+    question: str,
+    expected: str,
+):
+    decision = guard_dialogue_route(
+        DialogueDecision(intent="new_plan", skill_name="price-exogenous-eda"),
+        question,
+    )
+
+    assert decision.intent == expected
 
 
 def test_capability_context_locates_methods_and_report_content(synthetic_study: Path):

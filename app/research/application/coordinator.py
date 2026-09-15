@@ -14,12 +14,13 @@ from langgraph.types import Command
 from app.llm.factory import build_model_gateway
 from app.research.agent.context import MAX_PERSISTED_CONVERSATION_MESSAGES
 from app.research.agent.dynamic import DynamicAnalysisAgent
-from app.research.agent.orchestrator import MainResearchAgent, ModelResearchDialogue
+from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent, ModelResearchDialogue
 from app.research.agent.retrieval import select_persisted_conversation_history
 from app.research.agent.schemas import (
     AgentRunResult,
     ConversationMessage,
     EDAPlan,
+    EDAResearchScope,
     ResearchProposal,
     ResearchTurnResult,
 )
@@ -172,6 +173,7 @@ class ResearchCoordinator:
         automatic_approval_enabled: bool,
         study_input: StudyInputDescriptor | None = None,
         imported: dict[str, Any] | None = None,
+        routed_decision: DialogueDecision | None = None,
     ) -> dict[str, Any]:
         base = {
             "graph_schema_version": GRAPH_SCHEMA_VERSION,
@@ -207,6 +209,7 @@ class ResearchCoordinator:
             "quality_report": None,
             "active_skill": None,
             "decision": None,
+            "routed_decision": routed_decision.model_dump(mode="json") if routed_decision else None,
             "current_plan": None,
             "research_scope": None,
             "plan_history": [],
@@ -277,6 +280,7 @@ class ResearchCoordinator:
             if study_input is not None:
                 base["study_input"] = study_input.model_dump(mode="json")
             base["has_executable_data"] = bool(base.get("study_config") or base.get("study_input"))
+            base["routed_decision"] = routed_decision.model_dump(mode="json") if routed_decision else None
             base["messages"] = _conversation_payloads(
                 select_persisted_conversation_history(
                     base.get("messages", []),
@@ -286,6 +290,107 @@ class ResearchCoordinator:
                 )
             )
         return base
+
+    def _route_initial_turn(
+        self,
+        *,
+        question: str,
+        study_config: StudyConfig | None,
+        study_input: StudyInputDescriptor | None,
+        history: list[ConversationMessage | dict[str, Any]],
+        imported: dict[str, Any] | None,
+        current_turn_id: str,
+    ) -> DialogueDecision:
+        """Route a new conversation before allocating a persistent research Graph."""
+
+        source = imported or {}
+        config = study_config
+        if config is None and source.get("study_config"):
+            config = StudyConfig.model_validate(source["study_config"])
+        plan = EDAPlan.model_validate(source["current_plan"]) if source.get("current_plan") else None
+        scope = (
+            EDAResearchScope.model_validate(source["research_scope"])
+            if source.get("research_scope")
+            else None
+        )
+        cursor = source.get("loop_cursor") or {}
+        decision, _ = self.main_agent.decide(
+            question=question,
+            status=str(source.get("phase") or "idle"),
+            config=config,
+            plan=plan,
+            scope=scope,
+            data_profile=source.get("data_profile"),
+            quality_report=source.get("quality_report"),
+            summary=source.get("eda_summary"),
+            evaluation=source.get("evaluation"),
+            history=[ConversationMessage.model_validate(item) for item in history],
+            available_skills=self.skills.metadata(),
+            episode_summaries=list(source.get("episode_summaries") or []),
+            active_gate=source.get("user_interrupt_kind") or source.get("return_to_gate"),
+            episode_goal=str(cursor.get("episode_goal") or "") or None,
+            latest_run=source.get("latest_run"),
+            current_turn_id=current_turn_id,
+            has_executable_data=bool(config or study_input or source.get("study_input")),
+        )
+        return decision
+
+    @staticmethod
+    def _direct_dialogue_snapshot(
+        *,
+        thread_id: str,
+        decision: DialogueDecision,
+        history: list[ConversationMessage | dict[str, Any]],
+        turn_id: str,
+        source: dict[str, Any] | None,
+        study_config: StudyConfig | None,
+        study_input: StudyInputDescriptor | None,
+    ) -> ResearchLoopSnapshot:
+        """Return a desktop-compatible reply without creating a research checkpoint."""
+
+        answer = decision.response.strip()
+        if not answer:
+            raise ValueError("直接对话路由没有返回可展示回复")
+        assistant = ConversationMessage(role="assistant", content=answer, turn_id=turn_id)
+        previous = [ConversationMessage.model_validate(item).model_dump(mode="json") for item in history]
+        original = source or {}
+        values = {
+            **original,
+            "phase": "awaiting_user",
+            "control": "reply",
+            "decision": decision.model_dump(mode="json"),
+            "direct_dialogue": True,
+            "assistant_message": answer,
+            "messages": [*previous, assistant.model_dump(mode="json")],
+            "study_config": (
+                study_config.model_dump(mode="json")
+                if study_config is not None
+                else original.get("study_config")
+            ),
+            "study_input": (
+                study_input.model_dump(mode="json")
+                if study_input is not None
+                else original.get("study_input")
+            ),
+            "has_executable_data": bool(
+                study_config or study_input or original.get("study_config") or original.get("study_input")
+            ),
+        }
+        interrupt = InterruptPayload(
+            kind="result",
+            interrupt_id=uuid4().hex,
+            state_revision=0,
+            phase="awaiting_user",
+            message=answer,
+            choices=["followup", "next_round", "stop"],
+        )
+        return ResearchLoopSnapshot(
+            thread_id=thread_id,
+            phase="awaiting_user",
+            values=values,
+            interrupt=interrupt,
+            events=[],
+        )
 
     @staticmethod
     def _interrupt_from_state(snapshot: Any) -> InterruptPayload | None:
@@ -374,6 +479,7 @@ class ResearchCoordinator:
         approval_timeout_seconds: int = 30,
         automatic_approval_enabled: bool = False,
         imported_state: dict[str, Any] | None = None,
+        route_before_graph: bool = False,
         progress: Callable[[int, str], None] | None = None,
     ) -> ResearchLoopSnapshot:
         text = message.strip()
@@ -393,6 +499,27 @@ class ResearchCoordinator:
                 existing = self.get_snapshot(session_id)
                 if existing.values.get("graph_schema_version") != GRAPH_SCHEMA_VERSION:
                     return existing
+            if not has_compatible_thread and route_before_graph:
+                routed_decision = self._route_initial_turn(
+                    question=text,
+                    study_config=study_config,
+                    study_input=study_input,
+                    history=recalled_conversation,
+                    imported=imported_state,
+                    current_turn_id=resolved_turn_id,
+                )
+                if routed_decision.intent in {"discussion", "explain_result"}:
+                    return self._direct_dialogue_snapshot(
+                        thread_id=session_id,
+                        decision=routed_decision,
+                        history=recalled_conversation,
+                        turn_id=resolved_turn_id,
+                        source=imported_state,
+                        study_config=study_config,
+                        study_input=study_input,
+                    )
+            else:
+                routed_decision = None
             if not has_compatible_thread:
                 payload = self._initial_state(
                     thread_id=session_id,
@@ -405,6 +532,7 @@ class ResearchCoordinator:
                     approval_timeout_seconds=approval_timeout_seconds,
                     automatic_approval_enabled=automatic_approval_enabled,
                     imported=imported_state,
+                    routed_decision=routed_decision,
                 )
                 self._run_graph(payload, thread_id=session_id, progress=progress)
             else:
