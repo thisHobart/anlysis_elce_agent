@@ -9,6 +9,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.research.schemas.feedback import FeedbackPacket
+from app.research.tools.contracts import CallEvidenceRecord, ToolCallGroupRecord
 
 LoopPhase = Literal[
     "idle",
@@ -274,37 +275,6 @@ class ToolCallRecord(BaseModel):
     finished_at: str | None = None
     result: dict[str, Any] | None = None
     error: FeedbackPacket | None = None
-
-
-class ToolCallGroupRecord(BaseModel):
-    """Map one provider call to one or more local atomic calls."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    provider_call_id: str
-    requested_name: str
-    requested_version: str | None = None
-    child_call_ids: list[str] = Field(default_factory=list)
-    origin: Literal["direct", "recipe", "system_preflight"]
-    status: Literal["pending", "running", "completed", "failed", "cancelled"] = "pending"
-
-
-class CallEvidenceRecord(BaseModel):
-    """Canonical call-level evidence retained independently from merged summaries."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    sequence: int = Field(ge=1)
-    call_id: str
-    provider_call_id: str
-    origin: Literal["direct", "recipe", "system_preflight"]
-    function: str
-    function_version: str
-    arguments: dict[str, Any]
-    result: dict[str, Any]
-    data_fingerprint: str
-    output_hash: str
-    status: Literal["completed", "reused"]
 
 
 class InterruptPayload(BaseModel):

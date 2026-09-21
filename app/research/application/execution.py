@@ -29,14 +29,14 @@ from app.research.application.planning import (
 from app.research.data.snapshot import input_file_manifest, study_fingerprint
 from app.research.evaluation.eda import evaluate_agent_run
 from app.research.evidence import CallEvidenceLedger
-from app.research.planning.compiler import compile_function_parameters
 from app.research.reporting.artifacts import write_agent_research_package
 from app.research.schemas.study import StudyConfig
 from app.research.skills.registry import SkillRegistry
+from app.research.tools.calling import compile_dynamic_call
 from app.research.tools.catalog import FUNCTION_CATALOG
 from app.research.tools.contracts import ToolCall, ToolContext, ToolResult
 from app.research.tools.eda.functions import build_eda_tool_registry
-from app.research.tools.executor import ToolExecutor, output_fingerprint
+from app.research.tools.executor import ToolExecutor, validate_tool_result
 from app.research.tools.policy import ToolPermissionError, ToolPolicy
 from app.research.tools.registry import ToolRegistry
 from app.runtime_paths import source_worktree
@@ -51,6 +51,14 @@ class PreparedExecution:
     input_manifest: list[dict[str, Any]]
     data_fingerprint: str
     policy: ToolPolicy
+
+    @property
+    def context(self) -> ToolContext:
+        return ToolContext(
+            config=self.config,
+            frame=self.prepared.aligned.frame,
+            quality=self.prepared.quality,
+        )
 
 
 class EDAExecutionService:
@@ -83,6 +91,17 @@ class EDAExecutionService:
             f"{plan.plan_id}:{plan.revision}:{plan.data_fingerprint or 'unlocked'}:"
             f"{plan_signature}:{config_signature}"
         )
+
+    @staticmethod
+    def _scope_cache_key(scope: EDAResearchScope, config: StudyConfig) -> str:
+        config_payload = config.model_dump(mode="json", exclude={"analysis": {"output_directory"}})
+        config_signature = hashlib.sha256(
+            json.dumps(config_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:12]
+        scope_signature = hashlib.sha256(
+            json.dumps(scope.model_dump(mode="json"), ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:12]
+        return f"scope:{scope.scope_id}:{scope.data_fingerprint}:{scope_signature}:{config_signature}"
 
     @staticmethod
     def _with_output_directory(prepared: PreparedExecution, output_directory: str | Path | None) -> PreparedExecution:
@@ -208,6 +227,12 @@ class EDAExecutionService:
         """Restore and authorize the frozen dataset behind a dynamic research scope."""
 
         config = resolve_config(config_path=None, study_config=study_config)
+        cache_key = self._scope_cache_key(scope, config)
+        with self._prepared_cache_lock:
+            cached = self._prepared_cache.get(cache_key)
+            if cached is not None:
+                self._prepared_cache.move_to_end(cache_key)
+                return cached
         skill = self.skills.get(scope.skill_name)
         if skill.version != scope.skill_version:
             raise SkillVersionMismatchError(
@@ -235,13 +260,19 @@ class EDAExecutionService:
                 raise DataFingerprintMismatchError("研究数据在范围审批后发生变化，请重新生成研究范围")
         if not prepared.quality.usable_for_eda:
             raise InsufficientDataError("target data does not meet the minimum observation requirement for EDA")
-        return PreparedExecution(
+        prepared_execution = PreparedExecution(
             config=config,
             prepared=prepared,
             input_manifest=inputs,
             data_fingerprint=fingerprint,
             policy=ToolPolicy(allowed_functions=frozenset({"data_quality", *scope.authorized_functions})),
         )
+        with self._prepared_cache_lock:
+            self._prepared_cache[cache_key] = prepared_execution
+            self._prepared_cache.move_to_end(cache_key)
+            while len(self._prepared_cache) > self._prepared_cache_size:
+                self._prepared_cache.popitem(last=False)
+        return prepared_execution
 
     def compile_dynamic_call(
         self,
@@ -252,55 +283,13 @@ class EDAExecutionService:
         arguments: dict[str, Any],
         sequence: int,
     ) -> ToolCall:
-        if name != "data_quality" and name not in scope.authorized_functions:
-            raise ToolPermissionError(f"研究范围未授权工具：{name}")
-        spec = self.registry.get(name)
-        locally_managed = {
-            "spike_iqr_multiplier",
-            "outlier_iqr_multiplier",
-            "min_observations",
-            "max_lag_limit",
-        }
-        supplied_policy_values = sorted(set(arguments).intersection(locally_managed))
-        if supplied_policy_values:
-            raise ResearchPlanValidationError(
-                f"{name} 的安全参数由本地配置注入，模型不得提供："
-                + ", ".join(supplied_policy_values)
-            )
-        supplied_variables = list(dict.fromkeys(arguments.get("variables") or []))
-        unknown_variables = sorted(set(supplied_variables).difference(scope.authorized_variables))
-        if unknown_variables:
-            raise ToolPermissionError(f"工具参数包含未授权变量：{', '.join(unknown_variables)}")
-        compiled = compile_function_parameters(
-            name,
-            dict(arguments),
-            selected_variables=supplied_variables,
-            config=study_config,
-            enabled=True,
-        )
-        compiled.pop("max_lag_limit", None)
-        payload = {"name": name, "version": spec.version, "arguments": compiled}
-        work_id = hashlib.sha256(
-            json.dumps(
-                {"data_fingerprint": scope.data_fingerprint, "payload": payload},
-                ensure_ascii=False,
-                sort_keys=True,
-            ).encode("utf-8")
-        ).hexdigest()[:24]
-        call_id = hashlib.sha256(
-            json.dumps(
-                {"scope_id": scope.scope_id, "sequence": sequence, "work_id": work_id},
-                ensure_ascii=False,
-                sort_keys=True,
-            ).encode("utf-8")
-        ).hexdigest()[:24]
-        return ToolCall(
-            call_id=call_id,
-            work_id=work_id,
-            step_id=f"S{sequence}",
+        return compile_dynamic_call(
+            scope=scope,
+            study_config=study_config,
+            registry=self.registry,
             name=name,
-            version=spec.version,
-            arguments=compiled,
+            arguments=arguments,
+            sequence=sequence,
         )
 
     def execute_scope_call(
@@ -313,11 +302,7 @@ class EDAExecutionService:
         prepared = self.prepare_scope(scope=scope, study_config=study_config)
         result = self.executor.execute(
             call,
-            context=ToolContext(
-                config=prepared.config,
-                frame=prepared.prepared.aligned.frame,
-                quality=prepared.prepared.quality,
-            ),
+            context=prepared.context,
             policy=prepared.policy,
             data_fingerprint=prepared.data_fingerprint,
         )
@@ -333,18 +318,12 @@ class EDAExecutionService:
     ) -> None:
         if call.name != "data_quality" and call.name not in scope.authorized_functions:
             raise ToolPermissionError(f"研究范围未授权工具：{call.name}")
-        if result.call.call_id != call.call_id or result.call.work_id != call.work_id:
-            raise ResearchPlanValidationError("工具结果与动态调用身份不匹配")
-        expected = self.registry.get(call.name)
-        if result.output.result_key != expected.result_key or result.tool_version != expected.version:
-            raise ResearchPlanValidationError("工具结果与注册函数契约不匹配")
-        if result.data_fingerprint != scope.data_fingerprint:
-            raise ResearchPlanValidationError("工具结果数据指纹与研究范围不匹配")
-        if output_fingerprint(result.output) != result.output_hash:
-            raise ResearchPlanValidationError("工具结果 output_hash 校验失败")
-        evidence_field = FUNCTION_CATALOG[call.name].evidence_field
-        if evidence_field is not None and evidence_field not in result.output.value:
-            raise RepairablePlanError(f"工具 {call.name} 的结果缺少证据字段 {evidence_field}")
+        validate_tool_result(
+            call,
+            result,
+            registry=self.registry,
+            expected_data_fingerprint=scope.data_fingerprint,
+        )
 
     def build_dynamic_plan(
         self,
@@ -461,14 +440,9 @@ class EDAExecutionService:
         validate_result: bool = True,
     ) -> ToolResult:
         prepared = self.prepare(plan=plan, study_config=study_config)
-        context = ToolContext(
-            config=prepared.config,
-            frame=prepared.prepared.aligned.frame,
-            quality=prepared.prepared.quality,
-        )
         result = self.executor.execute(
             call,
-            context=context,
+            context=prepared.context,
             policy=prepared.policy,
             data_fingerprint=prepared.data_fingerprint,
         )
@@ -477,30 +451,14 @@ class EDAExecutionService:
         return result
 
     def validate_tool_result(self, *, plan: EDAPlan, call: ToolCall, result: ToolResult) -> None:
-        if (
-            result.call.call_id != call.call_id
-            or result.call.work_id != call.work_id
-            or result.call.step_id != call.step_id
-            or result.call.name != call.name
-        ):
-            raise ResearchPlanValidationError("工具结果与调用身份不匹配")
-        expected_key = self.registry.get(call.name).result_key
-        if result.output.result_key != expected_key:
-            raise RepairablePlanError(
-                f"工具 {call.name} 返回了错误结果键：{result.output.result_key}"
-            )
-        if result.tool_version != call.version:
-            raise ResearchPlanValidationError("工具结果版本与锁定调用不匹配")
-        if result.data_fingerprint != plan.data_fingerprint:
-            raise ResearchPlanValidationError("工具结果数据指纹与锁定计划不匹配")
-        if output_fingerprint(result.output) != result.output_hash:
-            # A reused or checkpoint-restored payload must still hash to its recorded value.
-            raise ResearchPlanValidationError(f"工具 {call.name} 的结果与记录的 output_hash 不一致")
-        evidence_field = FUNCTION_CATALOG[call.name].evidence_field
-        if evidence_field is not None and evidence_field not in result.output.value:
-            raise RepairablePlanError(
-                f"工具 {call.name} 的结果缺少证据字段 {evidence_field}"
-            )
+        if plan.data_fingerprint is None:
+            raise ResearchPlanValidationError("工具结果校验缺少锁定计划数据指纹")
+        validate_tool_result(
+            call,
+            result,
+            registry=self.registry,
+            expected_data_fingerprint=plan.data_fingerprint,
+        )
 
     def finalize(
         self,

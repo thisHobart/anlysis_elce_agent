@@ -68,6 +68,14 @@ from app.research.schemas.results import DataQualityReport
 from app.research.schemas.study import StudyConfig, StudyInputDescriptor
 from app.research.skills.loader import SkillLoadError
 from app.research.skills.registry import SkillRegistry
+from app.research.tools.calling import (
+    ToolTurnProtocolError,
+    build_tool_error_feedback,
+    build_tool_feedback,
+    build_tool_rejection_feedback,
+    compile_tool_turn,
+    tool_result_payload,
+)
 from app.research.tools.catalog import FUNCTION_CATALOG, FUNCTION_CATALOG_VERSION
 from app.research.tools.contracts import ToolCall, ToolResult
 from app.research.tools.executor import ToolExecutionError
@@ -2321,25 +2329,13 @@ def build_research_workflow(
                     result = result_store.get(
                         state["thread_id"], child_record.result, call=child_call
                     )
-                    child_results.append(
-                        {
-                            "call_id": child_id,
-                            "function": child_call.name,
-                            "status": child_record.status,
-                            "result_key": result.output.result_key,
-                            "value": _compact_tool_value(result.output.value),
-                            "output_hash": result.output_hash,
-                            "duplicate_notice": (
-                                {
-                                    "code": "duplicate_work_id",
-                                    "message": "相同数据、函数版本和参数的结果已复用，未重复计算。",
-                                    "work_id": child_call.work_id,
-                                }
-                                if child_record.status == "reused"
-                                else None
-                            ),
-                        }
+                    result_payload = tool_result_payload(
+                        child_call,
+                        result,
+                        status="completed" if child_record.status == "completed" else "reused",
                     )
+                    result_payload["call_id"] = child_id
+                    child_results.append(result_payload)
                     if child_id not in existing_evidence:
                         evidence.append(
                             CallEvidenceRecord(
@@ -2391,20 +2387,11 @@ def build_research_workflow(
             group.status = "failed" if is_target_group else "cancelled"
             groups[provider_id] = group
             messages.append(
-                ModelMessage(
-                    role="tool",
-                    tool_call_id=provider_id,
-                    content=json.dumps(
-                        {
-                            "requested": group.requested_name,
-                            "requested_version": group.requested_version,
-                            "status": group.status,
-                            "retryable": packet.retryable,
-                            "results": child_results,
-                            "errors": child_errors,
-                        },
-                        ensure_ascii=False,
-                    ),
+                build_tool_error_feedback(
+                    group,
+                    retryable=packet.retryable,
+                    results=child_results,
+                    errors=child_errors,
                 )
             )
             provider_messages += 1
@@ -2699,23 +2686,6 @@ def build_research_workflow(
             "pending_tool_result": None,
         }
 
-    def _compact_tool_value(value: Any, *, depth: int = 0) -> Any:
-        if depth >= 5:
-            return "<truncated>"
-        if isinstance(value, dict):
-            return {
-                str(key): _compact_tool_value(item, depth=depth + 1)
-                for key, item in list(value.items())[:40]
-            }
-        if isinstance(value, list):
-            compact = [_compact_tool_value(item, depth=depth + 1) for item in value[:20]]
-            if len(value) > 20:
-                compact.append({"omitted_items": len(value) - 20})
-            return compact
-        if isinstance(value, str) and len(value) > 1000:
-            return f"{value[:997]}..."
-        return value
-
     def complete_tool_batch(state: ResearchLoopState) -> dict[str, Any]:
         scope = _scope(state)
         if scope is None:
@@ -2746,23 +2716,11 @@ def build_research_workflow(
                     raise ResearchPlanValidationError(f"动态调用 {child_id} 缺少结果引用")
                 result = result_store.get(state["thread_id"], record.result, call=call)
                 child_payloads.append(
-                    {
-                        "function": call.name,
-                        "arguments": call.arguments,
-                        "status": "completed" if record.status == "completed" else "reused",
-                        "result_key": result.output.result_key,
-                        "value": _compact_tool_value(result.output.value),
-                        "output_hash": result.output_hash,
-                        "duplicate_notice": (
-                            {
-                                "code": "duplicate_work_id",
-                                "message": "相同数据、函数版本和参数的结果已复用，未重复计算。",
-                                "work_id": call.work_id,
-                            }
-                            if record.status == "reused"
-                            else None
-                        ),
-                    }
+                    tool_result_payload(
+                        call,
+                        result,
+                        status="completed" if record.status == "completed" else "reused",
+                    )
                 )
                 if child_id not in existing_call_ids:
                     evidence.append(
@@ -2786,21 +2744,7 @@ def build_research_workflow(
             group.status = "completed"
             groups[provider_id] = group
             if group.origin != "system_preflight":
-                messages.append(
-                    ModelMessage(
-                        role="tool",
-                        tool_call_id=provider_id,
-                        content=json.dumps(
-                            {
-                                "requested": group.requested_name,
-                                "requested_version": group.requested_version,
-                                "results": child_payloads,
-                            },
-                            ensure_ascii=False,
-                            allow_nan=False,
-                        ),
-                    )
-                )
+                messages.append(build_tool_feedback(group, child_payloads))
 
         budget = _budget(state)
         validate_analysis_message_protocol(
@@ -3109,139 +3053,65 @@ def build_research_workflow(
                 ),
             }
 
-        provider_ids = [str(call.call_id or "") for call in turn.tool_calls]
-        if any(not provider_id.strip() for provider_id in provider_ids):
-            packet = FeedbackPacket(
-                source="plan_validator",
-                code="missing_provider_call_id",
-                severity="error",
-                message="模型返回了空 provider call_id。",
-                retryable=True,
-            )
-            return _selector_protocol_retry(
-                state,
-                scope=scope,
-                budget=budget,
-                messages=messages,
-                packet=packet,
-            )
-        if len(provider_ids) != len(set(provider_ids)):
-            packet = FeedbackPacket(
-                source="plan_validator",
-                code="duplicate_provider_call_id",
-                severity="error",
-                message="模型在同一回合返回了重复 provider call_id。",
-                retryable=True,
-            )
-            return _selector_protocol_retry(
-                state,
-                scope=scope,
-                budget=budget,
-                messages=messages,
-                packet=packet,
-            )
-        reused_provider_ids = sorted(
-            set(provider_ids).intersection(state.get("provider_call_groups", {}))
-        )
-        if reused_provider_ids:
-            packet = FeedbackPacket(
-                source="plan_validator",
-                code="reused_provider_call_id",
-                severity="error",
-                message="模型重复使用了此前回合的 provider call_id。",
-                observed=reused_provider_ids,
-                retryable=True,
-            )
-            return _selector_protocol_retry(
-                state,
-                scope=scope,
-                budget=budget,
-                messages=messages,
-                packet=packet,
-            )
-
-        assistant = ModelMessage(role="assistant", content=turn.content, tool_calls=turn.tool_calls)
-        messages.append(assistant)
-
-        calls: list[ToolCall] = []
-        groups = dict(state.get("provider_call_groups", {}))
         records = dict(state.get("tool_records", {}))
-        process_call_steps = dict(state.get("process_call_steps", {}))
-        compile_packets: list[FeedbackPacket] = []
         next_sequence = max(
             (int(ToolCall.model_validate(record["call"]).step_id[1:]) for record in records.values()),
             default=0,
         ) + 1
-        for proposal in turn.tool_calls:
-            provider_id = str(proposal.call_id)
-            origin: Literal["direct", "recipe"] = "direct"
-            requested_version: str | None = None
-            try:
-                if proposal.name in dynamic_agent.recipes.names:
-                    if proposal.arguments:
-                        raise ResearchPlanValidationError(f"分析配方 {proposal.name} 不接受参数")
-                    recipe = dynamic_agent.recipes.get(proposal.name)
-                    names_and_arguments = [(name, {}) for name in recipe.functions]
-                    origin = "recipe"
-                    requested_version = recipe.version
-                else:
-                    names_and_arguments = [(proposal.name, proposal.arguments)]
-                    origin = "direct"
-                    requested_version = tools.get(proposal.name).version
-                proposal_calls: list[ToolCall] = []
-                proposal_records: dict[str, dict[str, Any]] = {}
-                proposal_sequence = next_sequence
-                for name, arguments in names_and_arguments:
-                    call = execution.compile_dynamic_call(
-                        scope=scope,
-                        study_config=config,
-                        name=name,
-                        arguments=arguments,
-                        sequence=proposal_sequence,
-                    )
-                    proposal_sequence += 1
-                    proposal_calls.append(call)
-                    proposal_records[call.call_id] = ToolCallRecord(
-                        call=call.model_dump(mode="json")
-                    ).model_dump(mode="json")
-                calls.extend(proposal_calls)
-                process_call_steps.update(
-                    {call.call_id: process_step_id for call in proposal_calls}
-                )
-                records.update(proposal_records)
-                next_sequence = proposal_sequence
-                groups[provider_id] = ToolCallGroupRecord(
-                    provider_call_id=provider_id,
-                    requested_name=proposal.name,
-                    requested_version=requested_version,
-                    child_call_ids=[call.call_id for call in proposal_calls],
-                    origin=origin,
-                ).model_dump(mode="json")
-            except Exception as exc:  # noqa: BLE001 - reject only this independent proposal
-                packet = exception_feedback(exc, source="tool_executor", retryable=True)
+        try:
+            compiled_batch = compile_tool_turn(
+                turn,
+                scope=scope,
+                study_config=config,
+                registry=tools,
+                recipes=dynamic_agent.recipes,
+                existing_provider_call_ids=set(state.get("provider_call_groups", {})),
+                next_sequence=next_sequence,
+                remaining_tool_calls=max(0, scope.max_tool_calls - budget.tool_calls_used),
+            )
+        except ToolTurnProtocolError as exc:
+            packet = FeedbackPacket(
+                source="plan_validator",
+                code=exc.code,
+                severity="error",
+                message=str(exc),
+                observed=exc.observed,
+                retryable=True,
+            )
+            return _selector_protocol_retry(
+                state,
+                scope=scope,
+                budget=budget,
+                messages=messages,
+                packet=packet,
+            )
+
+        provider_ids = [proposal.provider_call_id for proposal in compiled_batch.proposals]
+        messages.append(ModelMessage(role="assistant", content=turn.content, tool_calls=turn.tool_calls))
+        calls = list(compiled_batch.calls)
+        groups = dict(state.get("provider_call_groups", {}))
+        groups.update(
+            {provider_id: group.model_dump(mode="json") for provider_id, group in compiled_batch.groups.items()}
+        )
+        process_call_steps = dict(state.get("process_call_steps", {}))
+        compile_packets: list[FeedbackPacket] = []
+        for proposal in compiled_batch.proposals:
+            if proposal.error is not None:
+                packet = exception_feedback(proposal.error, source="tool_executor", retryable=True)
                 compile_packets.append(packet)
-                groups[provider_id] = ToolCallGroupRecord(
-                    provider_call_id=provider_id,
-                    requested_name=proposal.name,
-                    requested_version=requested_version,
-                    child_call_ids=[],
-                    origin=origin,
-                    status="failed",
-                ).model_dump(mode="json")
                 messages.append(
-                    ModelMessage(
-                    role="tool",
-                    tool_call_id=provider_id,
-                    content=json.dumps(
-                        {
-                            "status": "rejected",
-                            "error": packet.message,
-                            "retryable": True,
-                        },
-                        ensure_ascii=False,
-                    ),
+                    build_tool_rejection_feedback(
+                        proposal.provider_call_id,
+                        error=packet.message,
+                        retryable=True,
+                    )
                 )
-                )
+                continue
+            for call in proposal.calls:
+                records[call.call_id] = ToolCallRecord(
+                    call=call.model_dump(mode="json")
+                ).model_dump(mode="json")
+                process_call_steps[call.call_id] = process_step_id
 
         if not calls:
             budget.no_progress_rounds += 1
@@ -3274,7 +3144,7 @@ def build_research_workflow(
                 "process_events": process_history,
             }
 
-        if budget.tool_calls_used + len(calls) > scope.max_tool_calls:
+        if compiled_batch.exceeds_budget:
             packet = budget_feedback(budget, code="tool_call_budget", message="动态分析将超过 16 次工具调用上限。")
             for provider_id in provider_ids:
                 group = ToolCallGroupRecord.model_validate(groups[provider_id])
@@ -3289,13 +3159,10 @@ def build_research_workflow(
                     record.finished_at = _now()
                     records[child_id] = record.model_dump(mode="json")
                 messages.append(
-                    ModelMessage(
-                        role="tool",
-                        tool_call_id=provider_id,
-                        content=json.dumps(
-                            {"status": "rejected", "error": packet.message, "retryable": False},
-                            ensure_ascii=False,
-                        ),
+                    build_tool_rejection_feedback(
+                        provider_id,
+                        error=packet.message,
+                        retryable=False,
                     )
                 )
             validate_analysis_message_protocol(

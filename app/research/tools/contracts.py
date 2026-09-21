@@ -154,6 +154,37 @@ class ToolResult(BaseModel):
     output_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
+class ToolCallGroupRecord(BaseModel):
+    """Map one provider call to one or more local atomic calls."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider_call_id: str
+    requested_name: str
+    requested_version: str | None = None
+    child_call_ids: list[str] = Field(default_factory=list)
+    origin: Literal["direct", "recipe", "system_preflight"]
+    status: Literal["pending", "running", "completed", "failed", "cancelled"] = "pending"
+
+
+class CallEvidenceRecord(BaseModel):
+    """Canonical call-level evidence retained independently from merged summaries."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sequence: int = Field(ge=1)
+    call_id: str
+    provider_call_id: str
+    origin: Literal["direct", "recipe", "system_preflight"]
+    function: str
+    function_version: str
+    arguments: dict[str, Any]
+    result: dict[str, Any]
+    data_fingerprint: str
+    output_hash: str
+    status: Literal["completed", "reused"]
+
+
 @dataclass(frozen=True)
 class ToolContext:
     """Trusted runtime data hidden from model-visible function arguments."""

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 
 from app.llm.budget import ModelRequestPurpose
@@ -27,7 +27,7 @@ def _function_guidance(skill: SkillDefinition) -> dict[str, str]:
     }
 
 
-def _tool_schemas(
+def build_tool_schemas(
     registry: ToolRegistry,
     recipes: RecipeRegistry,
     scope: EDAResearchScope,
@@ -67,6 +67,34 @@ def _tool_schemas(
         if rule:
             function["description"] = f"{function.get('description', '')} 调用时机与判读：{rule}".strip()
     return [*schemas, *recipes.schemas_for(set(scope.authorized_functions))]
+
+
+@dataclass(frozen=True)
+class ToolRequest:
+    """The exact provider-neutral request used for one model tool-selection turn."""
+
+    messages: tuple[ModelMessage, ...]
+    tools: tuple[dict[str, Any], ...]
+    purpose: ModelRequestPurpose = ModelRequestPurpose.EDA_ANALYSIS
+
+    def as_gateway_kwargs(self) -> dict[str, Any]:
+        return {"messages": list(self.messages), "tools": list(self.tools), "purpose": self.purpose}
+
+
+def build_tool_request(
+    *,
+    scope: EDAResearchScope,
+    skill: SkillDefinition,
+    messages: list[ModelMessage],
+    registry: ToolRegistry,
+    recipes: RecipeRegistry,
+) -> ToolRequest:
+    """Build a debuggable tool request without performing model I/O."""
+
+    return ToolRequest(
+        messages=tuple(messages),
+        tools=tuple(build_tool_schemas(registry, recipes, scope, skill)),
+    )
 
 
 class DynamicAnalysisAgent:
@@ -117,11 +145,11 @@ class DynamicAnalysisAgent:
         skill: SkillDefinition,
         messages: list[ModelMessage],
     ) -> ModelToolTurn:
-        schemas = _tool_schemas(self.tools, self.recipes, scope, skill)
-        kwargs: dict[str, Any] = {
-            "messages": messages,
-            "tools": schemas,
-        }
-        if "purpose" in inspect.signature(self.gateway.invoke_tool_turn).parameters:
-            kwargs["purpose"] = ModelRequestPurpose.EDA_ANALYSIS
-        return self.gateway.invoke_tool_turn(**kwargs)
+        request = build_tool_request(
+            scope=scope,
+            skill=skill,
+            messages=messages,
+            registry=self.tools,
+            recipes=self.recipes,
+        )
+        return self.gateway.invoke_tool_turn(**request.as_gateway_kwargs())
