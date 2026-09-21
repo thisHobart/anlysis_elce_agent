@@ -1,0 +1,27 @@
+{
+  "base_scope": {
+    "scope_id": "tool-benchmark",
+    "revision": 1,
+    "question": "由案例覆盖",
+    "objective": "由案例覆盖",
+    "study_name": "工具选择固定评测",
+    "data_fingerprint": "000000000000",
+    "skill_name": "price-exogenous-eda",
+    "skill_version": "3.2.1",
+    "authorized_functions": [],
+    "authorized_variables": [],
+    "initial_strategy": ["只选择回答当前问题所需的最小工具集合"],
+    "max_model_rounds": 1,
+    "max_tool_calls": 16,
+    "max_attempts_per_call": 1
+  },
+  "quality_report": {
+    "usable_for_eda": true,
+    "issues": [],
+    "series": {}
+  },
+  "data_profile": {
+    "frequency": "1h",
+    "authorized_variable_ids_are_stable": true
+  }
+}

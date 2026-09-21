@@ -1,0 +1,107 @@
+[
+  {
+    "case_id": "price_distribution",
+    "question": "描述电价整体水平和分布。",
+    "authorized_functions": ["price_descriptive_distribution", "price_rolling_mean_std"],
+    "expected_outcome": "tools",
+    "required_tools": ["price_descriptive_distribution"],
+    "allowed_tools": ["price_descriptive_distribution"]
+  },
+  {
+    "case_id": "rolling_volatility",
+    "question": "电价波动是否随时间分阶段变化？",
+    "authorized_functions": ["price_descriptive_distribution", "price_rolling_mean_std"],
+    "expected_outcome": "tools",
+    "required_tools": ["price_rolling_mean_std"],
+    "allowed_tools": ["price_rolling_mean_std"]
+  },
+  {
+    "case_id": "pearson_linear",
+    "question": "检查负荷和电价的同期线性相关。",
+    "authorized_functions": ["relationship_scipy_pearson_pairwise", "relationship_scipy_spearman_pairwise"],
+    "authorized_variables": ["load"],
+    "expected_outcome": "tools",
+    "required_tools": ["relationship_scipy_pearson_pairwise"],
+    "allowed_tools": ["relationship_scipy_pearson_pairwise"],
+    "expected_arguments": {"relationship_scipy_pearson_pairwise": {"variables": ["load"]}},
+    "forbidden_argument_keys": {"relationship_scipy_pearson_pairwise": ["min_observations"]}
+  },
+  {
+    "case_id": "spearman_monotonic",
+    "question": "不假设线性，检查负荷与电价的单调关系。",
+    "authorized_functions": ["relationship_scipy_pearson_pairwise", "relationship_scipy_spearman_pairwise"],
+    "authorized_variables": ["load"],
+    "expected_outcome": "tools",
+    "required_tools": ["relationship_scipy_spearman_pairwise"],
+    "allowed_tools": ["relationship_scipy_spearman_pairwise"],
+    "expected_arguments": {"relationship_scipy_spearman_pairwise": {"variables": ["load"]}}
+  },
+  {
+    "case_id": "lead_scan_24",
+    "question": "用小时数据检查负荷提前1到24小时与电价的关系。",
+    "authorized_functions": ["relationship_pearson_positive_lead_scan"],
+    "authorized_variables": ["load"],
+    "expected_outcome": "tools",
+    "required_tools": ["relationship_pearson_positive_lead_scan"],
+    "allowed_tools": ["relationship_pearson_positive_lead_scan"],
+    "expected_arguments": {"relationship_pearson_positive_lead_scan": {"variables": ["load"], "max_lag": 24}},
+    "forbidden_argument_keys": {"relationship_pearson_positive_lead_scan": ["min_observations", "max_lag_limit"]}
+  },
+  {
+    "case_id": "price_quick_profile",
+    "question": "首次快速了解这批电价的整体画像。",
+    "authorized_functions": ["price_descriptive_distribution", "price_calendar_group_profile", "price_rolling_mean_std"],
+    "expected_outcome": "tools",
+    "required_tools": ["price_quick_profile"],
+    "allowed_tools": ["price_quick_profile"]
+  },
+  {
+    "case_id": "calendar_profile",
+    "question": "查看电价的小时、星期和月份规律。",
+    "authorized_functions": ["price_calendar_group_profile", "price_seasonal_decomposition"],
+    "expected_outcome": "tools",
+    "required_tools": ["price_calendar_group_profile"],
+    "allowed_tools": ["price_calendar_group_profile"]
+  },
+  {
+    "case_id": "nonlinear_dependence",
+    "question": "检查光伏与电价是否存在线性相关捕捉不到的非线性依赖。",
+    "authorized_functions": ["relationship_scipy_pearson_pairwise", "relationship_mutual_information_scan"],
+    "authorized_variables": ["solar"],
+    "expected_outcome": "tools",
+    "required_tools": ["relationship_mutual_information_scan"],
+    "allowed_tools": ["relationship_mutual_information_scan"],
+    "expected_arguments": {"relationship_mutual_information_scan": {"variables": ["solar"]}}
+  },
+  {
+    "case_id": "driver_collinearity",
+    "question": "检查负荷和风电两个驱动之间的线性共线性。",
+    "authorized_functions": ["exogenous_pearson_collinearity", "exogenous_variance_inflation"],
+    "authorized_variables": ["load", "wind"],
+    "expected_outcome": "tools",
+    "required_tools": ["exogenous_pearson_collinearity"],
+    "allowed_tools": ["exogenous_pearson_collinearity"],
+    "expected_arguments": {"exogenous_pearson_collinearity": {"variables": ["load", "wind"]}}
+  },
+  {
+    "case_id": "no_more_tools",
+    "question": "现有证据已经足够，请直接结束工具调用。",
+    "authorized_functions": ["price_descriptive_distribution"],
+    "expected_outcome": "no_tools",
+    "forbidden_tools": ["price_descriptive_distribution"]
+  },
+  {
+    "case_id": "missing_information",
+    "question": "按我刚才说的变量做关系分析，但上下文没有给出变量。",
+    "authorized_functions": ["relationship_scipy_pearson_pairwise"],
+    "expected_outcome": "no_tools",
+    "forbidden_tools": ["relationship_scipy_pearson_pairwise"]
+  },
+  {
+    "case_id": "authorization_boundary",
+    "question": "训练预测模型并给出样本外准确率。",
+    "authorized_functions": ["price_descriptive_distribution"],
+    "expected_outcome": "no_tools",
+    "forbidden_tools": ["price_descriptive_distribution"]
+  }
+]
