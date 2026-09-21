@@ -47,76 +47,124 @@ def _data_quality(context: ToolContext, _arguments: ToolArguments) -> ToolOutput
     return ToolOutput(result_key="data_quality", value=context.quality.model_dump(mode="json"))
 
 
-def _price_handler(function_name: str) -> Callable[[ToolContext, ToolArguments], ToolOutput]:
+def _run_price_analysis(function_name: str, context: ToolContext, arguments: ToolArguments) -> ToolOutput:
     method = FUNCTION_TO_ANALYSIS_METHOD[function_name]
-
-    def handler(context: ToolContext, arguments: ToolArguments) -> ToolOutput:
-        config = context.config
-        max_lag = config.analysis.max_lag
-        spike_multiplier = config.analysis.spike_iqr_multiplier
-        if function_name == "price_lag_autocorrelation":
-            max_lag = PriceAutocorrelationArguments.model_validate(arguments).max_lag
-        elif function_name == "price_tukey_outer_fence":
-            spike_multiplier = PriceExtremeArguments.model_validate(arguments).spike_iqr_multiplier
-        return ToolOutput(
-            result_key="price",
-            value=analyze_price(
-                context.frame[config.target.name],
-                unit=config.target.unit,
-                frequency=config.study.frequency,
-                max_lag=max_lag,
-                spike_iqr_multiplier=spike_multiplier,
-                methods={method},
-            ),
-        )
-
-    return handler
+    config = context.config
+    max_lag = config.analysis.max_lag
+    spike_multiplier = config.analysis.spike_iqr_multiplier
+    if function_name == "price_lag_autocorrelation":
+        max_lag = PriceAutocorrelationArguments.model_validate(arguments).max_lag
+    elif function_name == "price_tukey_outer_fence":
+        spike_multiplier = PriceExtremeArguments.model_validate(arguments).spike_iqr_multiplier
+    return ToolOutput(
+        result_key="price",
+        value=analyze_price(
+            context.frame[config.target.name],
+            unit=config.target.unit,
+            frequency=config.study.frequency,
+            max_lag=max_lag,
+            spike_iqr_multiplier=spike_multiplier,
+            methods={method},
+        ),
+    )
 
 
-def _exogenous_handler(function_name: str) -> Callable[[ToolContext, ToolArguments], ToolOutput]:
+def _price_descriptive_distribution(context: ToolContext, arguments: ToolArguments) -> ToolOutput:
+    return _run_price_analysis("price_descriptive_distribution", context, arguments)
+
+
+def _price_rolling_mean_std(context: ToolContext, arguments: ToolArguments) -> ToolOutput:
+    return _run_price_analysis("price_rolling_mean_std", context, arguments)
+
+
+def _price_tukey_outer_fence(context: ToolContext, arguments: ToolArguments) -> ToolOutput:
+    return _run_price_analysis("price_tukey_outer_fence", context, arguments)
+
+
+def _price_lag_autocorrelation(context: ToolContext, arguments: ToolArguments) -> ToolOutput:
+    return _run_price_analysis("price_lag_autocorrelation", context, arguments)
+
+
+def _price_calendar_group_profile(context: ToolContext, arguments: ToolArguments) -> ToolOutput:
+    return _run_price_analysis("price_calendar_group_profile", context, arguments)
+
+
+def _run_exogenous_analysis(function_name: str, context: ToolContext, arguments: ToolArguments) -> ToolOutput:
     method = FUNCTION_TO_ANALYSIS_METHOD[function_name]
-
-    def handler(context: ToolContext, arguments: ToolArguments) -> ToolOutput:
-        parsed = VariablesArguments.model_validate(arguments)
-        multiplier = context.config.analysis.outlier_iqr_multiplier
-        if function_name == "exogenous_iqr_outliers":
-            multiplier = ExogenousOutlierArguments.model_validate(arguments).outlier_iqr_multiplier
-        units = {spec.name: spec.unit for spec in context.config.exogenous}
-        return ToolOutput(
-            result_key="exogenous",
-            value=analyze_exogenous(
-                context.frame,
-                names=parsed.variables,
-                units=units,
-                outlier_iqr_multiplier=multiplier,
-                methods={method},
-            ),
-        )
-
-    return handler
+    parsed = VariablesArguments.model_validate(arguments)
+    multiplier = context.config.analysis.outlier_iqr_multiplier
+    if function_name == "exogenous_iqr_outliers":
+        multiplier = ExogenousOutlierArguments.model_validate(arguments).outlier_iqr_multiplier
+    units = {spec.name: spec.unit for spec in context.config.exogenous}
+    return ToolOutput(
+        result_key="exogenous",
+        value=analyze_exogenous(
+            context.frame,
+            names=parsed.variables,
+            units=units,
+            outlier_iqr_multiplier=multiplier,
+            methods={method},
+        ),
+    )
 
 
-def _relationship_handler(function_name: str) -> Callable[[ToolContext, ToolArguments], ToolOutput]:
+def _exogenous_descriptive_distribution(context: ToolContext, arguments: ToolArguments) -> ToolOutput:
+    return _run_exogenous_analysis("exogenous_descriptive_distribution", context, arguments)
+
+
+def _exogenous_iqr_outliers(context: ToolContext, arguments: ToolArguments) -> ToolOutput:
+    return _run_exogenous_analysis("exogenous_iqr_outliers", context, arguments)
+
+
+def _exogenous_linear_index_trend(context: ToolContext, arguments: ToolArguments) -> ToolOutput:
+    return _run_exogenous_analysis("exogenous_linear_index_trend", context, arguments)
+
+
+def _exogenous_pearson_collinearity(context: ToolContext, arguments: ToolArguments) -> ToolOutput:
+    return _run_exogenous_analysis("exogenous_pearson_collinearity", context, arguments)
+
+
+def _run_relationship_analysis(function_name: str, context: ToolContext, arguments: ToolArguments) -> ToolOutput:
     method = FUNCTION_TO_ANALYSIS_METHOD[function_name]
+    parsed = RelationshipArguments.model_validate(arguments)
+    max_lag = context.config.analysis.max_lag
+    if function_name == "relationship_pearson_positive_lead_scan":
+        max_lag = RelationshipLagArguments.model_validate(arguments).max_lag
+    return ToolOutput(
+        result_key="relationships",
+        value=analyze_relationships(
+            context.frame,
+            target_name=context.config.target.name,
+            exogenous_names=parsed.variables,
+            max_lag=max_lag,
+            min_observations=parsed.min_observations,
+            methods={method},
+        ),
+    )
 
-    def handler(context: ToolContext, arguments: ToolArguments) -> ToolOutput:
-        parsed = RelationshipArguments.model_validate(arguments)
-        max_lag = context.config.analysis.max_lag
-        if function_name == "relationship_pearson_positive_lead_scan":
-            max_lag = RelationshipLagArguments.model_validate(arguments).max_lag
-        return ToolOutput(
-            result_key="relationships",
-            value=analyze_relationships(
-                context.frame,
-                target_name=context.config.target.name,
-                exogenous_names=parsed.variables,
-                max_lag=max_lag,
-                min_observations=parsed.min_observations,
-                methods={method},
-            ),
-        )
 
-    return handler
+def _relationship_scipy_pearson_pairwise(context: ToolContext, arguments: ToolArguments) -> ToolOutput:
+    return _run_relationship_analysis("relationship_scipy_pearson_pairwise", context, arguments)
+
+
+def _relationship_scipy_spearman_pairwise(context: ToolContext, arguments: ToolArguments) -> ToolOutput:
+    return _run_relationship_analysis("relationship_scipy_spearman_pairwise", context, arguments)
+
+
+def _relationship_pearson_positive_lead_scan(context: ToolContext, arguments: ToolArguments) -> ToolOutput:
+    return _run_relationship_analysis("relationship_pearson_positive_lead_scan", context, arguments)
+
+
+def _relationship_pearson_by_hour(context: ToolContext, arguments: ToolArguments) -> ToolOutput:
+    return _run_relationship_analysis("relationship_pearson_by_hour", context, arguments)
+
+
+def _relationship_pearson_by_month(context: ToolContext, arguments: ToolArguments) -> ToolOutput:
+    return _run_relationship_analysis("relationship_pearson_by_month", context, arguments)
+
+
+def _relationship_feature_quartile_response(context: ToolContext, arguments: ToolArguments) -> ToolOutput:
+    return _run_relationship_analysis("relationship_feature_quartile_response", context, arguments)
 
 
 def _price_stationarity(context: ToolContext, _arguments: ToolArguments) -> ToolOutput:
@@ -291,14 +339,14 @@ def build_eda_tool_registry() -> ToolRegistry:
 
     handlers: dict[str, tuple[type[ToolArguments], Callable[[ToolContext, ToolArguments], ToolOutput]]] = {
         "data_quality": (DataQualityArguments, _data_quality),
-        "price_descriptive_distribution": (NoArguments, _price_handler("price_descriptive_distribution")),
-        "price_rolling_mean_std": (NoArguments, _price_handler("price_rolling_mean_std")),
-        "price_tukey_outer_fence": (PriceExtremeArguments, _price_handler("price_tukey_outer_fence")),
+        "price_descriptive_distribution": (NoArguments, _price_descriptive_distribution),
+        "price_rolling_mean_std": (NoArguments, _price_rolling_mean_std),
+        "price_tukey_outer_fence": (PriceExtremeArguments, _price_tukey_outer_fence),
         "price_lag_autocorrelation": (
             PriceAutocorrelationArguments,
-            _price_handler("price_lag_autocorrelation"),
+            _price_lag_autocorrelation,
         ),
-        "price_calendar_group_profile": (NoArguments, _price_handler("price_calendar_group_profile")),
+        "price_calendar_group_profile": (NoArguments, _price_calendar_group_profile),
         "price_stationarity_tests": (NoArguments, _price_stationarity),
         "price_seasonal_decomposition": (NoArguments, _price_decomposition),
         "price_partial_autocorrelation": (PriceAutocorrelationArguments, _price_partial_autocorrelation),
@@ -312,42 +360,42 @@ def build_eda_tool_registry() -> ToolRegistry:
         ),
         "exogenous_descriptive_distribution": (
             VariablesArguments,
-            _exogenous_handler("exogenous_descriptive_distribution"),
+            _exogenous_descriptive_distribution,
         ),
-        "exogenous_iqr_outliers": (ExogenousOutlierArguments, _exogenous_handler("exogenous_iqr_outliers")),
+        "exogenous_iqr_outliers": (ExogenousOutlierArguments, _exogenous_iqr_outliers),
         "exogenous_linear_index_trend": (
             VariablesArguments,
-            _exogenous_handler("exogenous_linear_index_trend"),
+            _exogenous_linear_index_trend,
         ),
         "exogenous_pearson_collinearity": (
             VariablesArguments,
-            _exogenous_handler("exogenous_pearson_collinearity"),
+            _exogenous_pearson_collinearity,
         ),
         "exogenous_variance_inflation": (VariablesArguments, _exogenous_variance_inflation),
         "exogenous_stationarity_tests": (VariablesArguments, _exogenous_stationarity),
         "relationship_scipy_pearson_pairwise": (
             RelationshipArguments,
-            _relationship_handler("relationship_scipy_pearson_pairwise"),
+            _relationship_scipy_pearson_pairwise,
         ),
         "relationship_scipy_spearman_pairwise": (
             RelationshipArguments,
-            _relationship_handler("relationship_scipy_spearman_pairwise"),
+            _relationship_scipy_spearman_pairwise,
         ),
         "relationship_pearson_positive_lead_scan": (
             RelationshipLagArguments,
-            _relationship_handler("relationship_pearson_positive_lead_scan"),
+            _relationship_pearson_positive_lead_scan,
         ),
         "relationship_pearson_by_hour": (
             RelationshipArguments,
-            _relationship_handler("relationship_pearson_by_hour"),
+            _relationship_pearson_by_hour,
         ),
         "relationship_pearson_by_month": (
             RelationshipArguments,
-            _relationship_handler("relationship_pearson_by_month"),
+            _relationship_pearson_by_month,
         ),
         "relationship_feature_quartile_response": (
             RelationshipArguments,
-            _relationship_handler("relationship_feature_quartile_response"),
+            _relationship_feature_quartile_response,
         ),
         "relationship_mutual_information_scan": (RelationshipLagArguments, _relationship_mutual_information),
         "relationship_granger_causality_scan": (RelationshipLagArguments, _relationship_granger),

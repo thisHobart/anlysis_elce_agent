@@ -63,6 +63,19 @@ def _conversation_payloads(history: list[Any]) -> list[dict[str, Any]]:
     return [ConversationMessage.model_validate(item).model_dump(mode="json") for item in history]
 
 
+def build_default_agent_roles(
+    tools: ToolRegistry,
+) -> tuple[MainResearchAgent, EDASubagent, DynamicAnalysisAgent]:
+    """Build the three production model roles with one explicit shared gateway."""
+
+    gateway = build_model_gateway()
+    return (
+        MainResearchAgent(model_dialogue=ModelResearchDialogue(gateway=gateway)),
+        EDASubagent(model_planner=ModelEDAPlanner(gateway=gateway, tools=tools)),
+        DynamicAnalysisAgent(gateway=gateway, tools=tools),
+    )
+
+
 class ResearchCoordinator:
     """Own the graph, model roles, checkpointer, Skills, and controlled tools."""
 
@@ -82,18 +95,20 @@ class ResearchCoordinator:
         self.skills = skills or SkillRegistry.default()
         self.skill_load_errors = list(self.skills.load_errors)
         self.tools = tools or build_eda_tool_registry()
-        if main_agent is None or eda_subagent is None:
+        if main_agent is None and eda_subagent is None:
+            default_main, default_eda, default_dynamic = build_default_agent_roles(self.tools)
+            main_agent = default_main
+            eda_subagent = default_eda
+            dynamic_agent = dynamic_agent or default_dynamic
+        elif main_agent is None or eda_subagent is None:
             gateway = build_model_gateway()
             main_agent = main_agent or MainResearchAgent(model_dialogue=ModelResearchDialogue(gateway=gateway))
             eda_subagent = eda_subagent or EDASubagent(
                 model_planner=ModelEDAPlanner(gateway=gateway, tools=self.tools)
             )
+            dynamic_agent = dynamic_agent or DynamicAnalysisAgent(gateway=gateway, tools=self.tools)
         self.main_agent = main_agent
         self.eda_subagent = eda_subagent
-        if dynamic_agent is None:
-            planner_gateway = getattr(getattr(eda_subagent, "model_planner", None), "gateway", None)
-            if planner_gateway is not None and hasattr(planner_gateway, "invoke_tool_turn"):
-                dynamic_agent = DynamicAnalysisAgent(gateway=planner_gateway, tools=self.tools)
         self.dynamic_agent = dynamic_agent
         self.planning = EDAPlanningService(eda_subagent)
         self.execution = execution or EDAExecutionService(registry=self.tools, skills=self.skills)
