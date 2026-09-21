@@ -8,11 +8,17 @@ import pytest
 from app.llm.gateway import ModelMessage, ModelToolCall, ModelToolTurn
 from app.research.agent.dynamic import build_tool_request
 from app.research.agent.schemas import EDAResearchScope
+from app.research.application.planning import prepare_research_data
 from app.research.evaluation.tool_calling import ToolSelectionCase, score_tool_turn
 from app.research.schemas.study import load_study_config
 from app.research.skills.registry import SkillRegistry
+from app.research.tools.catalog import FUNCTION_CATALOG
 from app.research.tools.calling import ToolTurnProtocolError, compile_tool_turn
+from app.research.tools.contracts import ToolCall, ToolContext
 from app.research.tools.eda.functions import build_eda_tool_registry
+from app.research.tools.executor import ToolExecutor, validate_tool_result
+from app.research.tools.parameters import compile_function_parameters
+from app.research.tools.policy import ToolPolicy
 from app.research.tools.recipes import build_recipe_registry
 
 
@@ -155,3 +161,61 @@ def test_twelve_reviewed_selection_cases_and_scorer_mutation_detection():
     score = score_tool_turn(lead, wrong)
     assert not score.passed
     assert "max_lag" in score.argument_errors[0]
+
+
+def test_all_atomic_tools_have_named_handlers_and_execute_through_the_shared_boundary(
+    synthetic_study: Path,
+):
+    config = load_study_config(synthetic_study)
+    prepared = prepare_research_data(config)
+    registry = build_eda_tool_registry()
+    executor = ToolExecutor(registry)
+    policy = ToolPolicy(frozenset(registry.names))
+    context = ToolContext(config=config, frame=prepared.aligned.frame, quality=prepared.quality)
+    variables = [item.name for item in config.exogenous]
+    segments = [
+        {"segment_id": "first_half", "label": "前半日", "kind": "hours", "hours": list(range(12))},
+        {"segment_id": "second_half", "label": "后半日", "kind": "hours", "hours": list(range(12, 24))},
+    ]
+
+    assert registry.names == set(FUNCTION_CATALOG)
+    for sequence, name in enumerate(FUNCTION_CATALOG, start=1):
+        spec = FUNCTION_CATALOG[name]
+        supplied: dict[str, object] = {}
+        if spec.uses_variables:
+            supplied["variables"] = variables
+        if spec.uses_max_lag:
+            supplied["max_lag"] = 4
+        if spec.uses_segments:
+            supplied.update({"comparison_id": "debug_comparison", "segments": segments})
+        arguments = compile_function_parameters(
+            name,
+            supplied,
+            selected_variables=variables if spec.uses_variables else [],
+            config=config,
+            enabled=True,
+        )
+        arguments.pop("max_lag_limit", None)
+        registered = registry.get(name)
+        assert registered.handler.__name__ != "handler"
+        assert registered.handler.__closure__ is None
+        call = ToolCall(
+            call_id=f"atomic-{sequence}",
+            work_id=f"{sequence:024x}",
+            step_id=f"S{sequence}",
+            name=name,
+            version=registered.version,
+            arguments=arguments,
+        )
+        result = executor.execute(
+            call,
+            context=context,
+            policy=policy,
+            data_fingerprint="2" * 12,
+        )
+        validate_tool_result(
+            call,
+            result,
+            registry=registry,
+            expected_data_fingerprint="2" * 12,
+        )
