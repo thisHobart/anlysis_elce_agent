@@ -26,6 +26,14 @@ dist/
 # Local configuration and secrets
 .env.*
 !.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+credentials*.json
+secrets*.json
+gitleaks-report.*
 
 # IDE and operating-system files
 .idea/

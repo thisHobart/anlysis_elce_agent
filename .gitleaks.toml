@@ -1,0 +1,32 @@
+title = "anlysis_elce_agent secret scanning"
+
+[extend]
+useDefault = true
+
+# The default generic rules intentionally use entropy thresholds. Database
+# passwords can still be real credentials when they are short or low entropy,
+# so reject any concrete value assigned to a database-password setting.
+[[rules]]
+id = "database-password-assignment"
+description = "Concrete database password assigned in source or configuration"
+regex = '''(?i)(?:"?(?:[a-z0-9]+[_-])*(?:db|database)(?:[_-][a-z0-9]+)*[_-](?:password|passwd|pwd)"?)[ \t]*(?::(?:[ \t]*[A-Za-z_][A-Za-z0-9_\[\], .|]*[ \t]*=)?|=)[ \t]*(?:SecretStr\([ \t]*)?["']?([^\s"'#,\(\)\]}]+)'''
+secretGroup = 1
+keywords = [
+  "db_password",
+  "db-password",
+  "database_password",
+  "database-password",
+  "db_feature_password",
+  "db_analytics_password",
+]
+tags = ["database", "password"]
+
+[[rules.allowlists]]
+description = "Permit explicit placeholders and environment indirection"
+regexTarget = "secret"
+regexes = [
+  '''(?i)^(?:test|dummy|fake|example|placeholder|changeme|change-me|replace-me|none|null)(?:[-_].*)?$''',
+  '''^\$\{[A-Za-z_][A-Za-z0-9_]*(?::-[^}]*)?\}?$''',
+  '''(?i)^(?:os\.)?(?:getenv|environ(?:\.get)?)[\(\[]$''',
+  '''(?i)^(?:SecretStr|Field)$''',
+]
