@@ -2,38 +2,49 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
+from uuid import uuid4
 
+from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
+from pydantic import ValidationError
 
+from app.llm.gateway import ModelMessage, ModelResponseError
 from app.research.agent.context import MAX_EPISODE_SUMMARIES, MAX_PERSISTED_CONVERSATION_MESSAGES
+from app.research.agent.dynamic import DynamicAnalysisAgent
 from app.research.agent.errors import (
     DataFingerprintMismatchError,
     InsufficientDataError,
     PlanCompatibilityError,
     RepairablePlanError,
+    ResearchModelContextLimitError,
+    ResearchModelOutputTruncatedError,
     ResearchModelUnavailableError,
     ResearchPlanValidationError,
     SkillVersionMismatchError,
 )
 from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
 from app.research.agent.retrieval import bounded_recent_turn_history, select_persisted_conversation_history
-from app.research.agent.schemas import ConversationMessage, EDAPlan
+from app.research.agent.schemas import ConversationMessage, EDAPlan, EDAResearchScope
 from app.research.application.execution import EDAExecutionService
 from app.research.application.planning import EDAPlanningService, noop_progress
+from app.research.data.inference import resolve_study_input
 from app.research.data.loader import ResearchDataError
 from app.research.data.sources.summary import summary_payload
 from app.research.graph.contracts import (
     ApprovalState,
     AuthorizationEnvelope,
+    CallEvidenceRecord,
     EpisodeSummary,
     InterruptKind,
     InterruptPayload,
     LoopBudget,
     LoopCursor,
     ResumePayload,
+    ToolCallGroupRecord,
     ToolCallRecord,
 )
 from app.research.graph.guards import (
@@ -43,16 +54,28 @@ from app.research.graph.guards import (
     evidence_fingerprint,
     exception_feedback,
     plan_fingerprint,
+    scope_authorization_envelope,
+    scope_fingerprint,
     validate_automatic_revision,
+    validate_scope_authorization,
 )
+from app.research.graph.process_events import ProcessEvent, append_process_events
 from app.research.graph.state import ResearchLoopState
 from app.research.graph.tool_result_store import ToolResultStore
 from app.research.reporting.loop_history import write_loop_record
 from app.research.schemas.feedback import FeedbackPacket
 from app.research.schemas.results import DataQualityReport
-from app.research.schemas.study import StudyConfig
+from app.research.schemas.study import StudyConfig, StudyInputDescriptor
 from app.research.skills.loader import SkillLoadError
 from app.research.skills.registry import SkillRegistry
+from app.research.tools.calling import (
+    ToolTurnProtocolError,
+    build_tool_error_feedback,
+    build_tool_feedback,
+    build_tool_rejection_feedback,
+    compile_tool_turn,
+    tool_result_payload,
+)
 from app.research.tools.catalog import FUNCTION_CATALOG, FUNCTION_CATALOG_VERSION
 from app.research.tools.contracts import ToolCall, ToolResult
 from app.research.tools.executor import ToolExecutionError
@@ -66,6 +89,57 @@ MAX_FEEDBACK_HISTORY = 128
 MAX_GRAPH_MESSAGES = MAX_PERSISTED_CONVERSATION_MESSAGES
 MAX_RUN_HISTORY = 48
 MAX_EPISODE_HISTORY = MAX_EPISODE_SUMMARIES
+
+
+def validate_analysis_message_protocol(
+    messages: list[dict[str, Any]] | list[ModelMessage],
+    provider_call_groups: dict[str, dict[str, Any]],
+    *,
+    allow_pending_current_batch: bool,
+) -> None:
+    """Validate unique provider IDs and exact assistant/tool message closure."""
+
+    proposed: dict[str, int] = {}
+    answered: dict[str, int] = {}
+    for index, raw in enumerate(messages):
+        message = raw if isinstance(raw, ModelMessage) else ModelMessage.model_validate(raw)
+        if message.role == "assistant":
+            for call in message.tool_calls:
+                call_id = str(call.call_id or "").strip()
+                if not call_id:
+                    raise ResearchPlanValidationError("assistant 工具调用缺少 provider call_id")
+                if call_id in proposed:
+                    raise ResearchPlanValidationError(f"provider call_id 被重复提出：{call_id}")
+                proposed[call_id] = index
+        elif message.role == "tool":
+            call_id = str(message.tool_call_id or "").strip()
+            if call_id not in proposed:
+                raise ResearchPlanValidationError(f"tool 消息没有对应的 assistant 调用：{call_id}")
+            if call_id in answered:
+                raise ResearchPlanValidationError(f"provider call_id 收到了重复 tool 结果：{call_id}")
+            if index <= proposed[call_id]:
+                raise ResearchPlanValidationError(f"tool 消息出现在 assistant 调用之前：{call_id}")
+            answered[call_id] = index
+    pending = set(proposed).difference(answered)
+    if not pending:
+        return
+    if not allow_pending_current_batch:
+        raise ResearchPlanValidationError(
+            "存在未闭合的 provider tool calls：" + "、".join(sorted(pending))
+        )
+    groups = {
+        key: ToolCallGroupRecord.model_validate(value)
+        for key, value in provider_call_groups.items()
+    }
+    invalid = sorted(
+        call_id
+        for call_id in pending
+        if call_id not in groups or groups[call_id].status not in {"pending", "running"}
+    )
+    if invalid:
+        raise ResearchPlanValidationError(
+            "未闭合 provider call 缺少唯一 pending group：" + "、".join(invalid)
+        )
 
 
 def _now() -> str:
@@ -120,6 +194,191 @@ def _event(
             "details": details,
         },
     ][-MAX_STATE_EVENTS:]
+
+
+def _process_sequence(state: ResearchLoopState) -> int:
+    sequences = [
+        int(item.get("sequence", 0))
+        for item in state.get("process_events", [])
+        if isinstance(item, dict)
+    ]
+    return max(sequences, default=0) + 1
+
+
+def _process_event(
+    state: ResearchLoopState,
+    event_type: str,
+    *,
+    step_id: str,
+    round_number: int,
+    source: Literal["model", "system"],
+    sequence: int | None = None,
+    phase: str = "analysis",
+    title: str = "",
+    content: str = "",
+    action_id: str | None = None,
+    tool_name: str | None = None,
+    arguments: dict[str, Any] | None = None,
+    result: str = "",
+    report_path: str | None = None,
+) -> ProcessEvent:
+    cursor = _cursor(state)
+    flow_id = cursor.episode_id or str(state.get("revision_cycle_id") or state["thread_id"])
+    return ProcessEvent(
+        session_id=str(state.get("session_id") or state["thread_id"]),
+        flow_id=flow_id,
+        round=round_number,
+        step_id=step_id,
+        sequence=sequence or _process_sequence(state),
+        event_type=event_type,  # type: ignore[arg-type]
+        phase=phase,
+        source=source,
+        title=title,
+        content=content,
+        action_id=action_id,
+        tool_name=tool_name,
+        arguments=arguments or {},
+        result=result,
+        report_path=report_path,
+    )
+
+
+def _emit_process_event(event: ProcessEvent) -> None:
+    """Stream a live event when invoked inside LangGraph; remain test-friendly."""
+
+    try:
+        get_stream_writer()(event.model_dump(mode="json"))
+    except RuntimeError:
+        # Some unit tests exercise node functions without a streaming runtime.
+        return
+
+
+def _process_result_summary(result: ToolResult) -> str:
+    """Build a short deterministic summary without copying the full tool output."""
+
+    value = result.output.value
+    for key in ("summary", "conclusion", "message"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return _short(candidate, 120)
+    findings = value.get("findings")
+    if isinstance(findings, list) and findings:
+        return _short(findings[0], 120)
+    return f"{result.output.result_key} 已通过校验，用时 {result.duration_ms:.0f} 毫秒"
+
+
+def _process_report_path(result: ToolResult) -> str | None:
+    for key in ("report_path", "artifact_path"):
+        value = result.output.value.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _call_process_context(
+    state: ResearchLoopState,
+    call: ToolCall,
+) -> tuple[str, int, Literal["model", "system"], str]:
+    step_id = state.get("process_call_steps", {}).get(call.call_id) or f"execution-{call.call_id}"
+    scope = _scope(state)
+    if scope is not None and not step_id.endswith("-system-preflight"):
+        return step_id, int(state.get("model_round", 0)), "model", ""
+    if step_id.endswith("-system-preflight"):
+        return step_id, 0, "system", "执行已批准研究前的数据质量门槛检查"
+    plan = _plan(state)
+    planned = next((item for item in plan.enabled_steps if item.step_id == call.step_id), None) if plan else None
+    basis = planned.rationale if planned is not None else "按照已确认的研究方案执行"
+    return step_id, int(call.step_id[1:]), "system", basis
+
+
+def _action_attempt_id(state: ResearchLoopState, call: ToolCall) -> str:
+    record_payload = state.get("tool_records", {}).get(call.call_id, {})
+    attempt = int(record_payload.get("attempts", 1)) if isinstance(record_payload, dict) else 1
+    return f"{call.call_id}:attempt:{max(1, attempt)}"
+
+
+def _action_started_events(
+    state: ResearchLoopState,
+    call: ToolCall,
+) -> tuple[list[dict[str, Any]], ProcessEvent]:
+    step_id, round_number, source, basis = _call_process_context(state, call)
+    existing = list(state.get("process_events", []))
+    step_exists = any(item.get("step_id") == step_id for item in existing)
+    additions: list[ProcessEvent] = []
+    sequence = _process_sequence(state)
+    if not step_exists:
+        ready = _process_event(
+            state,
+            "thinking_ready",
+            step_id=step_id,
+            round_number=round_number,
+            source=source,
+            sequence=sequence,
+            title="执行依据" if source == "system" else "思考过程",
+            content=basis or "本轮未提供思考过程说明",
+        )
+        additions.append(ready)
+        sequence += 1
+    started = _process_event(
+        state,
+        "action_started",
+        step_id=step_id,
+        round_number=round_number,
+        source=source,
+        sequence=sequence,
+        title=FUNCTION_CATALOG.get(call.name).title if call.name in FUNCTION_CATALOG else call.name,
+        content="正在执行",
+        action_id=_action_attempt_id(state, call),
+        tool_name=call.name,
+        arguments=_compact_event_arguments(call.arguments),
+    )
+    additions.append(started)
+    for event in additions:
+        _emit_process_event(event)
+    return append_process_events(existing, *additions), started
+
+
+def _action_finished_events(
+    state: ResearchLoopState,
+    call: ToolCall,
+    *,
+    result: str,
+    failed: bool = False,
+    complete_step: bool = False,
+    report_path: str | None = None,
+) -> list[dict[str, Any]]:
+    step_id, round_number, source, _basis = _call_process_context(state, call)
+    sequence = _process_sequence(state)
+    event = _process_event(
+        state,
+        "action_failed" if failed else "action_completed",
+        step_id=step_id,
+        round_number=round_number,
+        source=source,
+        sequence=sequence,
+        title=FUNCTION_CATALOG[call.name].title if call.name in FUNCTION_CATALOG else call.name,
+        action_id=_action_attempt_id(state, call),
+        tool_name=call.name,
+        result=result,
+        report_path=report_path,
+    )
+    additions = [event]
+    if complete_step:
+        additions.append(
+            _process_event(
+                state,
+                "step_completed",
+                step_id=step_id,
+                round_number=round_number,
+                source=source,
+                sequence=sequence + 1,
+                title="步骤完成" if not failed else "步骤中断",
+                result=result,
+            )
+        )
+    for addition in additions:
+        _emit_process_event(addition)
+    return append_process_events(list(state.get("process_events", [])), *additions)
 
 
 def _messages(state: ResearchLoopState) -> list[ConversationMessage]:
@@ -181,14 +440,24 @@ def _config(state: ResearchLoopState) -> StudyConfig | None:
     return StudyConfig.model_validate(value) if value is not None else None
 
 
+def _study_input(state: ResearchLoopState) -> StudyInputDescriptor | None:
+    value = state.get("study_input")
+    return StudyInputDescriptor.model_validate(value) if value is not None else None
+
+
 def _plan(state: ResearchLoopState) -> EDAPlan | None:
     value = state.get("current_plan")
     return EDAPlan.model_validate(value) if value is not None else None
 
 
+def _scope(state: ResearchLoopState) -> EDAResearchScope | None:
+    value = state.get("research_scope")
+    return EDAResearchScope.model_validate(value) if value is not None else None
+
+
 def _current_data_fingerprint(state: ResearchLoopState) -> str | None:
-    plan = state.get("current_plan") or {}
-    value = plan.get("data_fingerprint")
+    active = state.get("research_scope") or state.get("current_plan") or {}
+    value = active.get("data_fingerprint")
     return str(value) if value else None
 
 
@@ -373,6 +642,16 @@ def _approval_matches(state: ResearchLoopState, plan: EDAPlan) -> bool:
     )
 
 
+def _scope_approval_matches(state: ResearchLoopState, scope: EDAResearchScope) -> bool:
+    approval = ApprovalState.model_validate(state.get("approval_state", {}))
+    return bool(
+        approval.status == "approved"
+        and approval.plan_id == scope.scope_id
+        and approval.plan_fingerprint == scope_fingerprint(scope)
+        and approval.approved_at
+    )
+
+
 def _invalid_resume_feedback(state: ResearchLoopState, response: ResumePayload, payload: InterruptPayload) -> list[dict[str, Any]]:
     packet = FeedbackPacket(
         source="user",
@@ -453,14 +732,24 @@ def build_research_workflow(
     tools: ToolRegistry,
     checkpointer: Any,
     result_store: ToolResultStore,
+    dynamic_agent: DynamicAnalysisAgent | None = None,
 ):
     """Compile the only workflow used by desktop research sessions."""
 
     def skill_version_feedback(state: ResearchLoopState) -> FeedbackPacket | None:
         plan = _plan(state)
+        scope = _scope(state)
         skill_value = state.get("active_skill") or {}
-        skill_name = plan.skill_name if plan is not None else str(skill_value.get("name") or "")
-        locked_version = plan.skill_version if plan is not None else str(skill_value.get("version") or "")
+        skill_name = (
+            plan.skill_name
+            if plan is not None
+            else (scope.skill_name if scope is not None else str(skill_value.get("name") or ""))
+        )
+        locked_version = (
+            plan.skill_version
+            if plan is not None
+            else (scope.skill_version if scope is not None else str(skill_value.get("version") or ""))
+        )
         if not skill_name or not locked_version:
             return None
         try:
@@ -568,23 +857,30 @@ def build_research_workflow(
                 ),
             }
         try:
-            decision, _ = main_agent.decide(
-                question=_latest_turn(state),
-                status=state.get("phase", "idle"),
-                config=_config(state),
-                plan=_plan(state),
-                data_profile=state.get("data_profile"),
-                quality_report=state.get("quality_report"),
-                summary=state.get("eda_summary"),
-                evaluation=state.get("evaluation"),
-                history=_messages(state),
-                available_skills=skills.metadata(),
-                episode_summaries=_scoped_episode_summaries(state),
-                active_gate=state.get("user_interrupt_kind") or state.get("return_to_gate"),
-                episode_goal=_episode_goal(state),
-                latest_run=state.get("latest_run"),
-                current_turn_id=state.get("active_turn_id"),
-            )
+            routed = state.get("routed_decision")
+            if routed is not None:
+                decision = DialogueDecision.model_validate(routed)
+            else:
+                skill_metadata = skills.metadata()
+                decision, _ = main_agent.decide(
+                    question=_latest_turn(state),
+                    status=state.get("phase", "idle"),
+                    config=_config(state),
+                    plan=_plan(state),
+                    scope=_scope(state),
+                    data_profile=state.get("data_profile"),
+                    quality_report=state.get("quality_report"),
+                    summary=state.get("eda_summary"),
+                    evaluation=state.get("evaluation"),
+                    history=_messages(state),
+                    available_skills=skill_metadata,
+                    episode_summaries=_scoped_episode_summaries(state),
+                    active_gate=state.get("user_interrupt_kind") or state.get("return_to_gate"),
+                    episode_goal=_episode_goal(state),
+                    latest_run=state.get("latest_run"),
+                    current_turn_id=state.get("active_turn_id"),
+                    has_executable_data=bool(state.get("has_executable_data")),
+                )
             active_gate = state.get("user_interrupt_kind") or state.get("return_to_gate")
             if (
                 decision.intent == "execute_plan"
@@ -602,7 +898,14 @@ def build_research_workflow(
             packet = exception_feedback(
                 exc,
                 source="plan_validator",
-                retryable=isinstance(exc, ResearchModelUnavailableError),
+                retryable=isinstance(
+                    exc,
+                    (
+                        ResearchModelUnavailableError,
+                        ResearchModelOutputTruncatedError,
+                        ResearchModelContextLimitError,
+                    ),
+                ),
                 requires_user=True,
             )
             return {
@@ -622,9 +925,15 @@ def build_research_workflow(
                 ),
             }
         update = {
-            "phase": "planning" if decision.intent in {"new_plan", "revise_plan"} else "understanding",
+            "phase": (
+                "planning"
+                if decision.intent in {"new_plan", "revise_plan", "new_forecast_plan"}
+                else "understanding"
+            ),
             "control": decision.intent if decision.intent != "discussion" else "reply",
             "decision": decision.model_dump(mode="json"),
+            "routed_decision": None,
+            "post_analysis_action": decision.post_analysis_action,
             "events": _event(
                 state,
                 f"主 Agent 路由：{decision.intent}",
@@ -636,20 +945,127 @@ def build_research_workflow(
             update["revision_cycle_id"] = state.get("active_turn_id") or state.get("revision_cycle_id")
         return update
 
-    def route_main(state: ResearchLoopState) -> Literal["new_plan", "revise_plan", "execute_plan", "reply", "need_user"]:
+    def route_main(
+        state: ResearchLoopState,
+    ) -> Literal[
+        "resolve_data",
+        "revise_plan",
+        "execute_plan",
+        "business_handoff",
+        "reply",
+        "need_user",
+    ]:
         control = state.get("control", "reply")
-        if control == "execute_plan" and _plan(state) is None:
+        if control in {"new_news_analysis", "new_forecast_plan", "execute_forecast_plan"}:
+            return "business_handoff"
+        if control == "new_plan" or (
+            control in {"revise_plan", "execute_plan"} and _config(state) is None
+        ):
+            return "resolve_data"
+        if control == "execute_plan" and _plan(state) is None and _scope(state) is None:
             return "reply"
-        return control if control in {"new_plan", "revise_plan", "execute_plan", "need_user"} else "reply"  # type: ignore[return-value]
+        return control if control in {"revise_plan", "execute_plan", "need_user"} else "reply"  # type: ignore[return-value]
+
+    def resolve_study_context(state: ResearchLoopState) -> dict[str, Any]:
+        """Resolve selected files only after the main Agent chose a data-analysis route."""
+
+        action = str(state.get("pending_research_action") or state.get("control") or "new_plan")
+        config = _config(state)
+        if config is None:
+            descriptor = _study_input(state)
+            if descriptor is None:
+                packet = FeedbackPacket(
+                    source="data_loader",
+                    code="missing_study_input",
+                    severity="error",
+                    message="开始实际数据分析前需要先选择目标电价数据。",
+                    recommendation="选择数据后重新提交分析请求。",
+                    requires_user=True,
+                )
+                return {
+                    "phase": "awaiting_user",
+                    "control": "need_user",
+                    "pending_research_action": None,
+                    "feedback_packets": _append_feedback(state, packet),
+                    "stop_reason": packet.message,
+                    "user_interrupt_kind": "data_input_error",
+                    "events": _event(
+                        state,
+                        "实际分析缺少数据输入",
+                        "failed",
+                        trace_category="error",
+                    ),
+                }
+            try:
+                config = resolve_study_input(descriptor)
+            except Exception as exc:  # noqa: BLE001 - converted into a data-input interrupt
+                packet = exception_feedback(exc, source="data_loader", requires_user=True)
+                return {
+                    "phase": "awaiting_user",
+                    "control": "need_user",
+                    "pending_research_action": None,
+                    "feedback_packets": _append_feedback(state, packet),
+                    "stop_reason": packet.message,
+                    "user_interrupt_kind": "data_input_error",
+                    "events": _event(
+                        state,
+                        f"研究数据解析失败：{_short(packet.message)}",
+                        "failed",
+                        trace_category="error",
+                    ),
+                }
+        return {
+            "phase": "planning",
+            "control": action,
+            "pending_research_action": None,
+            "study_config": config.model_dump(mode="json"),
+            "has_executable_data": True,
+            "events": _event(
+                state,
+                f"实际分析数据已解析：{config.study.name}",
+                trace_category="input",
+            ),
+        }
+
+    def route_resolved_study(
+        state: ResearchLoopState,
+    ) -> Literal["new_plan", "revise_plan", "execute_plan", "need_user"]:
+        control = state.get("control", "need_user")
+        return control if control in {"new_plan", "revise_plan", "execute_plan"} else "need_user"  # type: ignore[return-value]
+
+    def prepare_forecast_handoff(state: ResearchLoopState) -> dict[str, Any]:
+        """Hand specialized business intent to the application that owns its inputs."""
+
+        intent = DialogueDecision.model_validate(state["decision"]).intent
+        control = {
+            "execute_forecast_plan": "forecast_execute_request",
+            "new_news_analysis": "news_analysis_request",
+        }.get(intent, "forecast_plan_request")
+        return {
+            "phase": "awaiting_user",
+            "control": control,
+            "assistant_message": "",
+            "events": _event(
+                state,
+                {
+                    "forecast_plan_request": "移交固定预测方案入口",
+                    "forecast_execute_request": "校验预测方案确认入口",
+                    "news_analysis_request": "移交电价新闻分析入口",
+                }[control],
+                trace_category="plan",
+                forecast_control=control,
+            ),
+        }
 
     def confirm_existing_plan(state: ResearchLoopState) -> dict[str, Any]:
+        active = _scope(state) or _plan(state)
         return {
             "phase": "validating_plan",
             "control": "validate",
             "plan_origin": "explicit_confirm",
             "events": _event(
                 state,
-                f"确认已有方案：{(_plan(state).plan_id if _plan(state) else 'unknown')}",
+                f"确认已有研究范围或方案：{getattr(active, 'scope_id', None) or getattr(active, 'plan_id', 'unknown')}",
                 trace_category="plan",
             ),
         }
@@ -715,8 +1131,115 @@ def build_research_workflow(
 
     def revise_user_plan(state: ResearchLoopState) -> dict[str, Any]:
         plan = _plan(state)
+        scope = _scope(state)
         config = _config(state)
         decision = DialogueDecision.model_validate(state["decision"])
+        if scope is not None and plan is None and config is not None:
+            changed_fields = (
+                decision.objective,
+                decision.enabled_functions,
+                decision.selected_variables,
+            )
+            if all(value is None for value in changed_fields):
+                packet = FeedbackPacket(
+                    source="plan_validator",
+                    code="empty_scope_revision",
+                    severity="error",
+                    message="没有识别到研究目标、工具范围或变量范围的具体修改。",
+                    retryable=True,
+                )
+                return {
+                    "phase": "awaiting_user",
+                    "control": "need_user",
+                    "feedback_packets": _append_feedback(state, packet),
+                    "user_interrupt_kind": "plan_error",
+                }
+            functions = (
+                list(scope.authorized_functions)
+                if decision.enabled_functions is None
+                else list(dict.fromkeys(decision.enabled_functions))
+            )
+            functions = [name for name in functions if name != "data_quality"]
+            outside_functions = sorted(set(functions).difference(scope.authorized_functions))
+            variables = (
+                list(scope.authorized_variables)
+                if decision.selected_variables is None
+                else list(dict.fromkeys(decision.selected_variables))
+            )
+            outside_variables = sorted(set(variables).difference(scope.authorized_variables))
+            if outside_functions or outside_variables:
+                packet = FeedbackPacket(
+                    source="plan_validator",
+                    code="scope_revision_expands_authority",
+                    severity="error",
+                    message="研究范围修改只能收窄；新增工具或变量需要重新发起研究。",
+                    observed={"functions": outside_functions, "variables": outside_variables},
+                    requires_user=True,
+                )
+                return {
+                    "phase": "awaiting_user",
+                    "control": "need_user",
+                    "feedback_packets": _append_feedback(state, packet),
+                    "user_interrupt_kind": "plan_error",
+                }
+            revised_scope = scope.model_copy(
+                update={
+                    "scope_id": uuid4().hex[:12],
+                    "revision": scope.revision + 1,
+                    "objective": decision.objective or scope.objective,
+                    "authorized_functions": functions,
+                    "authorized_variables": variables,
+                }
+            )
+            if scope_fingerprint(revised_scope) == scope_fingerprint(scope):
+                packet = FeedbackPacket(
+                    source="plan_validator",
+                    code="unchanged_scope_revision",
+                    severity="error",
+                    message="修改内容与当前研究范围相同，请说明要收窄的目标、工具或变量。",
+                    retryable=True,
+                )
+                return {
+                    "phase": "awaiting_user",
+                    "control": "need_user",
+                    "feedback_packets": _append_feedback(state, packet),
+                    "user_interrupt_kind": "plan_error",
+                }
+            assistant_message = decision.response.strip() or "已按你的要求收窄研究范围，请重新确认。"
+            return {
+                "research_scope": revised_scope.model_dump(mode="json"),
+                "plan_history": [*state.get("plan_history", []), revised_scope.model_dump(mode="json")],
+                "plan_fingerprints": [
+                    *state.get("plan_fingerprints", []),
+                    scope_fingerprint(revised_scope),
+                ],
+                "feedback_history": _archive_feedback(state),
+                "feedback_packets": [],
+                "plan_origin": "user_revision",
+                "return_to_gate": None,
+                "phase": "validating_plan",
+                "control": "validate",
+                "stop_reason": None,
+                "user_interrupt_kind": None,
+                "assistant_message": assistant_message,
+                "messages": _bounded_graph_messages(
+                    [
+                        *state.get("messages", []),
+                        _conversation_message(
+                            role="assistant",
+                            content=assistant_message,
+                            turn_id=state.get("active_turn_id"),
+                            episode_id=_cursor(state).episode_id,
+                        ),
+                    ]
+                ),
+                "events": _event(
+                    state,
+                    f"修订研究范围：{revised_scope.scope_id}",
+                    trace_category="plan",
+                    revision=revised_scope.revision,
+                ),
+            }
         if plan is None or config is None:
             packet = FeedbackPacket(
                 source="plan_validator",
@@ -846,7 +1369,16 @@ def build_research_workflow(
         feedback = _feedback(state)
         origin = state.get("plan_origin", "initial")
         try:
-            if origin == "automatic_evaluation" and _plan(state) is not None:
+            if dynamic_agent is not None and origin != "automatic_evaluation":
+                scope_proposal = planning.propose_scope(
+                    question=_episode_goal(state),
+                    study_config=config,
+                    conversation=_messages(state),
+                    progress=noop_progress,
+                    skill=skill,
+                )
+                proposal = None
+            elif origin == "automatic_evaluation" and _plan(state) is not None:
                 proposal = planning.revise_from_feedback(
                     current_plan=_plan(state),  # type: ignore[arg-type]
                     study_config=config,
@@ -871,6 +1403,7 @@ def build_research_workflow(
                     skill=skill,
                     feedback=feedback,
                 )
+                scope_proposal = None
         except Exception as exc:  # noqa: BLE001 - model/validator boundary
             packet = exception_feedback(exc, source="plan_validator", retryable=True)
             failure_fingerprint = canonical_hash(
@@ -909,6 +1442,52 @@ def build_research_workflow(
                     "warning",
                     trace_category="error",
                     error=packet.message,
+                ),
+            }
+        if dynamic_agent is not None and origin != "automatic_evaluation":
+            scope = scope_proposal.scope
+            fingerprint = scope_fingerprint(scope)
+            if fingerprint in state.get("plan_fingerprints", []):
+                packet = budget_feedback(budget, code="duplicate_scope", message="模型生成了重复研究范围。")
+                return {
+                    "phase": "awaiting_user",
+                    "control": "need_user",
+                    "feedback_packets": _append_feedback(state, packet),
+                    "stop_reason": packet.message,
+                    "user_interrupt_kind": "plan_error",
+                    "loop_cursor": cursor.model_dump(mode="json"),
+                    "budget": budget.model_dump(mode="json"),
+                }
+            scope_payload = scope.model_dump(mode="json")
+            return {
+                "phase": "validating_plan",
+                "control": "validate",
+                "user_interrupt_kind": None,
+                "feedback_history": _archive_feedback(state),
+                "feedback_packets": [],
+                "loop_cursor": cursor.model_dump(mode="json"),
+                "research_scope": scope_payload,
+                "current_plan": None,
+                "data_profile": scope_proposal.data_profile.model_dump(mode="json"),
+                "data_summary": summary_payload(scope_proposal.data_summary),
+                "quality_report": scope_proposal.quality_report.model_dump(mode="json"),
+                "plan_history": [*state.get("plan_history", []), scope_payload],
+                "plan_fingerprints": [*state.get("plan_fingerprints", []), fingerprint],
+                "budget": budget.model_copy(
+                    update={
+                        "max_model_rounds": scope.max_model_rounds,
+                        "max_tool_calls": scope.max_tool_calls,
+                        "max_function_attempts_per_call": scope.max_attempts_per_call,
+                    }
+                ).model_dump(mode="json"),
+                "assistant_message": scope_proposal.assistant_message,
+                "stop_reason": None,
+                "events": _event(
+                    state,
+                    f"生成研究范围：{scope.scope_id} · {_short(scope.objective, 42)}",
+                    trace_category="plan",
+                    scope_id=scope.scope_id,
+                    authorized_functions=scope.authorized_functions,
                 ),
             }
         fingerprint = plan_fingerprint(proposal.plan)
@@ -953,7 +1532,46 @@ def build_research_workflow(
 
     def validate_plan(state: ResearchLoopState) -> dict[str, Any]:
         plan = _plan(state)
+        scope = _scope(state)
         config = _config(state)
+        if scope is not None:
+            if config is None:
+                packet = FeedbackPacket(
+                    source="plan_validator",
+                    code="missing_scope_config",
+                    severity="fatal",
+                    message="研究范围缺少运行数据契约。",
+                    requires_user=True,
+                )
+                return {
+                    "phase": "awaiting_user",
+                    "control": "need_user",
+                    "feedback_packets": _append_feedback(state, packet),
+                    "user_interrupt_kind": "plan_error",
+                }
+            try:
+                execution.prepare_scope(scope=scope, study_config=config)
+            except Exception as exc:  # noqa: BLE001 - scope validation boundary
+                packet = exception_feedback(exc, source="plan_validator", requires_user=True)
+                return {
+                    "phase": "awaiting_user",
+                    "control": "need_user",
+                    "feedback_packets": _append_feedback(state, packet),
+                    "stop_reason": packet.message,
+                    "user_interrupt_kind": "plan_error",
+                }
+            control = "lock" if _scope_approval_matches(state, scope) else "approval"
+            return {
+                "phase": "validating_plan",
+                "control": control,
+                "user_interrupt_kind": None,
+                "events": _event(
+                    state,
+                    f"研究范围校验通过：{scope.scope_id}",
+                    trace_category="plan",
+                    authorized_functions=scope.authorized_functions,
+                ),
+            }
         if plan is None or config is None:
             packet = FeedbackPacket(
                 source="plan_validator",
@@ -1083,6 +1701,7 @@ def build_research_workflow(
             "episode_summaries": episode_summaries,
             "active_skill": None,
             "current_plan": None,
+            "research_scope": None,
             "plan_history": [],
             "plan_fingerprints": [],
             "planning_failure_fingerprints": [],
@@ -1096,6 +1715,13 @@ def build_research_workflow(
             "tool_result_cache": {},
             "tool_results": [],
             "pending_tool_result": None,
+            "analysis_messages": [],
+            "model_round": 0,
+            "tool_calls_used": 0,
+            "current_tool_batch": [],
+            "provider_call_groups": {},
+            "call_evidence": [],
+            "pending_analysis_text": "",
             "evaluation": None,
             "eda_summary": None,
             "feedback_packets": [],
@@ -1123,12 +1749,13 @@ def build_research_workflow(
 
     def prepare_approval(state: ResearchLoopState) -> dict[str, Any]:
         plan = _plan(state)
+        scope = _scope(state)
         timeout = int(state.get("approval_timeout_seconds", 30))
         automatic_approval_enabled = bool(state.get("automatic_approval_enabled", False))
         approval = ApprovalState(
             status="waiting",
-            plan_id=plan.plan_id if plan else None,
-            plan_fingerprint=plan_fingerprint(plan) if plan else None,
+            plan_id=scope.scope_id if scope else (plan.plan_id if plan else None),
+            plan_fingerprint=scope_fingerprint(scope) if scope else (plan_fingerprint(plan) if plan else None),
             deadline=(datetime.now(UTC) + timedelta(seconds=timeout)).isoformat()
             if automatic_approval_enabled
             else None,
@@ -1161,6 +1788,7 @@ def build_research_workflow(
             message="请确认、拒绝，或继续询问和修改当前研究方案。",
             choices=["approve", "modify", "reject", "followup"],
             plan=state.get("current_plan"),
+            scope=state.get("research_scope"),
             deadline=approval.deadline,
             remaining_seconds=approval.remaining_seconds,
         )
@@ -1308,6 +1936,74 @@ def build_research_workflow(
 
     def lock_plan(state: ResearchLoopState) -> dict[str, Any]:
         try:
+            scope = _scope(state)
+            if scope is not None:
+                config = _config(state)
+                if config is None or dynamic_agent is None:
+                    raise ResearchPlanValidationError("动态研究范围缺少执行组件")
+                if not _scope_approval_matches(state, scope):
+                    raise ResearchPlanValidationError("当前研究范围没有匹配的用户审批")
+                approval = ApprovalState.model_validate(state["approval_state"])
+                envelope = scope_authorization_envelope(scope, approved_at=approval.approved_at or _now())
+                validate_scope_authorization(scope, envelope)
+                preflight = execution.compile_dynamic_call(
+                    scope=scope,
+                    study_config=config,
+                    name="data_quality",
+                    arguments={},
+                    sequence=1,
+                )
+                preflight_payload = preflight.model_dump(mode="json")
+                record = ToolCallRecord(call=preflight_payload)
+                provider_id = "system-preflight-data-quality"
+                group = ToolCallGroupRecord(
+                    provider_call_id=provider_id,
+                    requested_name="data_quality",
+                    requested_version=FUNCTION_CATALOG["data_quality"].version,
+                    child_call_ids=[preflight.call_id],
+                    origin="system_preflight",
+                )
+                budget = _budget(state).model_copy(
+                    update={
+                        "max_model_rounds": scope.max_model_rounds,
+                        "max_tool_calls": scope.max_tool_calls,
+                        "max_function_attempts_per_call": scope.max_attempts_per_call,
+                    }
+                )
+                initial_messages = dynamic_agent.initial_messages(
+                    scope=scope,
+                    quality_report=state.get("quality_report", {}),
+                    data_profile=state.get("data_profile"),
+                )
+                return {
+                    "phase": "executing_tools",
+                    "control": "execute",
+                    "authorization_envelope": envelope.model_dump(mode="json"),
+                    "tool_queue": [preflight_payload],
+                    "current_tool_batch": [preflight_payload],
+                    "tool_cursor": 0,
+                    "tool_records": {preflight.call_id: record.model_dump(mode="json")},
+                    "tool_results": [],
+                    "pending_tool_result": None,
+                    "analysis_messages": [message.model_dump(mode="json") for message in initial_messages],
+                    "provider_call_groups": {provider_id: group.model_dump(mode="json")},
+                    "process_call_steps": {
+                        preflight.call_id: (
+                            f"{_cursor(state).episode_id or state['thread_id']}-system-preflight"
+                        )
+                    },
+                    "call_evidence": [],
+                    "model_round": 0,
+                    "tool_calls_used": 0,
+                    "budget": budget.model_dump(mode="json"),
+                    "events": _event(
+                        state,
+                        f"锁定动态研究范围：{scope.scope_id}",
+                        trace_category="plan",
+                        calls=0,
+                        functions=scope.authorized_functions,
+                    ),
+                }
             plan = _plan(state)
             if plan is None:
                 raise ResearchPlanValidationError("无法锁定空方案")
@@ -1385,6 +2081,13 @@ def build_research_workflow(
             "tool_queue": queue,
             "tool_cursor": 0,
             "tool_records": records,
+            "process_call_steps": {
+                ToolCall.model_validate(item).call_id: (
+                    f"{_cursor(state).episode_id or state['thread_id']}-"
+                    f"plan-{ToolCall.model_validate(item).step_id}"
+                )
+                for item in queue
+            },
             "tool_results": [],
             "pending_tool_result": None,
             "events": _event(
@@ -1404,6 +2107,12 @@ def build_research_workflow(
         cursor = int(state.get("tool_cursor", 0))
         queue = state.get("tool_queue", [])
         if cursor >= len(queue):
+            if _scope(state) is not None:
+                return {
+                    "control": "select",
+                    "phase": "executing_tools",
+                    "pending_tool_result": None,
+                }
             return {
                 "control": "evaluate",
                 "phase": "evaluating",
@@ -1412,6 +2121,22 @@ def build_research_workflow(
         call = ToolCall.model_validate(queue[cursor])
         records = dict(state.get("tool_records", {}))
         record = ToolCallRecord.model_validate(records[call.call_id])
+        if record.status == "pending" and record.result is None:
+            cached_payload = state.get("tool_result_cache", {}).get(call.work_id)
+            if cached_payload is not None:
+                rebound = result_store.get(state["thread_id"], cached_payload, call=call)
+                scope = _scope(state)
+                if scope is not None:
+                    execution.validate_scope_result(scope=scope, call=call, result=rebound)
+                else:
+                    plan = _plan(state)
+                    if plan is None:
+                        raise ResearchPlanValidationError("复用函数结果时缺少计划或研究范围")
+                    execution.validate_tool_result(plan=plan, call=call, result=rebound)
+                record.status = "reused"
+                record.result = result_store.bind(state["thread_id"], cached_payload, call)
+                record.finished_at = _now()
+                records[call.call_id] = record.model_dump(mode="json")
         if record.status in {"completed", "reused"} and record.result is not None:
             result_reference = next(
                 (
@@ -1432,11 +2157,29 @@ def build_research_workflow(
             results = list(state.get("tool_results", []))
             if not any(item["call"]["call_id"] == call.call_id for item in results):
                 results.append(rebound_reference)
+            process_history, started = _action_started_events(
+                {**state, "tool_records": records}, call
+            )
+            completed = _process_event(
+                state,
+                "action_completed",
+                step_id=started.step_id,
+                round_number=started.round,
+                source=started.source,
+                sequence=started.sequence + 1,
+                title=started.title,
+                action_id=started.action_id,
+                tool_name=call.name,
+                result="复用已校验的相同数据、函数版本和参数结果",
+            )
+            _emit_process_event(completed)
+            process_history = append_process_events(process_history, completed)
             return {
                 "tool_records": records,
                 "tool_results": results,
                 "control": "advance",
                 "pending_tool_result": None,
+                "process_events": process_history,
                 "events": _event(
                     state,
                     f"复用函数结果：{_function_label(call.name)}",
@@ -1445,6 +2188,12 @@ def build_research_workflow(
                     function=call.name,
                 ),
             }
+        if _scope(state) is not None and record.status == "cancelled":
+            return {
+                "tool_records": records,
+                "control": "advance",
+                "pending_tool_result": None,
+            }
         budget = _budget(state)
         attempt_count = record.attempts
         if (
@@ -1452,6 +2201,13 @@ def build_research_workflow(
             and attempt_count >= budget.max_function_attempts_per_call
         ):
             packet = budget_feedback(budget, code="tool_retry_budget", message=f"工具 {call.name} 重试耗尽。")
+            if _scope(state) is not None and call.name != "data_quality":
+                return _dynamic_tool_error_update(
+                    state,
+                    call=call,
+                    packet=packet,
+                    force_user=True,
+                )
             return {
                 "phase": "awaiting_user",
                 "control": "need_user",
@@ -1469,10 +2225,14 @@ def build_research_workflow(
         record.attempts += 1
         record.started_at = _now()
         records[call.call_id] = record.model_dump(mode="json")
+        process_history, _started = _action_started_events(
+            {**state, "tool_records": records}, call
+        )
         return {
             "tool_records": records,
             "budget": budget.model_dump(mode="json"),
             "control": "run",
+            "process_events": process_history,
             "loop_cursor": _cursor(state).model_copy(
                 update={
                     "episode_status": "executing",
@@ -1514,27 +2274,182 @@ def build_research_workflow(
                 ),
             }
 
-    def route_mark_tool(state: ResearchLoopState) -> Literal["run", "advance", "evaluate", "need_user", "fail"]:
+    def route_mark_tool(state: ResearchLoopState) -> Literal["run", "advance", "evaluate", "select", "need_user", "fail"]:
         control = state.get("control", "run")
-        return control if control in {"advance", "evaluate", "need_user", "fail"} else "run"  # type: ignore[return-value]
+        return control if control in {"advance", "evaluate", "select", "need_user", "fail"} else "run"  # type: ignore[return-value]
+
+    def _dynamic_tool_error_update(
+        state: ResearchLoopState,
+        *,
+        call: ToolCall,
+        packet: FeedbackPacket,
+        force_user: bool = False,
+    ) -> dict[str, Any]:
+        """Close the failed provider call while preserving independent batch work."""
+
+        records = dict(state.get("tool_records", {}))
+        groups = {
+            key: ToolCallGroupRecord.model_validate(value)
+            for key, value in state.get("provider_call_groups", {}).items()
+        }
+        batch_ids = {
+            ToolCall.model_validate(item).call_id for item in state.get("current_tool_batch", [])
+        }
+        messages = [ModelMessage.model_validate(item) for item in state.get("analysis_messages", [])]
+        evidence = list(state.get("call_evidence", []))
+        existing_evidence = {str(item.get("call_id")) for item in evidence}
+        target_provider_ids = {
+            provider_id
+            for provider_id, group in groups.items()
+            if call.call_id in group.child_call_ids
+        }
+        if len(target_provider_ids) != 1:
+            raise ResearchPlanValidationError(
+                f"本地调用 {call.call_id} 没有唯一的 provider call group"
+            )
+
+        provider_messages = 0
+        new_evidence = 0
+        for provider_id, group in groups.items():
+            if group.origin == "system_preflight" or not set(group.child_call_ids).intersection(batch_ids):
+                continue
+            is_target_group = provider_id in target_provider_ids
+            if not is_target_group and not force_user:
+                # A repairable failure belongs only to its provider call. Other
+                # independent calls in the assistant batch remain executable.
+                continue
+            child_errors = []
+            child_results = []
+            for child_id in group.child_call_ids:
+                if child_id not in batch_ids:
+                    continue
+                child_record = ToolCallRecord.model_validate(records[child_id])
+                child_call = ToolCall.model_validate(child_record.call)
+                if child_record.status in {"completed", "reused"} and child_record.result is not None:
+                    result = result_store.get(
+                        state["thread_id"], child_record.result, call=child_call
+                    )
+                    result_payload = tool_result_payload(
+                        child_call,
+                        result,
+                        status="completed" if child_record.status == "completed" else "reused",
+                    )
+                    result_payload["call_id"] = child_id
+                    child_results.append(result_payload)
+                    if child_id not in existing_evidence:
+                        evidence.append(
+                            CallEvidenceRecord(
+                                sequence=int(child_call.step_id[1:]),
+                                call_id=child_call.call_id,
+                                provider_call_id=provider_id,
+                                origin=group.origin,
+                                function=child_call.name,
+                                function_version=child_call.version,
+                                arguments=child_call.arguments,
+                                result=child_record.result,
+                                data_fingerprint=result.data_fingerprint,
+                                output_hash=result.output_hash,
+                                status=child_record.status,
+                            ).model_dump(mode="json")
+                        )
+                        existing_evidence.add(child_id)
+                        if child_record.status == "completed":
+                            new_evidence += 1
+                    continue
+
+                is_failed_child = child_id == call.call_id
+                child_record.status = "failed" if is_failed_child else "cancelled"
+                cancellation_packet = FeedbackPacket(
+                    source="tool_executor",
+                    code="cancelled_due_to_batch_abort",
+                    severity="warning",
+                    message="同批次因其他调用失败而取消。",
+                    step_id=child_id,
+                    retryable=False,
+                    requires_user=force_user,
+                )
+                child_record.error = packet if is_failed_child else cancellation_packet
+                child_record.finished_at = _now()
+                records[child_id] = child_record.model_dump(mode="json")
+                child_errors.append(
+                    {
+                        "call_id": child_id,
+                        "function": child_call.name,
+                        "status": child_record.status,
+                        "code": packet.code if is_failed_child else "cancelled_due_to_batch_abort",
+                        "error": (
+                            packet.message
+                            if is_failed_child
+                            else cancellation_packet.message
+                        ),
+                    }
+                )
+            group.status = "failed" if is_target_group else "cancelled"
+            groups[provider_id] = group
+            messages.append(
+                build_tool_error_feedback(
+                    group,
+                    retryable=packet.retryable,
+                    results=child_results,
+                    errors=child_errors,
+                )
+            )
+            provider_messages += 1
+
+        budget = _budget(state)
+        if force_user:
+            budget.no_progress_rounds = 0 if new_evidence else budget.no_progress_rounds + 1
+        needs_user = force_user or provider_messages == 0
+        serialized_groups = {
+            key: value.model_dump(mode="json") for key, value in groups.items()
+        }
+        validate_analysis_message_protocol(
+            messages,
+            serialized_groups,
+            allow_pending_current_batch=not needs_user,
+        )
+        return {
+            "phase": "awaiting_user" if needs_user else "executing_tools",
+            "control": "need_user" if needs_user else "advance",
+            "tool_queue": [] if needs_user else list(state.get("tool_queue", [])),
+            "current_tool_batch": [] if needs_user else list(state.get("current_tool_batch", [])),
+            "tool_cursor": 0 if needs_user else int(state.get("tool_cursor", 0)),
+            "tool_records": records,
+            "provider_call_groups": serialized_groups,
+            "analysis_messages": [message.model_dump(mode="json") for message in messages],
+            "call_evidence": evidence,
+            "pending_tool_result": None,
+            "feedback_packets": _append_feedback(state, packet),
+            "budget": budget.model_dump(mode="json"),
+            "user_interrupt_kind": "plan_error" if needs_user else None,
+            "stop_reason": packet.message if needs_user else None,
+        }
 
     def execute_tool(state: ResearchLoopState) -> dict[str, Any]:
         call: ToolCall | None = None
+        scope: EDAResearchScope | None = None
         try:
             cursor = int(state.get("tool_cursor", 0))
             call = ToolCall.model_validate(state["tool_queue"][cursor])
             plan = _plan(state)
             config = _config(state)
-            if plan is None or config is None:
+            scope = _scope(state)
+            if config is None or (plan is None and scope is None):
                 raise ResearchPlanValidationError("工具执行缺少计划或配置")
-            result = execution.execute_call(
-                plan=plan,
-                study_config=config,
-                call=call,
-                validate_result=False,
-            )
+            if scope is not None:
+                result = execution.execute_scope_call(
+                    scope=scope,
+                    study_config=config,
+                    call=call,
+                )
+            else:
+                result = execution.execute_call(
+                    plan=plan,
+                    study_config=config,
+                    call=call,
+                    validate_result=False,
+                )
         except Exception as exc:  # noqa: BLE001 - tool boundary
-            transient = isinstance(exc, (OSError, TimeoutError))
             permission_or_data = isinstance(
                 exc,
                 (
@@ -1545,6 +2460,7 @@ def build_research_workflow(
                     InsufficientDataError,
                 ),
             )
+            transient = isinstance(exc, (OSError, TimeoutError)) and not permission_or_data
             plan_error = isinstance(
                 exc,
                 (ToolExecutionError, ResearchPlanValidationError, ToolRegistryError, RepairablePlanError),
@@ -1556,6 +2472,15 @@ def build_research_workflow(
                 retryable=transient or plan_error,
                 requires_user=permission_or_data,
             )
+            if scope is not None and call is not None and plan_error and call.name != "data_quality":
+                update = _dynamic_tool_error_update(state, call=call, packet=packet)
+                update["process_events"] = _action_finished_events(
+                    state,
+                    call,
+                    result=_short(packet.message, 120),
+                    failed=True,
+                )
+                return update
             outcome = (
                 "retry"
                 if transient
@@ -1568,6 +2493,26 @@ def build_research_workflow(
                         "recommendation": "当前工具异常无法安全恢复，研究循环已停止。",
                     }
                 )
+            if (
+                scope is not None
+                and call is not None
+                and call.name != "data_quality"
+                and outcome in {"need_user", "fail"}
+            ):
+                update = _dynamic_tool_error_update(
+                    state,
+                    call=call,
+                    packet=packet,
+                    force_user=True,
+                )
+                update["process_events"] = _action_finished_events(
+                    state,
+                    call,
+                    result=_short(packet.message, 120),
+                    failed=True,
+                    complete_step=True,
+                )
+                return update
             records = dict(state.get("tool_records", {}))
             if call is not None and call.call_id in records:
                 record = ToolCallRecord.model_validate(records[call.call_id])
@@ -1582,6 +2527,17 @@ def build_research_workflow(
                 "feedback_packets": _append_feedback(state, packet),
                 "pending_tool_result": None,
                 "stop_reason": packet.message if outcome in {"need_user", "fail"} else None,
+                "process_events": (
+                    _action_finished_events(
+                        state,
+                        call,
+                        result=_short(packet.message, 120),
+                        failed=True,
+                        complete_step=outcome in {"need_user", "fail"} or scope is None,
+                    )
+                    if call is not None
+                    else list(state.get("process_events", []))
+                ),
                 "events": _event(
                     state,
                     f"函数执行失败：{_function_label(call.name)} · {_short(packet.message, 36)}",
@@ -1609,7 +2565,7 @@ def build_research_workflow(
 
     def route_tool_execution(
         state: ResearchLoopState,
-    ) -> Literal["validate", "retry", "revise", "need_user", "stop", "advance", "fail"]:
+    ) -> Literal["validate", "retry", "revise", "need_user", "stop", "advance", "select", "fail"]:
         return state.get("control", "stop")  # type: ignore[return-value]
 
     def _validate_tool_result(state: ResearchLoopState) -> dict[str, Any]:
@@ -1617,12 +2573,26 @@ def build_research_workflow(
         call = ToolCall.model_validate(state["tool_queue"][cursor])
         result = ToolResult.model_validate(state["pending_tool_result"])
         try:
-            plan = _plan(state)
-            if plan is None:
-                raise ResearchPlanValidationError("结果校验缺少锁定计划")
-            execution.validate_tool_result(plan=plan, call=call, result=result)
+            scope = _scope(state)
+            if scope is not None:
+                execution.validate_scope_result(scope=scope, call=call, result=result)
+            else:
+                plan = _plan(state)
+                if plan is None:
+                    raise ResearchPlanValidationError("结果校验缺少锁定计划")
+                execution.validate_tool_result(plan=plan, call=call, result=result)
         except Exception as exc:  # noqa: BLE001 - result-validator boundary
             packet = exception_feedback(exc, source="tool_result_validator", step_id=call.call_id, retryable=True)
+            if scope is not None and call.name != "data_quality":
+                update = _dynamic_tool_error_update(state, call=call, packet=packet)
+                update["process_events"] = _action_finished_events(
+                    state,
+                    call,
+                    result=_short(packet.message, 120),
+                    failed=True,
+                    complete_step=False,
+                )
+                return update
             records = dict(state.get("tool_records", {}))
             record = ToolCallRecord.model_validate(records[call.call_id])
             record.status = "failed"
@@ -1634,6 +2604,13 @@ def build_research_workflow(
                 "control": "revise",
                 "tool_records": records,
                 "pending_tool_result": None,
+                "process_events": _action_finished_events(
+                    state,
+                    call,
+                    result=_short(packet.message, 120),
+                    failed=True,
+                    complete_step=scope is None,
+                ),
                 "feedback_packets": _append_feedback(state, packet),
                 "events": _event(
                     state,
@@ -1657,6 +2634,13 @@ def build_research_workflow(
         result_cache[call.work_id] = result_reference
         while len(result_cache) > MAX_TOOL_RESULT_CACHE:
             result_cache.pop(next(iter(result_cache)))
+        process_history = _action_finished_events(
+            state,
+            call,
+            result=_process_result_summary(result),
+            complete_step=scope is None,
+            report_path=_process_report_path(result),
+        )
         return {
             "phase": "executing_tools",
             "control": "advance",
@@ -1664,6 +2648,7 @@ def build_research_workflow(
             "tool_result_cache": result_cache,
             "tool_results": [*state.get("tool_results", []), result_reference],
             "pending_tool_result": None,
+            "process_events": process_history,
             "events": _event(
                 state,
                 f"函数结果校验通过：{_function_label(call.name)}",
@@ -1701,6 +2686,545 @@ def build_research_workflow(
             "pending_tool_result": None,
         }
 
+    def complete_tool_batch(state: ResearchLoopState) -> dict[str, Any]:
+        scope = _scope(state)
+        if scope is None:
+            return {"control": "evaluate", "phase": "evaluating"}
+        batch = [ToolCall.model_validate(item) for item in state.get("current_tool_batch", [])]
+        records = dict(state.get("tool_records", {}))
+        groups = {
+            key: ToolCallGroupRecord.model_validate(value)
+            for key, value in state.get("provider_call_groups", {}).items()
+        }
+        messages = [ModelMessage.model_validate(item) for item in state.get("analysis_messages", [])]
+        evidence = list(state.get("call_evidence", []))
+        existing_call_ids = {str(item.get("call_id")) for item in evidence}
+        batch_ids = {call.call_id for call in batch}
+        new_evidence = 0
+
+        for provider_id, group in groups.items():
+            if (
+                not set(group.child_call_ids).intersection(batch_ids)
+                or group.status in {"completed", "failed", "cancelled"}
+            ):
+                continue
+            child_payloads = []
+            for child_id in group.child_call_ids:
+                call = next(item for item in batch if item.call_id == child_id)
+                record = ToolCallRecord.model_validate(records[child_id])
+                if record.result is None:
+                    raise ResearchPlanValidationError(f"动态调用 {child_id} 缺少结果引用")
+                result = result_store.get(state["thread_id"], record.result, call=call)
+                child_payloads.append(
+                    tool_result_payload(
+                        call,
+                        result,
+                        status="completed" if record.status == "completed" else "reused",
+                    )
+                )
+                if child_id not in existing_call_ids:
+                    evidence.append(
+                        CallEvidenceRecord(
+                            sequence=int(call.step_id[1:]),
+                            call_id=call.call_id,
+                            provider_call_id=provider_id,
+                            origin=group.origin,
+                            function=call.name,
+                            function_version=call.version,
+                            arguments=call.arguments,
+                            result=record.result,
+                            data_fingerprint=result.data_fingerprint,
+                            output_hash=result.output_hash,
+                            status=record.status,
+                        ).model_dump(mode="json")
+                    )
+                    existing_call_ids.add(child_id)
+                    if record.status == "completed":
+                        new_evidence += 1
+            group.status = "completed"
+            groups[provider_id] = group
+            if group.origin != "system_preflight":
+                messages.append(build_tool_feedback(group, child_payloads))
+
+        budget = _budget(state)
+        validate_analysis_message_protocol(
+            messages,
+            {key: value.model_dump(mode="json") for key, value in groups.items()},
+            allow_pending_current_batch=False,
+        )
+        if any(group.origin != "system_preflight" and set(group.child_call_ids).intersection(batch_ids) for group in groups.values()):
+            budget.no_progress_rounds = 0 if new_evidence else budget.no_progress_rounds + 1
+        process_history = list(state.get("process_events", []))
+        call_steps = state.get("process_call_steps", {})
+        batch_step_ids = list(
+            dict.fromkeys(call_steps.get(call.call_id) for call in batch if call_steps.get(call.call_id))
+        )
+        for step_id in batch_step_ids:
+            if any(
+                item.get("step_id") == step_id and item.get("event_type") == "step_completed"
+                for item in process_history
+            ):
+                continue
+            related = [call for call in batch if call_steps.get(call.call_id) == step_id]
+            sample = related[0]
+            _resolved_step, round_number, source, _basis = _call_process_context(state, sample)
+            completed = _process_event(
+                state,
+                "step_completed",
+                step_id=step_id,
+                round_number=round_number,
+                source=source,
+                title="步骤完成",
+                result=f"{len(related)} 个行动已完成",
+                sequence=(
+                    max(
+                        (int(item.get("sequence", 0)) for item in process_history),
+                        default=0,
+                    )
+                    + 1
+                ),
+            )
+            _emit_process_event(completed)
+            process_history = append_process_events(process_history, completed)
+        if budget.no_progress_rounds >= 2:
+            packet = budget_feedback(budget, code="no_new_evidence", message="连续两轮没有新增分析证据。")
+            return {
+                "phase": "awaiting_user",
+                "control": "need_user",
+                "feedback_packets": _append_feedback(state, packet),
+                "user_interrupt_kind": "result_limitations",
+                "tool_queue": [],
+                "current_tool_batch": [],
+                "tool_cursor": 0,
+                "analysis_messages": [message.model_dump(mode="json") for message in messages],
+                "provider_call_groups": {key: value.model_dump(mode="json") for key, value in groups.items()},
+                "call_evidence": evidence,
+                "budget": budget.model_dump(mode="json"),
+                "process_events": process_history,
+            }
+        return {
+            "phase": "executing_tools",
+            "control": "select",
+            "tool_queue": [],
+            "current_tool_batch": [],
+            "tool_cursor": 0,
+            "analysis_messages": [message.model_dump(mode="json") for message in messages],
+            "provider_call_groups": {key: value.model_dump(mode="json") for key, value in groups.items()},
+            "call_evidence": evidence,
+            "budget": budget.model_dump(mode="json"),
+            "process_events": process_history,
+        }
+
+    def _selector_protocol_retry(
+        state: ResearchLoopState,
+        *,
+        scope: EDAResearchScope,
+        budget: LoopBudget,
+        messages: list[ModelMessage],
+        packet: FeedbackPacket,
+    ) -> dict[str, Any]:
+        """Reject an invalid provider turn without persisting its assistant calls."""
+
+        budget.no_progress_rounds += 1
+        messages.append(
+            ModelMessage(
+                role="user",
+                content=json.dumps(
+                    {
+                        "internal_protocol_feedback": {
+                            "code": packet.code,
+                            "message": packet.message,
+                            "instruction": (
+                                "重新生成整个工具回合；每个 provider call_id 必须非空、"
+                                "在当前及历史回合中唯一。"
+                            ),
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        )
+        needs_user = (
+            budget.no_progress_rounds >= 2
+            or budget.model_rounds_used >= scope.max_model_rounds
+        )
+        process_history = list(state.get("process_events", []))
+        current = next(
+            (
+                ProcessEvent.model_validate(item)
+                for item in reversed(process_history)
+                if item.get("event_type") == "thinking_started"
+            ),
+            None,
+        )
+        if current is not None:
+            completed = _process_event(
+                state,
+                "step_completed",
+                step_id=current.step_id,
+                round_number=current.round,
+                source=current.source,
+                title="模型响应无效",
+                result=_short(packet.message, 120),
+            )
+            _emit_process_event(completed)
+            process_history = append_process_events(process_history, completed)
+        return {
+            "phase": "awaiting_user" if needs_user else "executing_tools",
+            "control": "need_user" if needs_user else "select",
+            "analysis_messages": [message.model_dump(mode="json") for message in messages],
+            "feedback_packets": _append_feedback(state, packet),
+            "budget": budget.model_dump(mode="json"),
+            "model_round": budget.model_rounds_used,
+            "user_interrupt_kind": "response_error" if needs_user else None,
+            "stop_reason": packet.message if needs_user else None,
+            "process_events": process_history,
+            "events": _event(
+                state,
+                f"拒绝非法模型工具回合：{packet.code}",
+                "warning",
+                trace_category="error",
+            ),
+        }
+
+    def analysis_selector(state: ResearchLoopState) -> dict[str, Any]:
+        scope = _scope(state)
+        config = _config(state)
+        if scope is None or config is None or dynamic_agent is None:
+            raise ResearchPlanValidationError("动态分析选择器缺少研究范围或模型组件")
+        envelope = AuthorizationEnvelope.model_validate(state.get("authorization_envelope", {}))
+        validate_scope_authorization(scope, envelope)
+        budget = _budget(state)
+        if not scope.authorized_functions:
+            completed_calls = [
+                ToolCall.model_validate(record["call"])
+                for record in state.get("tool_records", {}).values()
+                if record.get("status") in {"completed", "reused"}
+            ]
+            completed_calls.sort(key=lambda call: int(call.step_id[1:]))
+            plan = execution.build_dynamic_plan(scope=scope, calls=completed_calls)
+            messages = [
+                ModelMessage.model_validate(item)
+                for item in state.get("analysis_messages", [])
+            ]
+            messages.append(
+                ModelMessage(
+                    role="assistant",
+                    content="本次批准范围仅包含系统数据质量核验，无需选择其他分析函数。",
+                )
+            )
+            return {
+                "phase": "evaluating",
+                "control": "evaluate",
+                "current_plan": plan.model_dump(mode="json"),
+                "analysis_messages": [message.model_dump(mode="json") for message in messages],
+                "pending_analysis_text": messages[-1].content,
+                "budget": budget.model_dump(mode="json"),
+            }
+        if budget.model_rounds_used >= scope.max_model_rounds:
+            packet = budget_feedback(budget, code="model_round_budget", message="动态分析已达到 8 轮模型决策上限。")
+            return {
+                "phase": "awaiting_user",
+                "control": "need_user",
+                "feedback_packets": _append_feedback(state, packet),
+                "user_interrupt_kind": "result_limitations",
+            }
+        messages = [ModelMessage.model_validate(item) for item in state.get("analysis_messages", [])]
+        try:
+            validate_analysis_message_protocol(
+                messages,
+                state.get("provider_call_groups", {}),
+                allow_pending_current_batch=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - corrupted/restored protocol state
+            packet = exception_feedback(exc, source="plan_validator", requires_user=True)
+            return {
+                "phase": "awaiting_user",
+                "control": "need_user",
+                "feedback_packets": _append_feedback(state, packet),
+                "stop_reason": packet.message,
+                "user_interrupt_kind": "response_error",
+            }
+        budget.model_rounds_used += 1
+        round_number = budget.model_rounds_used
+        flow_token = _cursor(state).episode_id or str(
+            state.get("revision_cycle_id") or state["thread_id"]
+        )
+        process_step_id = f"{flow_token}-model-round-{round_number}"
+        thinking_started = _process_event(
+            state,
+            "thinking_started",
+            step_id=process_step_id,
+            round_number=round_number,
+            source="model",
+            title=f"第 {round_number} 步",
+            content="正在根据已有证据选择下一步行动",
+        )
+        _emit_process_event(thinking_started)
+        process_history = append_process_events(
+            list(state.get("process_events", [])),
+            thinking_started,
+        )
+        state = {**state, "process_events": process_history}
+        try:
+            skill = skills.get(scope.skill_name)
+            turn = dynamic_agent.select(scope=scope, skill=skill, messages=messages)
+        except (ModelResponseError, ValidationError) as exc:
+            packet = FeedbackPacket(
+                source="plan_validator",
+                code="invalid_provider_tool_turn",
+                severity="error",
+                message=f"模型返回的工具回合不符合协议：{exc}",
+                retryable=True,
+            )
+            return _selector_protocol_retry(
+                state,
+                scope=scope,
+                budget=budget,
+                messages=messages,
+                packet=packet,
+            )
+        except Exception as exc:  # noqa: BLE001 - model tool-selection boundary
+            packet = exception_feedback(exc, source="plan_validator", retryable=True, requires_user=True)
+            completed = _process_event(
+                state,
+                "step_completed",
+                step_id=process_step_id,
+                round_number=round_number,
+                source="model",
+                title="模型调用失败",
+                result=_short(packet.message, 120),
+            )
+            _emit_process_event(completed)
+            process_history = append_process_events(process_history, completed)
+            return {
+                "phase": "awaiting_user",
+                "control": "need_user",
+                "feedback_packets": _append_feedback(state, packet),
+                "stop_reason": packet.message,
+                "user_interrupt_kind": "response_error",
+                "process_events": process_history,
+            }
+        thinking_ready = _process_event(
+            state,
+            "thinking_ready",
+            step_id=process_step_id,
+            round_number=round_number,
+            source="model",
+            title="思考过程",
+            content=turn.content.strip() or "本轮未提供思考过程说明",
+        )
+        _emit_process_event(thinking_ready)
+        process_history = append_process_events(process_history, thinking_ready)
+        state = {**state, "process_events": process_history}
+        if not turn.tool_calls:
+            messages.append(ModelMessage(role="assistant", content=turn.content))
+            completed_calls = [
+                ToolCall.model_validate(record["call"])
+                for record in state.get("tool_records", {}).values()
+                if record.get("status") in {"completed", "reused"}
+            ]
+            completed_calls.sort(key=lambda call: int(call.step_id[1:]))
+            plan = execution.build_dynamic_plan(scope=scope, calls=completed_calls)
+            completed = _process_event(
+                state,
+                "step_completed",
+                step_id=process_step_id,
+                round_number=round_number,
+                source="model",
+                title="分析决策完成",
+                result=_short(turn.content, 120),
+            )
+            _emit_process_event(completed)
+            process_history = append_process_events(process_history, completed)
+            return {
+                "phase": "evaluating",
+                "control": "evaluate",
+                "current_plan": plan.model_dump(mode="json"),
+                "analysis_messages": [message.model_dump(mode="json") for message in messages],
+                "pending_analysis_text": turn.content,
+                "model_round": budget.model_rounds_used,
+                "budget": budget.model_dump(mode="json"),
+                "process_events": process_history,
+                "events": _event(
+                    state,
+                    f"动态分析完成选择：{budget.model_rounds_used} 轮",
+                    trace_category="plan",
+                ),
+            }
+
+        records = dict(state.get("tool_records", {}))
+        next_sequence = max(
+            (int(ToolCall.model_validate(record["call"]).step_id[1:]) for record in records.values()),
+            default=0,
+        ) + 1
+        try:
+            compiled_batch = compile_tool_turn(
+                turn,
+                scope=scope,
+                study_config=config,
+                registry=tools,
+                recipes=dynamic_agent.recipes,
+                existing_provider_call_ids=set(state.get("provider_call_groups", {})),
+                next_sequence=next_sequence,
+                remaining_tool_calls=max(0, scope.max_tool_calls - budget.tool_calls_used),
+            )
+        except ToolTurnProtocolError as exc:
+            packet = FeedbackPacket(
+                source="plan_validator",
+                code=exc.code,
+                severity="error",
+                message=str(exc),
+                observed=exc.observed,
+                retryable=True,
+            )
+            return _selector_protocol_retry(
+                state,
+                scope=scope,
+                budget=budget,
+                messages=messages,
+                packet=packet,
+            )
+
+        provider_ids = [proposal.provider_call_id for proposal in compiled_batch.proposals]
+        messages.append(ModelMessage(role="assistant", content=turn.content, tool_calls=turn.tool_calls))
+        calls = list(compiled_batch.calls)
+        groups = dict(state.get("provider_call_groups", {}))
+        groups.update(
+            {provider_id: group.model_dump(mode="json") for provider_id, group in compiled_batch.groups.items()}
+        )
+        process_call_steps = dict(state.get("process_call_steps", {}))
+        compile_packets: list[FeedbackPacket] = []
+        for proposal in compiled_batch.proposals:
+            if proposal.error is not None:
+                packet = exception_feedback(proposal.error, source="tool_executor", retryable=True)
+                compile_packets.append(packet)
+                messages.append(
+                    build_tool_rejection_feedback(
+                        proposal.provider_call_id,
+                        error=packet.message,
+                        retryable=True,
+                    )
+                )
+                continue
+            for call in proposal.calls:
+                records[call.call_id] = ToolCallRecord(
+                    call=call.model_dump(mode="json")
+                ).model_dump(mode="json")
+                process_call_steps[call.call_id] = process_step_id
+
+        if not calls:
+            budget.no_progress_rounds += 1
+            needs_user = budget.no_progress_rounds >= 2
+            packet = compile_packets[-1]
+            completed = _process_event(
+                state,
+                "step_completed",
+                step_id=process_step_id,
+                round_number=round_number,
+                source="model",
+                title="行动无法执行",
+                result=_short(packet.message, 120),
+            )
+            _emit_process_event(completed)
+            process_history = append_process_events(process_history, completed)
+            validate_analysis_message_protocol(
+                messages,
+                groups,
+                allow_pending_current_batch=False,
+            )
+            return {
+                "phase": "awaiting_user" if needs_user else "executing_tools",
+                "control": "need_user" if needs_user else "select",
+                "analysis_messages": [message.model_dump(mode="json") for message in messages],
+                "provider_call_groups": groups,
+                "feedback_packets": _append_feedback(state, packet),
+                "budget": budget.model_dump(mode="json"),
+                "user_interrupt_kind": "plan_error" if needs_user else None,
+                "process_events": process_history,
+            }
+
+        if compiled_batch.exceeds_budget:
+            packet = budget_feedback(budget, code="tool_call_budget", message="动态分析将超过 16 次工具调用上限。")
+            for provider_id in provider_ids:
+                group = ToolCallGroupRecord.model_validate(groups[provider_id])
+                if group.status != "pending":
+                    continue
+                group.status = "failed"
+                groups[provider_id] = group.model_dump(mode="json")
+                for child_id in group.child_call_ids:
+                    record = ToolCallRecord.model_validate(records[child_id])
+                    record.status = "failed"
+                    record.error = packet
+                    record.finished_at = _now()
+                    records[child_id] = record.model_dump(mode="json")
+                messages.append(
+                    build_tool_rejection_feedback(
+                        provider_id,
+                        error=packet.message,
+                        retryable=False,
+                    )
+                )
+            validate_analysis_message_protocol(
+                messages,
+                groups,
+                allow_pending_current_batch=False,
+            )
+            completed = _process_event(
+                state,
+                "step_completed",
+                step_id=process_step_id,
+                round_number=round_number,
+                source="model",
+                title="行动超过预算",
+                result=_short(packet.message, 120),
+            )
+            _emit_process_event(completed)
+            process_history = append_process_events(process_history, completed)
+            return {
+                "phase": "awaiting_user",
+                "control": "need_user",
+                "feedback_packets": _append_feedback(state, packet),
+                "user_interrupt_kind": "result_limitations",
+                "analysis_messages": [message.model_dump(mode="json") for message in messages],
+                "provider_call_groups": groups,
+                "tool_records": records,
+                "budget": budget.model_dump(mode="json"),
+                "process_events": process_history,
+            }
+        budget.tool_calls_used += len(calls)
+        payloads = [call.model_dump(mode="json") for call in calls]
+        validate_analysis_message_protocol(
+            messages,
+            groups,
+            allow_pending_current_batch=True,
+        )
+        return {
+            "phase": "executing_tools",
+            "control": "execute",
+            "tool_queue": payloads,
+            "current_tool_batch": payloads,
+            "tool_cursor": 0,
+            "tool_records": records,
+            "provider_call_groups": groups,
+            "process_call_steps": process_call_steps,
+            "process_events": process_history,
+            "analysis_messages": [message.model_dump(mode="json") for message in messages],
+            "model_round": budget.model_rounds_used,
+            "tool_calls_used": budget.tool_calls_used,
+            "budget": budget.model_dump(mode="json"),
+            "events": _event(
+                state,
+                f"动态选择函数：{len(calls)} 个调用",
+                trace_category="tool",
+                functions=[call.name for call in calls],
+            ),
+        }
+
+    def route_analysis_selector(state: ResearchLoopState) -> Literal["execute", "evaluate", "select", "need_user"]:
+        control = state.get("control", "need_user")
+        return control if control in {"execute", "evaluate", "select"} else "need_user"  # type: ignore[return-value]
+
     def prepare_plan_repair(state: ResearchLoopState) -> dict[str, Any]:
         budget = _budget(state)
         if budget.plan_attempts_in_iteration >= budget.max_plan_attempts_per_iteration:
@@ -1725,6 +3249,11 @@ def build_research_workflow(
         }
 
     def _finalize_iteration(state: ResearchLoopState) -> dict[str, Any]:
+        validate_analysis_message_protocol(
+            state.get("analysis_messages", []),
+            state.get("provider_call_groups", {}),
+            allow_pending_current_batch=False,
+        )
         plan = _plan(state)
         config = _config(state)
         if plan is None or config is None:
@@ -1759,6 +3288,7 @@ def build_research_workflow(
                 "feedback_packets": state.get("feedback_packets", []),
                 "feedback_history": state.get("feedback_history", []),
                 "tool_records": state.get("tool_records", {}),
+                "call_evidence": state.get("call_evidence", []),
                 "authorization_envelope": state.get("authorization_envelope"),
                 "budget_before_evaluation": state.get("budget", {}),
             },
@@ -1861,7 +3391,16 @@ def build_research_workflow(
 
     def route_evaluation(
         state: ResearchLoopState,
-    ) -> Literal["accept", "revise", "need_user", "reject", "failed", "finalization_error", "invalid"]:
+    ) -> Literal[
+        "accept",
+        "revise",
+        "dynamic_revise",
+        "need_user",
+        "reject",
+        "failed",
+        "finalization_error",
+        "invalid",
+    ]:
         if state.get("control") == "finalization_error":
             return "finalization_error"
         if state.get("control") == "failed":
@@ -1876,6 +3415,14 @@ def build_research_workflow(
         budget = _budget(state)
         if budget.evaluated_iterations >= budget.max_evaluated_iterations:
             return "need_user"
+        scope = _scope(state)
+        if scope is not None:
+            if (
+                budget.model_rounds_used >= scope.max_model_rounds
+                or budget.tool_calls_used >= scope.max_tool_calls
+            ):
+                return "need_user"
+            return "dynamic_revise"
         return "revise"
 
     def prepare_invalid_evaluation(state: ResearchLoopState) -> dict[str, Any]:
@@ -1963,6 +3510,54 @@ def build_research_workflow(
             ),
         }
 
+    def prepare_dynamic_evaluation_revision(state: ResearchLoopState) -> dict[str, Any]:
+        """Feed deterministic evaluation gaps back into the same approved tool loop."""
+
+        scope = _scope(state)
+        if scope is None:
+            raise ResearchPlanValidationError("动态评估修订缺少已批准研究范围")
+        evaluation = state.get("evaluation") or {}
+        cursor = _cursor(state).next_iteration()
+        budget = _budget(state).reset_for_iteration()
+        messages = [ModelMessage.model_validate(item) for item in state.get("analysis_messages", [])]
+        messages.append(
+            ModelMessage(
+                role="user",
+                content=json.dumps(
+                    {
+                        "type": "deterministic_evaluation_feedback",
+                        "decision": evaluation.get("decision"),
+                        "summary": evaluation.get("summary"),
+                        "checks": evaluation.get("checks", []),
+                        "feedback_packets": evaluation.get("feedback_packets", []),
+                        "suggested_followups": evaluation.get("suggested_followups", []),
+                        "instruction": "仅在已批准研究范围和剩余预算内补充必要证据；否则停止调用并说明限制。",
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        )
+        return {
+            "phase": "executing_tools",
+            "control": "select",
+            "loop_cursor": cursor.model_dump(mode="json"),
+            "budget": budget.model_dump(mode="json"),
+            "analysis_messages": [message.model_dump(mode="json") for message in messages],
+            "feedback_history": _archive_feedback(state),
+            "feedback_packets": [],
+            "tool_queue": [],
+            "current_tool_batch": [],
+            "tool_cursor": 0,
+            "pending_tool_result": None,
+            "events": _event(
+                state,
+                "确定性评估要求动态补充证据",
+                trace_category="evaluation",
+                model_rounds_remaining=max(0, scope.max_model_rounds - budget.model_rounds_used),
+                tool_calls_remaining=max(0, scope.max_tool_calls - budget.tool_calls_used),
+            ),
+        }
+
     def prepare_need_user(state: ResearchLoopState) -> dict[str, Any]:
         packets = list(state.get("feedback_packets", []))
         blocking = _blocking_feedback(packets)
@@ -2005,7 +3600,7 @@ def build_research_workflow(
             packets = _append_feedback({**state, "feedback_packets": packets}, packet)
             stop_reason = evaluation_summary
         interrupt_kind = state.get("user_interrupt_kind") or state.get("return_to_gate")
-        if interrupt_kind not in {"plan_error", "result_limitations", "response_error"}:
+        if interrupt_kind not in {"plan_error", "result_limitations", "response_error", "data_input_error"}:
             interrupt_kind = "result_limitations" if state.get("latest_run") else "plan_error"
         cursor = _cursor(state).model_copy(
             update={
@@ -2286,6 +3881,7 @@ def build_research_workflow(
             "result_rejected",
             "response_error",
             "finalization_error",
+            "data_input_error",
         }:
             return "error"
         return "result"
@@ -2298,11 +3894,13 @@ def build_research_workflow(
             "result_rejected",
             "response_error",
             "finalization_error",
+            "data_input_error",
         }:
             interrupt_kind = "result_limitations" if state.get("latest_run") else "plan_error"
         has_result = interrupt_kind in {"result_limitations", "result_rejected"}
         is_response_error = interrupt_kind == "response_error"
         is_finalization_error = interrupt_kind == "finalization_error"
+        is_data_input_error = interrupt_kind == "data_input_error"
         is_rejected = interrupt_kind == "result_rejected"
         is_version_mismatch = any(
             item.get("code") == "session_skill_version_mismatch"
@@ -2316,6 +3914,9 @@ def build_research_workflow(
             choices = ["retry", "stop"]
         elif is_response_error:
             message = state.get("stop_reason") or "大模型没有生成可展示回复。"
+            choices = ["retry", "stop"]
+        elif is_data_input_error:
+            message = state.get("stop_reason") or "研究数据无法解析，请检查或重新选择数据。"
             choices = ["retry", "stop"]
         elif is_rejected:
             message = state.get("stop_reason") or "评估器拒绝当前结果。"
@@ -2495,6 +4096,7 @@ def build_research_workflow(
     for name, node in {
         "ingest_user": ingest_user,
         "main_agent": understand,
+        "resolve_study_context": resolve_study_context,
         "begin_episode": begin_episode,
         "resolve_skill": resolve_skill,
         "eda_subagent": create_plan,
@@ -2508,14 +4110,18 @@ def build_research_workflow(
         "execute_tool": execute_tool,
         "validate_tool_result": validate_tool_result,
         "advance_tool": advance_tool,
+        "complete_tool_batch": complete_tool_batch,
+        "analysis_selector": analysis_selector,
         "prepare_plan_repair": prepare_plan_repair,
         "finalize_iteration": finalize_iteration,
         "prepare_invalid_evaluation": prepare_invalid_evaluation,
         "prepare_rejected_result": prepare_rejected_result,
         "prepare_evaluation_revision": prepare_evaluation_revision,
+        "prepare_dynamic_evaluation_revision": prepare_dynamic_evaluation_revision,
         "prepare_need_user": prepare_need_user,
         "explain_result": explain_result,
         "reply": reply,
+        "prepare_forecast_handoff": prepare_forecast_handoff,
         "user_interrupt": user_interrupt,
         "result_interrupt": result_interrupt,
         "persist_stop": persist_stop,
@@ -2529,13 +4135,15 @@ def build_research_workflow(
         "main_agent",
         route_main,
         {
-            "new_plan": "begin_episode",
+            "resolve_data": "resolve_study_context",
             "revise_plan": "revise_user_plan",
             "execute_plan": "confirm_existing_plan",
+            "business_handoff": "prepare_forecast_handoff",
             "reply": "reply",
             "need_user": "prepare_need_user",
         },
     )
+    graph.add_edge("prepare_forecast_handoff", END)
     graph.add_edge("confirm_existing_plan", "validate_plan")
     graph.add_conditional_edges("resolve_skill", route_skill, {"plan": "eda_subagent", "need_user": "prepare_need_user"})
     graph.add_conditional_edges(
@@ -2577,6 +4185,7 @@ def build_research_workflow(
             "run": "execute_tool",
             "advance": "advance_tool",
             "evaluate": "finalize_iteration",
+            "select": "complete_tool_batch",
             "need_user": "prepare_need_user",
             "fail": "persist_failure",
         },
@@ -2587,7 +4196,9 @@ def build_research_workflow(
         {
             "validate": "validate_tool_result",
             "retry": "mark_tool_running",
+            "advance": "advance_tool",
             "revise": "prepare_plan_repair",
+            "select": "analysis_selector",
             "need_user": "prepare_need_user",
             "stop": "persist_stop",
             "fail": "persist_failure",
@@ -2596,9 +4207,40 @@ def build_research_workflow(
     graph.add_conditional_edges(
         "validate_tool_result",
         route_tool_execution,
-        {"advance": "advance_tool", "revise": "prepare_plan_repair", "fail": "persist_failure"},
+        {
+            "advance": "advance_tool",
+            "revise": "prepare_plan_repair",
+            "select": "analysis_selector",
+            "need_user": "prepare_need_user",
+            "fail": "persist_failure",
+        },
     )
     graph.add_edge("advance_tool", "mark_tool_running")
+    graph.add_conditional_edges(
+        "complete_tool_batch",
+        lambda state: "need_user" if state.get("control") == "need_user" else "select",
+        {"select": "analysis_selector", "need_user": "prepare_need_user"},
+    )
+    graph.add_conditional_edges(
+        "resolve_study_context",
+        route_resolved_study,
+        {
+            "new_plan": "begin_episode",
+            "revise_plan": "revise_user_plan",
+            "execute_plan": "confirm_existing_plan",
+            "need_user": "prepare_need_user",
+        },
+    )
+    graph.add_conditional_edges(
+        "analysis_selector",
+        route_analysis_selector,
+        {
+            "execute": "mark_tool_running",
+            "evaluate": "finalize_iteration",
+            "select": "analysis_selector",
+            "need_user": "prepare_need_user",
+        },
+    )
     graph.add_conditional_edges(
         "prepare_plan_repair",
         lambda state: "need_user" if state.get("control") == "need_user" else "repair",
@@ -2610,6 +4252,7 @@ def build_research_workflow(
         {
             "accept": "explain_result",
             "revise": "prepare_evaluation_revision",
+            "dynamic_revise": "prepare_dynamic_evaluation_revision",
             "need_user": "prepare_need_user",
             "reject": "prepare_rejected_result",
             "failed": "persist_failure",
@@ -2620,6 +4263,7 @@ def build_research_workflow(
     graph.add_edge("prepare_invalid_evaluation", "prepare_need_user")
     graph.add_edge("prepare_rejected_result", "user_interrupt")
     graph.add_edge("prepare_evaluation_revision", "eda_subagent")
+    graph.add_edge("prepare_dynamic_evaluation_revision", "analysis_selector")
     graph.add_edge("prepare_need_user", "user_interrupt")
     graph.add_conditional_edges(
         "user_interrupt",

@@ -19,7 +19,7 @@ from app.research.agent.errors import (
     ResearchPlanValidationError,
     SkillVersionMismatchError,
 )
-from app.research.agent.schemas import AgentRunResult, ConversationMessage, EDAPlan
+from app.research.agent.schemas import AgentRunResult, ConversationMessage, EDAPlan, EDAPlanStep, EDAResearchScope
 from app.research.application.planning import (
     noop_progress,
     prepare_research_data,
@@ -28,14 +28,16 @@ from app.research.application.planning import (
 )
 from app.research.data.snapshot import input_file_manifest, study_fingerprint
 from app.research.evaluation.eda import evaluate_agent_run
+from app.research.evidence import CallEvidenceLedger
 from app.research.reporting.artifacts import write_agent_research_package
 from app.research.schemas.study import StudyConfig
 from app.research.skills.registry import SkillRegistry
+from app.research.tools.calling import compile_dynamic_call
 from app.research.tools.catalog import FUNCTION_CATALOG
 from app.research.tools.contracts import ToolCall, ToolContext, ToolResult
 from app.research.tools.eda.functions import build_eda_tool_registry
-from app.research.tools.executor import ToolExecutor, output_fingerprint
-from app.research.tools.policy import ToolPolicy
+from app.research.tools.executor import ToolExecutor, validate_tool_result
+from app.research.tools.policy import ToolPermissionError, ToolPolicy
 from app.research.tools.registry import ToolRegistry
 from app.runtime_paths import source_worktree
 
@@ -49,6 +51,14 @@ class PreparedExecution:
     input_manifest: list[dict[str, Any]]
     data_fingerprint: str
     policy: ToolPolicy
+
+    @property
+    def context(self) -> ToolContext:
+        return ToolContext(
+            config=self.config,
+            frame=self.prepared.aligned.frame,
+            quality=self.prepared.quality,
+        )
 
 
 class EDAExecutionService:
@@ -81,6 +91,17 @@ class EDAExecutionService:
             f"{plan.plan_id}:{plan.revision}:{plan.data_fingerprint or 'unlocked'}:"
             f"{plan_signature}:{config_signature}"
         )
+
+    @staticmethod
+    def _scope_cache_key(scope: EDAResearchScope, config: StudyConfig) -> str:
+        config_payload = config.model_dump(mode="json", exclude={"analysis": {"output_directory"}})
+        config_signature = hashlib.sha256(
+            json.dumps(config_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:12]
+        scope_signature = hashlib.sha256(
+            json.dumps(scope.model_dump(mode="json"), ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:12]
+        return f"scope:{scope.scope_id}:{scope.data_fingerprint}:{scope_signature}:{config_signature}"
 
     @staticmethod
     def _with_output_directory(prepared: PreparedExecution, output_directory: str | Path | None) -> PreparedExecution:
@@ -197,6 +218,169 @@ class EDAExecutionService:
                 self._prepared_cache.popitem(last=False)
         return self._with_output_directory(prepared_execution, output_directory)
 
+    def prepare_scope(
+        self,
+        *,
+        scope: EDAResearchScope,
+        study_config: StudyConfig,
+    ) -> PreparedExecution:
+        """Restore and authorize the frozen dataset behind a dynamic research scope."""
+
+        config = resolve_config(config_path=None, study_config=study_config)
+        cache_key = self._scope_cache_key(scope, config)
+        with self._prepared_cache_lock:
+            cached = self._prepared_cache.get(cache_key)
+            if cached is not None:
+                self._prepared_cache.move_to_end(cache_key)
+                return cached
+        skill = self.skills.get(scope.skill_name)
+        if skill.version != scope.skill_version:
+            raise SkillVersionMismatchError(
+                f"Skill 版本不匹配 {scope.skill_name}: scope={scope.skill_version}, installed={skill.version}"
+            )
+        unknown_functions = sorted(set(scope.authorized_functions).difference(self.registry.names))
+        if unknown_functions:
+            raise PlanCompatibilityError(f"研究范围包含未注册函数：{', '.join(unknown_functions)}")
+        if not set(scope.authorized_functions).issubset(skill.allowed_functions):
+            raise PlanCompatibilityError("研究范围包含当前 Skill 未授权的函数")
+        available_variables = {spec.name for spec in config.exogenous}
+        unknown_variables = sorted(set(scope.authorized_variables).difference(available_variables))
+        if unknown_variables:
+            raise PlanCompatibilityError(f"研究范围包含未知变量：{', '.join(unknown_variables)}")
+        frozen = restore_prepared_data(scope.data_fingerprint, config)
+        if frozen is not None:
+            prepared, snapshot = frozen
+            inputs = snapshot.input_manifest
+            fingerprint = scope.data_fingerprint
+        else:
+            prepared = prepare_research_data(config)
+            inputs = input_file_manifest(config)
+            fingerprint = study_fingerprint(config, inputs)
+            if fingerprint != scope.data_fingerprint:
+                raise DataFingerprintMismatchError("研究数据在范围审批后发生变化，请重新生成研究范围")
+        if not prepared.quality.usable_for_eda:
+            raise InsufficientDataError("target data does not meet the minimum observation requirement for EDA")
+        prepared_execution = PreparedExecution(
+            config=config,
+            prepared=prepared,
+            input_manifest=inputs,
+            data_fingerprint=fingerprint,
+            policy=ToolPolicy(allowed_functions=frozenset({"data_quality", *scope.authorized_functions})),
+        )
+        with self._prepared_cache_lock:
+            self._prepared_cache[cache_key] = prepared_execution
+            self._prepared_cache.move_to_end(cache_key)
+            while len(self._prepared_cache) > self._prepared_cache_size:
+                self._prepared_cache.popitem(last=False)
+        return prepared_execution
+
+    def compile_dynamic_call(
+        self,
+        *,
+        scope: EDAResearchScope,
+        study_config: StudyConfig,
+        name: str,
+        arguments: dict[str, Any],
+        sequence: int,
+    ) -> ToolCall:
+        return compile_dynamic_call(
+            scope=scope,
+            study_config=study_config,
+            registry=self.registry,
+            name=name,
+            arguments=arguments,
+            sequence=sequence,
+        )
+
+    def execute_scope_call(
+        self,
+        *,
+        scope: EDAResearchScope,
+        study_config: StudyConfig,
+        call: ToolCall,
+    ) -> ToolResult:
+        prepared = self.prepare_scope(scope=scope, study_config=study_config)
+        result = self.executor.execute(
+            call,
+            context=prepared.context,
+            policy=prepared.policy,
+            data_fingerprint=prepared.data_fingerprint,
+        )
+        self.validate_scope_result(scope=scope, call=call, result=result)
+        return result
+
+    def validate_scope_result(
+        self,
+        *,
+        scope: EDAResearchScope,
+        call: ToolCall,
+        result: ToolResult,
+    ) -> None:
+        if call.name != "data_quality" and call.name not in scope.authorized_functions:
+            raise ToolPermissionError(f"研究范围未授权工具：{call.name}")
+        validate_tool_result(
+            call,
+            result,
+            registry=self.registry,
+            expected_data_fingerprint=scope.data_fingerprint,
+        )
+
+    def build_dynamic_plan(
+        self,
+        *,
+        scope: EDAResearchScope,
+        calls: list[ToolCall],
+    ) -> EDAPlan:
+        """Materialize the actual execution manifest used by evaluation and reporting."""
+
+        if not calls or calls[0].name != "data_quality":
+            raise ResearchPlanValidationError("动态执行清单必须以 data_quality 开始")
+        skill = self.skills.get(scope.skill_name)
+        selected_variables = list(
+            dict.fromkeys(
+                variable
+                for call in calls
+                for variable in (call.arguments.get("variables") or [])
+            )
+        )
+        steps = [
+            EDAPlanStep(
+                step_id=call.step_id,
+                function=call.name,
+                title=FUNCTION_CATALOG[call.name].title,
+                description=FUNCTION_CATALOG[call.name].description,
+                rationale=(
+                    "系统前置数据质量核验。"
+                    if call.name == "data_quality"
+                    else "动态分析 Agent 根据当前证据选择。"
+                ),
+                enabled=True,
+                required=call.name == "data_quality",
+                parameters=dict(call.arguments),
+                function_version=call.version,
+            )
+            for call in calls
+        ]
+        protocol = skill.research_protocol
+        return EDAPlan(
+            plan_id=scope.scope_id,
+            data_fingerprint=scope.data_fingerprint,
+            revision=scope.revision,
+            question=scope.question,
+            objective=scope.objective,
+            study_name=scope.study_name,
+            planner="llm",
+            skill_name=scope.skill_name,
+            skill_version=scope.skill_version,
+            research_protocol_id=protocol.protocol_id if protocol else None,
+            research_protocol_version=protocol.version if protocol else None,
+            research_protocol_function_order=list(protocol.function_order) if protocol else [],
+            research_protocol_step_texts=protocol.display_text_by_function if protocol else {},
+            selected_variables=selected_variables,
+            steps=steps,
+            planning_notes=[*scope.initial_strategy, "执行步骤由动态 Function Calling 形成。"],
+        )
+
     @staticmethod
     def _stable_work_id(plan: EDAPlan, payload: dict[str, Any]) -> str:
         if plan.data_fingerprint is None:
@@ -256,14 +440,9 @@ class EDAExecutionService:
         validate_result: bool = True,
     ) -> ToolResult:
         prepared = self.prepare(plan=plan, study_config=study_config)
-        context = ToolContext(
-            config=prepared.config,
-            frame=prepared.prepared.aligned.frame,
-            quality=prepared.prepared.quality,
-        )
         result = self.executor.execute(
             call,
-            context=context,
+            context=prepared.context,
             policy=prepared.policy,
             data_fingerprint=prepared.data_fingerprint,
         )
@@ -272,55 +451,14 @@ class EDAExecutionService:
         return result
 
     def validate_tool_result(self, *, plan: EDAPlan, call: ToolCall, result: ToolResult) -> None:
-        if (
-            result.call.call_id != call.call_id
-            or result.call.work_id != call.work_id
-            or result.call.step_id != call.step_id
-            or result.call.name != call.name
-        ):
-            raise ResearchPlanValidationError("工具结果与调用身份不匹配")
-        expected_key = self.registry.get(call.name).result_key
-        if result.output.result_key != expected_key:
-            raise RepairablePlanError(
-                f"工具 {call.name} 返回了错误结果键：{result.output.result_key}"
-            )
-        if result.tool_version != call.version:
-            raise ResearchPlanValidationError("工具结果版本与锁定调用不匹配")
-        if result.data_fingerprint != plan.data_fingerprint:
-            raise ResearchPlanValidationError("工具结果数据指纹与锁定计划不匹配")
-        if output_fingerprint(result.output) != result.output_hash:
-            # A reused or checkpoint-restored payload must still hash to its recorded value.
-            raise ResearchPlanValidationError(f"工具 {call.name} 的结果与记录的 output_hash 不一致")
-        evidence_field = FUNCTION_CATALOG[call.name].evidence_field
-        if evidence_field is not None and evidence_field not in result.output.value:
-            raise RepairablePlanError(
-                f"工具 {call.name} 的结果缺少证据字段 {evidence_field}"
-            )
-
-    @classmethod
-    def _merge_evidence(cls, existing: Any, incoming: Any, *, field: str = "") -> Any:
-        """Merge partial atomic-function evidence and reject contradictory shared metadata."""
-
-        if existing is None:
-            return incoming
-        if incoming is None:
-            return existing
-        if isinstance(existing, dict) and isinstance(incoming, dict):
-            merged = dict(existing)
-            for key, value in incoming.items():
-                merged[key] = cls._merge_evidence(merged.get(key), value, field=key)
-            return merged
-        if isinstance(existing, list) and isinstance(incoming, list):
-            if field == "methods":
-                return list(dict.fromkeys([*existing, *incoming]))
-            if not existing:
-                return incoming
-            if not incoming or existing == incoming:
-                return existing
-            raise ResearchPlanValidationError(f"原子函数返回了冲突的列表证据：{field}")
-        if existing == incoming:
-            return existing
-        raise ResearchPlanValidationError(f"原子函数返回了冲突的共享证据：{field}")
+        if plan.data_fingerprint is None:
+            raise ResearchPlanValidationError("工具结果校验缺少锁定计划数据指纹")
+        validate_tool_result(
+            call,
+            result,
+            registry=self.registry,
+            expected_data_fingerprint=plan.data_fingerprint,
+        )
 
     def finalize(
         self,
@@ -343,24 +481,6 @@ class EDAExecutionService:
         config = prepared_execution.config
         prepared = prepared_execution.prepared
         selected = list(dict.fromkeys(plan.selected_variables))
-        summary: dict[str, Any] = {
-            "study": {
-                "name": config.study.name,
-                "market": config.study.market,
-                "timezone": config.study.timezone,
-                "frequency": config.study.frequency,
-                "target": config.target.name,
-                "exogenous": [spec.name for spec in config.exogenous],
-            },
-            "research_question": plan.question,
-            "selected_variables": selected,
-            "methodology": {
-                "missing_value_policy": "pairwise complete for relationships; no implicit imputation",
-                "outlier_policy": "retain observations and report robust IQR flags",
-                "lag_semantics": "positive lag compares feature[t-lag] with target[t]",
-                "causal_claims": False,
-            },
-        }
         trace: list[dict[str, Any]] = []
         steps = {step.step_id: step for step in plan.enabled_steps}
         result_step_ids = [result.call.step_id for result in tool_results]
@@ -376,10 +496,8 @@ class EDAExecutionService:
         for result in tool_results:
             self.validate_tool_result(plan=plan, call=result.call, result=result)
             result_key = result.output.result_key
-            if result_key != "data_quality":
-                summary[result_key] = self._merge_evidence(summary.get(result_key), result.output.value)
-            step = steps[result.call.step_id]
             record = tool_records.get(result.call.call_id, {})
+            step = steps[result.call.step_id]
             trace.append(
                 {
                     "step_id": step.step_id,
@@ -388,7 +506,7 @@ class EDAExecutionService:
                     "function": result.call.name,
                     "title": step.title,
                     "parameters": result.call.arguments,
-                    "status": "completed",
+                    "status": record.get("status") or "completed",
                     "result_key": result_key,
                     "started_at": result.started_at or record.get("started_at"),
                     "finished_at": result.finished_at or record.get("finished_at"),
@@ -399,8 +517,23 @@ class EDAExecutionService:
                     "output_hash": result.output_hash,
                 }
             )
+        evidence_ledger = CallEvidenceLedger.from_tool_results(
+            plan=plan,
+            tool_results=tool_results,
+            loop_context=loop_context,
+        )
+        summary = evidence_ledger.analysis_view(
+            config=config,
+            research_question=plan.question,
+            selected_variables=selected,
+        )
         callback(78, "评估器检查结果与风险")
-        evaluation = evaluate_agent_run(plan=plan, quality=prepared.quality, summary=summary)
+        evaluation = evaluate_agent_run(
+            plan=plan,
+            quality=prepared.quality,
+            evidence=evidence_ledger,
+            config=config,
+        )
         resolved_loop_context = dict(loop_context or {})
         if loop_context is not None:
             resolved_loop_context["evaluation"] = evaluation.model_dump(mode="json")
@@ -419,7 +552,8 @@ class EDAExecutionService:
         bundle = write_agent_research_package(
             config=config,
             quality=prepared.quality,
-            summary=summary,
+            evidence=evidence_ledger,
+            compatibility_summary=summary,
             aligned_frame=prepared.aligned.frame,
             input_manifest=prepared_execution.input_manifest,
             fingerprint=fingerprint,

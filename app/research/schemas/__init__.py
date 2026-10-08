@@ -2,7 +2,14 @@
 
 from app.research.schemas.feedback import FeedbackPacket
 from app.research.schemas.results import DataQualityReport
-from app.research.schemas.study import AnalysisSettings, SeriesSpec, StudyConfig, StudyDefinition, load_study_config
+from app.research.schemas.study import (
+    AnalysisSettings,
+    SeriesSpec,
+    StudyConfig,
+    StudyDefinition,
+    StudyInputDescriptor,
+    load_study_config,
+)
 
 __all__ = [
     "AnalysisSettings",
@@ -11,5 +18,6 @@ __all__ = [
     "SeriesSpec",
     "StudyConfig",
     "StudyDefinition",
+    "StudyInputDescriptor",
     "load_study_config",
 ]

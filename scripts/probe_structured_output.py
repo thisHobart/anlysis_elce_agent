@@ -29,9 +29,7 @@ from app.llm.gateway import ModelGatewayError, ModelMessage
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="验证模型端点是否真正执行原生结构化输出 schema。"
-    )
+    parser = argparse.ArgumentParser(description="验证模型端点是否真正执行原生结构化输出 schema。")
     parser.add_argument("--attempts", type=int, default=3, choices=range(1, 11))
     parser.add_argument(
         "--show-raw",
@@ -83,10 +81,7 @@ def _messages() -> list[ModelMessage]:
         ),
         ModelMessage(
             role="user",
-            content=(
-                "请把以下三项事实填入服务端提供的 schema：代码 NEM_SCHEMA_7；"
-                "方向 UP_ONLY；间隔 5 分钟。"
-            ),
+            content=("请把以下三项事实填入服务端提供的 schema：代码 NEM_SCHEMA_7；方向 UP_ONLY；间隔 5 分钟。"),
         ),
     ]
 
@@ -164,21 +159,16 @@ def main() -> int:
     print()
     if failures:
         enforcement = (
-            "本地 schema 校验"
-            if settings.llm_structured_output_method == "prompt_json"
-            else "服务端 schema 执行"
+            "本地 schema 校验" if settings.llm_structured_output_method == "prompt_json" else "服务端 schema 执行"
         )
         print(
             f"结论：未通过（{failures}/{args.attempts} 次失败）。"
             f"当前链路未能稳定通过{enforcement}，不应运行 P2 模型抽取基准。"
         )
-        if (
-            settings.llm_provider != "gemini"
-            and settings.llm_structured_output_method != "prompt_json"
-        ):
+        if settings.llm_provider != "gemini" and settings.llm_structured_output_method != "prompt_json":
             print(
-                "若必须通过 Cherry 调用 Gemini，请设置 "
-                "VPP_LLM_STRUCTURED_OUTPUT_METHOD=prompt_json。"
+                "若必须通过 Cherry 调用 Gemini，请在桌面模型配置的模型画像中选择"
+                "“Cherry 兼容 JSON/函数选择（本地校验）”。"
             )
         return 1
 

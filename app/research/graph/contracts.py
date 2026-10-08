@@ -9,6 +9,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.research.schemas.feedback import FeedbackPacket
+from app.research.tools.contracts import CallEvidenceRecord, ToolCallGroupRecord
 
 LoopPhase = Literal[
     "idle",
@@ -32,6 +33,7 @@ InterruptKind = Literal[
     "result",
     "response_error",
     "finalization_error",
+    "data_input_error",
 ]
 ResumeAction = Literal[
     "approve",
@@ -54,8 +56,13 @@ class EpisodeBudget(BaseModel):
     max_plan_attempts_per_iteration: int = 3
     max_function_attempts_per_call: int = 2
     max_evaluated_iterations: int = 4
+    max_model_rounds: int = 8
+    max_tool_calls: int = 16
     plan_attempts_in_iteration: int = 0
     evaluated_iterations: int = 0
+    model_rounds_used: int = 0
+    tool_calls_used: int = 0
+    no_progress_rounds: int = 0
 
     @model_validator(mode="before")
     @classmethod
@@ -77,12 +84,14 @@ class EpisodeBudget(BaseModel):
             migrated["max_function_attempts_per_call"] = int(migrated["max_tool_retries"]) + 1
         if "plan_repairs_used" in migrated and "plan_attempts_in_iteration" not in migrated:
             migrated["plan_attempts_in_iteration"] = int(migrated["plan_repairs_used"])
+        if "max_function_calls" in migrated and "max_tool_calls" not in migrated:
+            migrated["max_tool_calls"] = int(migrated["max_function_calls"])
+        if "function_calls_used" in migrated and "tool_calls_used" not in migrated:
+            migrated["tool_calls_used"] = int(migrated["function_calls_used"])
         migrated.pop("max_plan_repairs", None)
         migrated.pop("max_tool_retries", None)
         migrated.pop("plan_repairs_used", None)
         for obsolete in (
-            "max_tool_calls",
-            "tool_calls_used",
             "max_function_calls",
             "function_calls_used",
             "max_active_seconds",
@@ -98,6 +107,9 @@ class EpisodeBudget(BaseModel):
             update={
                 "plan_attempts_in_iteration": 0,
                 "evaluated_iterations": 0,
+                "model_rounds_used": 0,
+                "tool_calls_used": 0,
+                "no_progress_rounds": 0,
             }
         )
 
@@ -245,13 +257,19 @@ class AuthorizationEnvelope(BaseModel):
     max_lag_by_function: dict[str, int]
     segment_parameters_by_function: dict[str, dict[str, Any]]
     approved_parameters_by_function: dict[str, dict[str, Any]]
+    authorization_kind: Literal["fixed_plan", "dynamic_scope"] = "fixed_plan"
+    approved_scope_id: str | None = None
+    approved_scope_fingerprint: str | None = None
+    max_model_rounds: int = Field(default=8, ge=1, le=32)
+    max_tool_calls: int = Field(default=16, ge=1, le=64)
+    max_attempts_per_call: int = Field(default=2, ge=1, le=5)
 
 
 class ToolCallRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     call: dict[str, Any]
-    status: Literal["pending", "running", "completed", "failed", "reused"] = "pending"
+    status: Literal["pending", "running", "completed", "failed", "cancelled", "reused"] = "pending"
     attempts: int = 0
     started_at: str | None = None
     finished_at: str | None = None
@@ -269,6 +287,7 @@ class InterruptPayload(BaseModel):
     message: str
     choices: list[ResumeAction]
     plan: dict[str, Any] | None = None
+    scope: dict[str, Any] | None = None
     evaluation: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
     deadline: str | None = None

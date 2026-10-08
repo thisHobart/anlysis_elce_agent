@@ -24,6 +24,7 @@ _APPROVE = frozenset(
         "直接用你给的方案研究",
         "可以就这么跑吧",
         "可以就这样执行",
+        "可以开始",
     }
 )
 _REJECT = frozenset({"拒绝", "不同意", "不执行", "不要执行", "取消方案", "放弃方案"})
@@ -108,6 +109,7 @@ def resolve_text_action(
         "result": "followup",
         "response_error": "retry",
         "finalization_error": "retry",
+        "data_input_error": "retry",
     }
     default = contextual_defaults[kind]
     if default in available:

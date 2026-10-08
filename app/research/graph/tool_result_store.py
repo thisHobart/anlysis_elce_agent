@@ -137,7 +137,11 @@ class InMemoryToolResultStore(ToolResultStore):
             payload = self._items.get((thread_id, reference.storage_key))
         if payload is None:
             raise FileNotFoundError(f"工具结果引用不存在：{reference.storage_key}")
-        return self._validate_loaded(ToolResult.model_validate(payload), reference, call)
+        return self._validate_loaded(
+            ToolResult.model_validate(payload),
+            reference,
+            call or reference.call,
+        )
 
     def delete_thread(self, thread_id: str) -> None:
         with self._lock:
@@ -208,7 +212,11 @@ class FileToolResultStore(ToolResultStore):
         source = self._thread_directory(thread_id) / reference.storage_key
         with self._lock:
             payload = json.loads(source.read_text(encoding="utf-8"))
-        return self._validate_loaded(ToolResult.model_validate(payload), reference, call)
+        return self._validate_loaded(
+            ToolResult.model_validate(payload),
+            reference,
+            call or reference.call,
+        )
 
     def delete_thread(self, thread_id: str) -> None:
         target = self._thread_directory(thread_id).resolve()

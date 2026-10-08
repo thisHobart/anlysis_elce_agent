@@ -10,7 +10,7 @@ from app.config import Settings
 from app.research.agent.schemas import EDAPlan
 from app.research.application.planning import prepare_research_data
 from app.research.evaluation.agenda import resolve_agenda_item
-from app.research.evaluation.eda import evaluate_agent_run
+from app.research.evaluation.eda import evaluate_compatibility_summary as evaluate_agent_run
 from app.research.planning.compiler import (
     FUNCTION_AGENDA_HYPOTHESES,
     FUNCTION_AGENDA_ITEM_IDS,
@@ -21,13 +21,19 @@ from app.research.schemas.study import load_study_config
 from app.research.skills.registry import SkillRegistry
 
 
-def _compile(study: Path, *, hypotheses: list[str], functions: list[str]) -> EDAPlan:
+def _compile(
+    study: Path,
+    *,
+    hypotheses: list[str],
+    functions: list[str],
+    question: str = "这批数据能看出什么？",
+) -> EDAPlan:
     config = load_study_config(study)
     skill = SkillRegistry.default(Settings(skill_paths="")).get("price-exogenous-eda")
     steps = [{"function": name, "enabled": True, "rationale": "回归测试"} for name in functions]
     return EDAPlanCompiler().compile(
         EDAPlanDraft(objective="检查议程", selected_variables=[], steps=steps, hypotheses=hypotheses),
-        question="这批数据能看出什么？",
+        question=question,
         config=config,
         skill=skill,
         model_name="regression",
@@ -80,6 +86,19 @@ def test_a_hypothesis_no_function_can_decide_never_enters_the_agenda(synthetic_s
     assert guess not in plan.hypotheses
     assert plan.unverifiable_hypotheses == [guess]
     assert any("没有对应的确定性检验" in note for note in plan.planning_notes)
+
+
+def test_requested_statistics_are_deliverables_not_unverifiable_hypotheses(synthetic_study: Path):
+    plan = _compile(
+        synthetic_study,
+        hypotheses=["电价总体均值、最低价和最高价可以由有效目标观测计算。"],
+        functions=["price_descriptive_distribution"],
+        question="给出实时电价均值、最低价和最高价",
+    )
+
+    assert plan.analysis_kind == "descriptive"
+    assert plan.requested_statistics == ("mean", "min", "max")
+    assert plan.unverifiable_hypotheses == []
 
 
 def test_a_flat_day_is_volatility_evidence_rather_than_missing_data(synthetic_study: Path):

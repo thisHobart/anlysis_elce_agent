@@ -2,25 +2,37 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.config import Settings, get_settings
+from app.llm.budget import ModelRequestPurpose
 from app.llm.factory import build_model_gateway
 from app.llm.gateway import (
     ModelConfigurationError,
+    ModelContextLimitError,
     ModelGateway,
     ModelGatewayError,
     ModelMessage,
+    ModelOutputTruncatedError,
     ModelResponseError,
+    ModelTransientError,
 )
 from app.research.agent.context import compact_episode_context
-from app.research.agent.errors import ResearchModelUnavailableError, ResearchPlanValidationError
+from app.research.agent.errors import (
+    ResearchModelContextLimitError,
+    ResearchModelOutputTruncatedError,
+    ResearchModelSchemaError,
+    ResearchModelTransientError,
+    ResearchModelUnavailableError,
+    ResearchPlanValidationError,
+)
 from app.research.agent.prompts import DIALOGUE_PROMPT_VERSION, DIALOGUE_SYSTEM_PROMPT
 from app.research.agent.retrieval import select_conversation_context
-from app.research.agent.schemas import ConversationMessage, EDAPlan, EDAToolName
+from app.research.agent.schemas import ConversationMessage, EDAPlan, EDAResearchScope, EDAToolName
 from app.research.planning.variables import (
     VariableSelectionMode,
     eligible_exogenous_variables,
@@ -32,8 +44,91 @@ from app.research.schemas.study import StudyConfig
 from app.research.tools.catalog import FUNCTION_CATALOG, function_metadata
 from app.research.tools.contracts import SegmentDefinition
 
-DialogueIntent = Literal["discussion", "new_plan", "revise_plan", "explain_result", "execute_plan"]
+DialogueIntent = Literal[
+    "discussion",
+    "new_plan",
+    "revise_plan",
+    "explain_result",
+    "execute_plan",
+    "new_news_analysis",
+    "new_forecast_plan",
+    "execute_forecast_plan",
+]
 FUNCTION_METADATA = function_metadata()
+
+
+def requests_analysis_before_forecast(question: str) -> bool:
+    """Return whether one turn explicitly asks for analysis and a forecast."""
+
+    compact = "".join(question.lower().split())
+    return any(word in compact for word in ("分析", "研究", "诊断")) and any(
+        word in compact for word in ("预测", "预报")
+    )
+
+
+def requests_explicit_data_analysis(question: str) -> bool:
+    """Conservatively recognize a request to calculate against selected data."""
+
+    compact = "".join(question.casefold().split())
+    discussion_cues = (
+        "为什么",
+        "是什么",
+        "怎么做",
+        "如何做",
+        "怎么分析",
+        "如何分析",
+        "哪些方法",
+        "什么方法",
+        "分析思路",
+        "研究思路",
+        "给些建议",
+        "通常",
+        "介绍一下",
+        "解释一下",
+        "想研究",
+    )
+    explicit_cues = (
+        "请分析",
+        "帮我分析",
+        "开始分析",
+        "进行分析",
+        "执行分析",
+        "直接分析",
+        "请计算",
+        "帮我计算",
+        "开始计算",
+        "执行计算",
+        "跑一下",
+        "运行分析",
+        "基于当前数据",
+        "分析这批数据",
+        "分析当前数据",
+        "分析实际数据",
+    )
+    starts_with_action = compact.startswith(("分析", "计算", "统计", "检验", "诊断"))
+    if any(cue in compact for cue in discussion_cues) and not any(
+        cue in compact for cue in ("开始执行", "立即执行", "直接计算", "实际计算")
+    ):
+        return False
+    return (
+        starts_with_action
+        or any(cue in compact for cue in explicit_cues)
+        or ("继续按" in compact and "分析" in compact)
+    )
+
+
+def guard_dialogue_route(decision: DialogueDecision, question: str) -> DialogueDecision:
+    """Fail closed when a model tries to start EDA from an ambiguous discussion turn."""
+
+    if decision.intent != "new_plan" or requests_explicit_data_analysis(question):
+        return decision
+    return DialogueDecision(
+        intent="discussion",
+        response=(
+            "我会先把这条消息当作电价问题讨论，不会仅因为已经选择了数据就启动计算。"
+            "如果你希望运行当前数据，请明确说“请分析当前数据”，并补充想回答的问题。"
+        ),
+    )
 
 
 class DialogueDecision(BaseModel):
@@ -53,6 +148,16 @@ class DialogueDecision(BaseModel):
     max_lag: int | None = Field(default=None, ge=0)
     comparison_id: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]{0,31}$")
     segments: list[SegmentDefinition] | None = None
+    post_analysis_action: Literal["forecast"] | None = None
+
+    @model_validator(mode="after")
+    def validate_post_analysis_action(self) -> DialogueDecision:
+        if self.post_analysis_action is not None and self.intent not in {
+            "new_plan",
+            "new_news_analysis",
+        }:
+            raise ValueError("post_analysis_action 只适用于分析后继续预测的路由")
+        return self
 
 
 def _compact_comparisons(value: Any) -> dict[str, Any]:
@@ -86,8 +191,7 @@ def _compact_comparisons(value: Any) -> dict[str, Any]:
                 variable: {
                     "segments": {
                         segment_id: {
-                            key: row.get(key)
-                            for key in ("label", "selector", "observations", "correlation", "p_value")
+                            key: row.get(key) for key in ("label", "selector", "observations", "correlation", "p_value")
                         }
                         for segment_id, row in (result.get("segments") or {}).items()
                     },
@@ -144,9 +248,7 @@ def _compact_price_evidence(value: Any) -> dict[str, Any]:
         compact["autocorrelation"] = autocorrelation
     partial = value.get("partial_autocorrelation")
     if isinstance(partial, dict):
-        compact["partial_autocorrelation"] = {
-            key: item for key, item in partial.items() if key != "series"
-        }
+        compact["partial_autocorrelation"] = {key: item for key, item in partial.items() if key != "series"}
     duration = value.get("duration_curve")
     if isinstance(duration, dict):
         compact["duration_curve"] = {
@@ -177,7 +279,9 @@ def _compact_section_series(value: Any, *, drop: frozenset[str]) -> dict[str, An
     series = value.get("series")
     if isinstance(series, dict):
         compact["series"] = {
-            name: ({key: item for key, item in result.items() if key not in drop} if isinstance(result, dict) else result)
+            name: (
+                {key: item for key, item in result.items() if key not in drop} if isinstance(result, dict) else result
+            )
             for name, result in series.items()
         }
     return compact
@@ -240,6 +344,102 @@ def compact_evidence(
     return compact
 
 
+def _compact_dialogue_retry_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep the facts needed to route a turn after a truncated dialogue response."""
+
+    current_plan = payload.get("current_plan")
+    if isinstance(current_plan, dict):
+        current_plan = {
+            key: current_plan.get(key)
+            for key in (
+                "plan_id",
+                "plan_kind",
+                "question",
+                "objective",
+                "skill_name",
+                "skill_version",
+                "data_fingerprint",
+                "selected_variables",
+                "variable_selection_stage",
+                "steps",
+            )
+            if key in current_plan
+        }
+
+    def short_messages(items: Any, limit: int) -> list[dict[str, Any]]:
+        if not isinstance(items, list):
+            return []
+        compacted = []
+        for item in items[-limit:]:
+            if not isinstance(item, dict):
+                continue
+            compacted.append(
+                {
+                    key: (str(value)[-1200:] if key == "content" else value)
+                    for key, value in item.items()
+                    if key in {"role", "content", "turn_id", "episode_id"}
+                }
+            )
+        return compacted
+
+    def short_turns(items: Any, limit: int) -> list[dict[str, Any]]:
+        if not isinstance(items, list):
+            return []
+        turns = []
+        for item in items[-limit:]:
+            if not isinstance(item, dict):
+                continue
+            turns.append(
+                {
+                    "turn_id": item.get("turn_id"),
+                    "messages": short_messages(item.get("messages"), 4),
+                    "relevance": item.get("relevance"),
+                }
+            )
+        return turns
+
+    skills = payload.get("available_skills")
+    compact_skills = [
+        {
+            key: item.get(key)
+            for key in (
+                "name",
+                "version",
+                "domain",
+                "allowed_functions",
+                "research_protocol",
+            )
+            if key in item
+        }
+        for item in skills or []
+        if isinstance(item, dict)
+    ]
+    capabilities = payload.get("output_capabilities")
+    return {
+        "prompt_version": payload.get("prompt_version"),
+        "retry_reason": "上一响应达到输出长度限制；只返回一个简短且完整的结构化决策，response不超过600字。",
+        "question": payload.get("question"),
+        "session_status": payload.get("session_status"),
+        "has_executable_data": payload.get("has_executable_data"),
+        "interaction_context": payload.get("interaction_context"),
+        "conversation_history": short_messages(payload.get("conversation_history"), 4),
+        "earlier_related_turns": short_turns(payload.get("earlier_related_turns"), 2),
+        "episode_memory": list(payload.get("episode_memory") or [])[-4:],
+        "current_plan": current_plan,
+        "study": payload.get("study"),
+        "data_profile": payload.get("data_profile"),
+        "quality_issues": list(payload.get("quality_issues") or [])[:8],
+        "evidence": payload.get("evidence"),
+        "available_variables": payload.get("available_variables"),
+        "available_skills": compact_skills,
+        "allowed_function_names": sorted((payload.get("allowed_functions") or {}).keys()),
+        "intent_rules": payload.get("intent_rules"),
+        "revision_contract": payload.get("revision_contract"),
+        "skill_contract": payload.get("skill_contract"),
+        "supported_workflows": (capabilities.get("supported_workflows") if isinstance(capabilities, dict) else None),
+    }
+
+
 class ModelResearchDialogue:
     """Call the required model for every research conversation decision."""
 
@@ -271,6 +471,7 @@ class ModelResearchDialogue:
         status: str,
         config: StudyConfig | None,
         plan: EDAPlan | None,
+        scope: EDAResearchScope | None = None,
         data_profile: dict[str, Any] | None,
         quality_report: dict[str, Any] | None,
         summary: dict[str, Any] | None,
@@ -282,6 +483,7 @@ class ModelResearchDialogue:
         episode_goal: str | None = None,
         latest_run: dict[str, Any] | None = None,
         current_turn_id: str | None = None,
+        has_executable_data: bool | None = None,
     ) -> DialogueDecision:
         if not self.enabled:
             raise ResearchModelUnavailableError("大模型尚未配置，无法处理研究对话。")
@@ -314,11 +516,12 @@ class ModelResearchDialogue:
             },
             "question": question,
             "session_status": status,
-            "has_executable_data": config is not None,
+            "has_executable_data": config is not None if has_executable_data is None else has_executable_data,
             "conversation_history": [item.model_dump(mode="json") for item in recent_history],
             "earlier_related_turns": [item.as_payload() for item in earlier_related_turns],
             "episode_memory": compact_episode_context(episode_summaries or []),
             "current_plan": plan.model_dump(mode="json") if plan is not None else None,
+            "research_scope": scope.model_dump(mode="json") if scope is not None else None,
             "study": {
                 "name": config.study.name if config is not None else None,
                 "market": config.study.market if config is not None else None,
@@ -345,11 +548,14 @@ class ModelResearchDialogue:
                 for function_name, metadata in FUNCTION_METADATA.items()
             },
             "intent_rules": {
-                "discussion": "方法讨论或当前方案说明，返回文字解释",
-                "new_plan": "根据数据和问题创建确定性分析方案",
+                "discussion": "电价领域问答、问候、方法讨论、必要澄清、当前方案说明或无关问题引导",
+                "new_plan": "用户明确要求计算实际数据时，根据数据和问题创建分析任务",
                 "revise_plan": "按用户反馈生成当前方案的变更",
                 "explain_result": "引用已有结构化证据解释结果",
                 "execute_plan": "用户明确确认运行当前方案",
+                "new_news_analysis": "用户明确要求分析与电价相关的新闻或政策事件",
+                "new_forecast_plan": "用户只要求山东次日省级实时电价预测；参数由本地固定",
+                "execute_forecast_plan": "用户明确确认运行已冻结的预测方案",
             },
             "revision_contract": {
                 "unchanged_fields": "null",
@@ -361,16 +567,38 @@ class ModelResearchDialogue:
             },
             "skill_contract": {
                 "new_plan_skill_name": "choose_from_available_skills",
+                "uploaded_data_without_execution_request": "discussion",
+                "domain": "electricity_price_only",
             },
         }
-        messages = [
-            ModelMessage(role="system", content=DIALOGUE_SYSTEM_PROMPT),
-            ModelMessage(role="user", content=json.dumps(payload, ensure_ascii=False)),
-        ]
+
+        def invoke(value: dict[str, Any]) -> DialogueDecision:
+            messages = [
+                ModelMessage(role="system", content=DIALOGUE_SYSTEM_PROMPT),
+                ModelMessage(role="user", content=json.dumps(value, ensure_ascii=False)),
+            ]
+            kwargs: dict[str, Any] = {"messages": messages, "schema": DialogueDecision}
+            if "purpose" in inspect.signature(self.gateway.invoke_structured).parameters:
+                kwargs["purpose"] = (
+                    ModelRequestPurpose.RESULT_EXPLANATION
+                    if summary is not None or evaluation is not None
+                    else ModelRequestPurpose.DIALOGUE
+                )
+            return self.gateway.invoke_structured(**kwargs)
+
         try:
-            return self.gateway.invoke_structured(messages=messages, schema=DialogueDecision)
+            try:
+                return guard_dialogue_route(invoke(payload), question)
+            except (ModelOutputTruncatedError, ModelContextLimitError):
+                return guard_dialogue_route(invoke(_compact_dialogue_retry_payload(payload)), question)
+        except ModelOutputTruncatedError as exc:
+            raise ResearchModelOutputTruncatedError(f"大模型对话输出达到长度限制：{exc}") from exc
+        except ModelContextLimitError as exc:
+            raise ResearchModelContextLimitError(f"大模型对话请求超过上下文限制：{exc}") from exc
+        except ModelTransientError as exc:
+            raise ResearchModelTransientError(f"大模型对话暂时不可用：{exc}") from exc
         except ModelResponseError as exc:
-            raise ResearchPlanValidationError(f"大模型返回的对话决策无法解析：{exc}") from exc
+            raise ResearchModelSchemaError(f"大模型返回的对话决策无法解析：{exc}") from exc
         except (ModelConfigurationError, ModelGatewayError) as exc:
             raise ResearchModelUnavailableError(f"大模型对话调用失败：{exc}") from exc
 
@@ -399,9 +627,7 @@ class MainResearchAgent:
 
         enabled_functions = {step.function for step in revised.enabled_steps}
         enabled_item_ids = {
-            FUNCTION_AGENDA_ITEM_IDS[name]
-            for name in enabled_functions
-            if name in FUNCTION_AGENDA_ITEM_IDS
+            FUNCTION_AGENDA_ITEM_IDS[name] for name in enabled_functions if name in FUNCTION_AGENDA_ITEM_IDS
         }
         canonical_by_item_id = {
             FUNCTION_AGENDA_ITEM_IDS[name]: hypothesis
@@ -425,11 +651,7 @@ class MainResearchAgent:
                     represented_item_ids.add(item_id)
 
         generated = set(FUNCTION_AGENDA_HYPOTHESES.values())
-        kept = [
-            item
-            for item in kept
-            if item not in generated or item in canonical_by_item_id.values()
-        ]
+        kept = [item for item in kept if item not in generated or item in canonical_by_item_id.values()]
         for item_id, hypothesis in canonical_by_item_id.items():
             if item_id not in represented_item_ids and hypothesis not in kept:
                 kept.append(hypothesis)
@@ -468,9 +690,7 @@ class MainResearchAgent:
             if unknown_functions:
                 raise ResearchPlanValidationError(f"大模型修订包含未知研究函数：{', '.join(unknown_functions)}")
             if plan.research_protocol_function_order:
-                outside_protocol = sorted(
-                    enabled_functions.difference(plan.research_protocol_function_order)
-                )
+                outside_protocol = sorted(enabled_functions.difference(plan.research_protocol_function_order))
                 if outside_protocol:
                     raise ResearchPlanValidationError(
                         f"大模型修订包含领域协议未授权函数：{', '.join(outside_protocol)}"
@@ -623,11 +843,7 @@ class MainResearchAgent:
                     )
                 )
             revised = revised.model_copy(update={"steps": extra_steps})
-        agenda_decision = (
-            decision.model_copy(update={"hypotheses": []})
-            if selection_stage == "screening"
-            else decision
-        )
+        agenda_decision = decision.model_copy(update={"hypotheses": []}) if selection_stage == "screening" else decision
         revised = revised.model_copy(
             update={
                 "hypotheses": self._revised_agenda(

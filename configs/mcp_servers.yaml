@@ -1,0 +1,21 @@
+version: 1
+servers:
+  - server_id: browser
+    label: Playwright 浏览器（P2新闻采集）
+    enabled: true
+    transport: stdio
+    command: npx
+    args:
+      - -y
+      - "@playwright/mcp@0.0.80"
+      - --headless
+      - --isolated
+      - --image-responses=omit
+    read_timeout_seconds: 60
+    allowed_tools:
+      - browser_navigate
+      - browser_evaluate
+      - browser_snapshot
+      - browser_wait_for
+      - browser_tabs
+      - browser_close

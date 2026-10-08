@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from app.research.schemas.study import AnalysisSettings, SeriesSpec, StudyConfig, StudyDefinition
+from app.research.schemas.study import AnalysisSettings, SeriesSpec, StudyConfig, StudyDefinition, StudyInputDescriptor
 from app.runtime_paths import default_research_output_directory
 
 
@@ -205,3 +205,24 @@ def infer_study_context(
         exogenous=exogenous,
         analysis=AnalysisSettings(output_directory=artifact_root),
     )
+
+
+def resolve_study_input(descriptor: StudyInputDescriptor) -> StudyConfig:
+    """Read and infer a full execution contract after the dialogue route requires data."""
+
+    config = infer_study_context(
+        target_path=descriptor.target_path,
+        actuals_path=descriptor.actuals_path,
+        forecasts_path=descriptor.forecasts_path,
+        output_directory=descriptor.output_directory,
+    )
+    study_updates = {
+        "start_time": descriptor.start_time,
+        "end_time": descriptor.end_time,
+    }
+    for name in ("name", "market", "timezone", "frequency"):
+        descriptor_name = "study_name" if name == "name" else name
+        value = getattr(descriptor, descriptor_name)
+        if value is not None:
+            study_updates[name] = value
+    return config.model_copy(update={"study": config.study.model_copy(update=study_updates)})

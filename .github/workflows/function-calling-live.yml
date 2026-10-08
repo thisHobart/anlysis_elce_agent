@@ -1,0 +1,117 @@
+name: Live Function Calling Acceptance
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 18 * * *"
+  workflow_call:
+    secrets:
+      LIVE_OPENAI_BASE_URL:
+        required: true
+      LIVE_OPENAI_API_KEY:
+        required: true
+      LIVE_OPENAI_MODEL:
+        required: true
+      LIVE_GEMINI_API_KEY:
+        required: true
+      LIVE_GEMINI_MODEL:
+        required: true
+      LIVE_PROMPT_JSON_BASE_URL:
+        required: true
+      LIVE_PROMPT_JSON_API_KEY:
+        required: true
+      LIVE_PROMPT_JSON_MODEL:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  openai-native:
+    runs-on: ubuntu-latest
+    env:
+      VPP_LLM_PROVIDER: custom
+      VPP_LLM_BASE_URL: ${{ secrets.LIVE_OPENAI_BASE_URL }}
+      VPP_LLM_API_KEY: ${{ secrets.LIVE_OPENAI_API_KEY }}
+      VPP_LLM_MODEL: ${{ secrets.LIVE_OPENAI_MODEL }}
+      VPP_LLM_STRUCTURED_OUTPUT_METHOD: function_calling
+      VPP_LLM_CONTEXT_WINDOW_TOKENS: "32768"
+      VPP_LLM_MAX_OUTPUT_TOKENS: "4096"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -e .
+      - run: python scripts/probe_dynamic_tool_turn.py --case openai-native --output artifacts/live/openai-native.json
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-openai-native
+          path: artifacts/live/openai-native.json
+
+  gemini-native:
+    runs-on: ubuntu-latest
+    env:
+      VPP_LLM_PROVIDER: gemini
+      VPP_LLM_API_KEY: ${{ secrets.LIVE_GEMINI_API_KEY }}
+      VPP_LLM_MODEL: ${{ secrets.LIVE_GEMINI_MODEL }}
+      VPP_LLM_STRUCTURED_OUTPUT_METHOD: function_calling
+      VPP_LLM_CONTEXT_WINDOW_TOKENS: "32768"
+      VPP_LLM_MAX_OUTPUT_TOKENS: "4096"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -e .
+      - run: python scripts/probe_dynamic_tool_turn.py --case gemini-native --output artifacts/live/gemini-native.json
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-gemini-native
+          path: artifacts/live/gemini-native.json
+
+  prompt-json:
+    runs-on: ubuntu-latest
+    env:
+      VPP_LLM_PROVIDER: custom
+      VPP_LLM_BASE_URL: ${{ secrets.LIVE_PROMPT_JSON_BASE_URL }}
+      VPP_LLM_API_KEY: ${{ secrets.LIVE_PROMPT_JSON_API_KEY }}
+      VPP_LLM_MODEL: ${{ secrets.LIVE_PROMPT_JSON_MODEL }}
+      VPP_LLM_STRUCTURED_OUTPUT_METHOD: prompt_json
+      VPP_LLM_CONTEXT_WINDOW_TOKENS: "32768"
+      VPP_LLM_MAX_OUTPUT_TOKENS: "4096"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -e .
+      - run: python scripts/probe_dynamic_tool_turn.py --case prompt-json --output artifacts/live/prompt-json.json
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-prompt-json
+          path: artifacts/live/prompt-json.json
+
+  release-gate:
+    if: always()
+    needs: [openai-native, gemini-native, prompt-json]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all live protocols
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          results = json.loads(os.environ["RESULTS"])
+          failed = {name: item["result"] for name, item in results.items() if item["result"] != "success"}
+          if failed:
+              print(f"Live protocol acceptance failed: {failed}")
+              sys.exit(1)
+          PY

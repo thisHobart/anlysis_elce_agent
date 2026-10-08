@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
 from uuid import uuid4
-
-import pandas as pd
 
 from app.research.agent.errors import DuplicateResearchFunctionError, ResearchPlanValidationError
 from app.research.agent.schemas import EDAPlan, EDAPlanStep
@@ -14,6 +11,7 @@ from app.research.planning.contracts import DraftStep, EDAPlanDraft
 from app.research.schemas.study import StudyConfig
 from app.research.skills.contracts import SkillDefinition
 from app.research.tools.catalog import FUNCTION_CATALOG
+from app.research.tools.parameters import compile_function_parameters, max_lag_limit
 
 FUNCTION_AGENDA_HYPOTHESES: dict[str, str] = {
     "price_descriptive_distribution": "电价分布可能明显偏斜或存在厚尾。",
@@ -80,7 +78,32 @@ FUNCTION_AGENDA_ITEM_IDS: dict[str, str] = {
 }
 
 
-def _agenda_hypotheses(draft: EDAPlanDraft, functions: list[str]) -> tuple[list[str], list[str]]:
+def _requested_statistics(question: str) -> tuple[str, ...]:
+    normalized = question.casefold()
+    mappings = (
+        ("mean", ("均值", "平均值", "mean", "average")),
+        ("min", ("最低", "最小", "minimum", " min")),
+        ("max", ("最高", "最大", "maximum", " max")),
+    )
+    return tuple(name for name, terms in mappings if any(term in normalized for term in terms))
+
+
+def _is_statistic_deliverable(hypothesis: str, requested: tuple[str, ...]) -> bool:
+    terms = {
+        "mean": ("均值", "平均值", "mean", "average"),
+        "min": ("最低", "最小", "minimum"),
+        "max": ("最高", "最大", "maximum"),
+    }
+    normalized = hypothesis.casefold()
+    return bool(requested) and all(any(term in normalized for term in terms[name]) for name in requested)
+
+
+def _agenda_hypotheses(
+    draft: EDAPlanDraft,
+    functions: list[str],
+    *,
+    requested_statistics: tuple[str, ...] = (),
+) -> tuple[list[str], list[str]]:
     """Build the agenda from the selected functions, keeping one hypothesis per item.
 
     The planner's own wording is preferred when it resolves to an item, because it
@@ -100,98 +123,14 @@ def _agenda_hypotheses(draft: EDAPlanDraft, functions: list[str]) -> tuple[list[
     for hypothesis in draft.hypotheses:
         item_id = resolve_agenda_item(hypothesis)
         if item_id is None:
+            if _is_statistic_deliverable(hypothesis, requested_statistics):
+                continue
             parked.append(hypothesis)
             continue
         agenda.setdefault(item_id, hypothesis)
     for item_id, hypothesis in generated.items():
         agenda.setdefault(item_id, hypothesis)
     return list(agenda.values()), list(dict.fromkeys(parked))
-
-
-def _intervals_per_hour(frequency: str) -> float:
-    offset = pd.tseries.frequencies.to_offset(frequency)
-    seconds = offset.nanos / 1_000_000_000
-    return 3600 / seconds
-
-
-def max_lag_limit(frequency: str, *, days: int = 31) -> int:
-    """Convert a duration safety limit to canonical intervals."""
-
-    return max(1, round(days * 24 * _intervals_per_hour(frequency)))
-
-
-def _parameter_int(parameters: dict[str, Any], key: str, default: int) -> int:
-    value = parameters.get(key, default)
-    if isinstance(value, bool):
-        raise ResearchPlanValidationError(f"{key} 必须是整数")
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise ResearchPlanValidationError(f"{key} 必须是整数") from exc
-
-
-def compile_function_parameters(
-    function_name: str,
-    parameters: dict[str, Any],
-    *,
-    selected_variables: list[str],
-    config: StudyConfig,
-    enabled: bool,
-) -> dict[str, Any]:
-    """Fill trusted arguments and reject parameters unrelated to one atomic function."""
-
-    spec = FUNCTION_CATALOG[function_name]
-    supplied = dict(parameters)
-    compiled: dict[str, Any] = {}
-
-    if spec.uses_variables:
-        requested_variables = supplied.pop("variables", selected_variables)
-        if requested_variables != selected_variables:
-            raise ResearchPlanValidationError(f"{function_name}.variables 必须与方案所选变量一致")
-        if enabled and len(selected_variables) < spec.min_variables:
-            raise ResearchPlanValidationError(
-                f"模型启用了 {function_name}，但所选外生变量少于 {spec.min_variables} 个"
-            )
-        compiled["variables"] = selected_variables
-    elif "variables" in supplied:
-        raise ResearchPlanValidationError(f"{function_name} 不接受 variables 参数")
-
-    if spec.uses_max_lag:
-        maximum = max_lag_limit(config.study.frequency)
-        max_lag = _parameter_int(supplied, "max_lag", config.analysis.max_lag)
-        supplied.pop("max_lag", None)
-        supplied.pop("max_lag_limit", None)
-        if not 0 <= max_lag <= maximum:
-            raise ResearchPlanValidationError(f"{function_name}.max_lag 必须在 0 到 {maximum} 之间")
-        compiled.update({"max_lag": max_lag, "max_lag_limit": maximum})
-    elif "max_lag" in supplied or "max_lag_limit" in supplied:
-        raise ResearchPlanValidationError(f"{function_name} 不接受 max_lag 参数")
-
-    if spec.uses_segments:
-        comparison_id = supplied.pop("comparison_id", None)
-        segments = supplied.pop("segments", None)
-        if not comparison_id or not segments:
-            raise ResearchPlanValidationError(f"{function_name} 必须提供 comparison_id 和至少两个 segments")
-        compiled["comparison_id"] = comparison_id
-        compiled["segments"] = segments
-    elif "comparison_id" in supplied or "segments" in supplied:
-        raise ResearchPlanValidationError(f"{function_name} 不接受分段参数")
-
-    if spec.uses_spike_multiplier:
-        supplied.pop("spike_iqr_multiplier", None)
-        compiled["spike_iqr_multiplier"] = config.analysis.spike_iqr_multiplier
-    if spec.uses_outlier_multiplier:
-        supplied.pop("outlier_iqr_multiplier", None)
-        compiled["outlier_iqr_multiplier"] = config.analysis.outlier_iqr_multiplier
-    if spec.category == "relationship":
-        supplied.pop("min_observations", None)
-        compiled["min_observations"] = config.analysis.min_relationship_observations
-
-    if supplied:
-        raise ResearchPlanValidationError(
-            f"{function_name} 包含不支持的参数：{', '.join(sorted(supplied))}"
-        )
-    return compiled
 
 
 def compile_function_step(
@@ -315,7 +254,12 @@ class EDAPlanCompiler:
             notes.append("目标电价单位未知，绝对数值和阈值解释前需要用户确认单位。")
         if "unspecified" in config.study.market.casefold():
             notes.append("市场范围尚未明确，当前不生成依赖具体市场规则的解释。")
-        agenda, parked = _agenda_hypotheses(draft, ordered_names)
+        requested_statistics = _requested_statistics(question)
+        agenda, parked = _agenda_hypotheses(
+            draft,
+            ordered_names,
+            requested_statistics=requested_statistics,
+        )
         if parked:
             notes.append(
                 "以下说法没有对应的确定性检验，未列入本轮议程：" + "；".join(parked[:3])
@@ -348,6 +292,8 @@ class EDAPlanCompiler:
             ),
             hypotheses=agenda,
             unverifiable_hypotheses=parked,
+            analysis_kind="descriptive" if requested_statistics else "research",
+            requested_statistics=requested_statistics,
             selected_variables=selected,
             variable_selection_mode=draft.variable_selection_mode,
             variable_selection_stage=draft.variable_selection_stage,

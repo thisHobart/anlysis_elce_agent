@@ -7,11 +7,18 @@ from pathlib import Path
 
 import pytest
 
+from app.llm.budget import ModelRequestPurpose
 from app.llm.gateway import ModelMessage
-from app.research.agent.orchestrator import DIALOGUE_PROMPT_VERSION, ModelResearchDialogue, compact_evidence
+from app.research.agent.orchestrator import (
+    DIALOGUE_PROMPT_VERSION,
+    DialogueDecision,
+    ModelResearchDialogue,
+    compact_evidence,
+    guard_dialogue_route,
+)
 from app.research.agent.prompts import DIALOGUE_SYSTEM_PROMPT
 from app.research.agent.schemas import EDAPlan
-from app.research.agent.subagents.eda import AGENDA_FUNCTION_NAME, PLANNING_PROMPT_VERSION, ModelEDAPlanner
+from app.research.agent.subagents.eda import PLANNING_PROMPT_VERSION, ModelEDAPlanner
 from app.research.application.planning import prepare_research_data
 from app.research.reporting.capabilities import FIGURE_CATALOG
 from app.research.schemas.study import load_study_config
@@ -24,27 +31,16 @@ class CaptureGateway:
 
     def __init__(self) -> None:
         self.calls: list[list[ModelMessage]] = []
+        self.purposes: list[ModelRequestPurpose] = []
 
-    def invoke_structured(self, *, messages, schema):
+    def invoke_structured(self, *, messages, schema, purpose):
         self.calls.append(messages)
+        self.purposes.append(purpose)
         raise RuntimeError(f"captured {schema.__name__}")
 
     def invoke_text(self, *, messages):
         self.calls.append(messages)
         raise RuntimeError("captured text")
-
-
-class ToolCallCaptureGateway(CaptureGateway):
-    """Capture the tool set a planning call would actually offer the model."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.tools: list[list[dict]] = []
-
-    def invoke_tool_calls(self, *, messages, tools):
-        self.calls.append(messages)
-        self.tools.append(tools)
-        raise RuntimeError("captured tool calls")
 
 
 def _payload(messages: list[ModelMessage]) -> dict:
@@ -57,7 +53,7 @@ def test_planning_prompt_states_local_eda_scope_and_version(synthetic_study: Pat
     skill = load_skill(Path("app/research/skills/price-exogenous-eda/SKILL.md"), source="builtin")
     gateway = CaptureGateway()
 
-    with pytest.raises(RuntimeError, match="captured EDAPlanDraft"):
+    with pytest.raises(RuntimeError, match="captured EDAPlanIntent"):
         ModelEDAPlanner(gateway=gateway).propose(
             "分析电价分布",
             config,
@@ -67,23 +63,20 @@ def test_planning_prompt_states_local_eda_scope_and_version(synthetic_study: Pat
 
     messages = gateway.calls[0]
     assert "输入文件由本地程序只读加载" in messages[0].content
-    assert "Function Calling" in messages[0].content
+    assert "EDAPlanIntent schema" in messages[0].content
     payload = _payload(messages)
     assert payload["prompt_version"] == PLANNING_PROMPT_VERSION
     assert "task_scope" not in payload
     assert "output_schema" not in payload
-    assert payload["output_capabilities"]["automatic_report_generation"] is True
-    assert payload["output_capabilities"]["figure_format"] == "SVG"
+    assert "automatic_report_generation" in payload["output_capability_ids"]
     assert payload["constraints"]["executable_functions"] == "provided_function_names_only"
     assert payload["constraints"]["function_cardinality"] == "each_function_at_most_once_per_plan"
-    assert "price_calendar_group_profile" in payload["allowed_functions"]
-    assert payload["allowed_functions"]["price_segment_distribution_comparison"]["batch_parameter"] == "segments"
-    assert payload["allowed_functions"]["price_lag_autocorrelation"]["batch_parameter"] == "max_lag"
+    functions = {item["name"]: item for item in payload["allowed_functions"]}
+    assert "price_calendar_group_profile" in functions
+    assert functions["price_segment_distribution_comparison"]["accepts_segments"] is True
+    assert functions["price_lag_autocorrelation"]["accepts_max_lag"] is True
     assert "reasoning_control" not in payload
-    assert (
-        payload["active_skill"]["research_protocol"]["protocol_id"]
-        == "electricity-price-evidence-ladder"
-    )
+    assert payload["active_skill"]["research_protocol"]["protocol_id"] == "electricity-price-evidence-ladder"
     assert "method_id" not in json.dumps(payload, ensure_ascii=False)
     assert "target_must_never_appear_in_selected_variables" not in payload["constraints"]
 
@@ -125,7 +118,7 @@ def test_planning_prompt_keeps_episode_memory_outside_trimmed_chat(synthetic_stu
     ]
     memory = [{"episode_id": "episode-kept", "summary": "已验证历史证据。"}]
 
-    with pytest.raises(RuntimeError, match="captured EDAPlanDraft"):
+    with pytest.raises(RuntimeError, match="captured EDAPlanIntent"):
         ModelEDAPlanner(gateway=gateway).propose(
             "继续分析 actual_wind 的滞后关系",
             config,
@@ -137,9 +130,7 @@ def test_planning_prompt_keeps_episode_memory_outside_trimmed_chat(synthetic_stu
 
     payload = _payload(gateway.calls[0])
     assert len(payload["conversation_history"]) == 8
-    assert "继续分析 actual_wind 的滞后关系" not in {
-        item["content"] for item in payload["conversation_history"]
-    }
+    assert "继续分析 actual_wind 的滞后关系" not in {item["content"] for item in payload["conversation_history"]}
     assert [item["turn_id"] for item in payload["earlier_related_turns"]] == ["turn-old"]
     assert [item["role"] for item in payload["earlier_related_turns"][0]["messages"]] == [
         "user",
@@ -205,16 +196,14 @@ def test_dialogue_prompt_states_route_contract_and_version(synthetic_study: Path
     assert "task_scope" not in payload
     assert "output_schema" not in payload
     assert payload["output_capabilities"]["desktop_report_reader"] is True
+    assert "news" in payload["output_capabilities"]["supported_workflows"]
     assert payload["interaction_context"]["current_run"]["status"] == "available"
     assert payload["interaction_context"]["current_run"]["figure_count"] == 2
     assert [item["key"] for item in payload["interaction_context"]["current_run"]["figures"]] == [
         "seasonal_patterns",
         "correlation_matrix",
     ]
-    assert (
-        payload["revision_contract"]["function_selection"]
-        == "non_null_enabled_functions_is_complete_replacement"
-    )
+    assert payload["revision_contract"]["function_selection"] == "non_null_enabled_functions_is_complete_replacement"
     assert payload["revision_contract"]["agenda_selection"] == (
         "a_replaced_function_set_rebuilds_the_agenda_from_retained_functions"
     )
@@ -259,9 +248,7 @@ def test_dialogue_prompt_does_not_treat_missing_current_artifacts_as_missing_cap
         "figure_count": 0,
         "figures": [],
     }
-    figure_catalog = {
-        item["key"]: item for item in payload["output_capabilities"]["figure_catalog"]
-    }
+    figure_catalog = {item["key"]: item for item in payload["output_capabilities"]["figure_catalog"]}
     assert figure_catalog["seasonal_patterns"]["form"] == "柱状图"
     assert figure_catalog["price_month_profile"]["title"] == "分月份平均电价"
     assert figure_catalog["correlation_matrix"]["form"] == "热力图"
@@ -276,10 +263,7 @@ def test_compact_evidence_preserves_periodic_results_without_large_profiles():
             "methods": ["price_calendar_group_profile", "price_seasonal_decomposition"],
             "seasonality": {"hour_of_day": [{"group": 0, "mean": 10.0}]},
             "decomposition": {"seasonal_strength": {"day": 0.7}},
-            "autocorrelation": [
-                {"lag": lag, "correlation": lag / 100}
-                for lag in range(1, 41)
-            ],
+            "autocorrelation": [{"lag": lag, "correlation": lag / 100} for lag in range(1, 41)],
             "partial_autocorrelation": {
                 "max_lag": 40,
                 "series": [{"lag": lag, "partial_correlation": 0.1} for lag in range(1, 41)],
@@ -343,7 +327,7 @@ def test_automatic_revision_prompt_contains_current_plan_and_approval_boundary(s
         "allowed_changes": {"max_lag": "decrease only"},
     }
 
-    with pytest.raises(RuntimeError, match="captured EDAPlanDraft"):
+    with pytest.raises(RuntimeError, match="captured EDAPlanIntent"):
         ModelEDAPlanner(gateway=gateway).propose_with_context(
             "分析电价",
             config,
@@ -362,6 +346,58 @@ def test_recorded_planning_prompt_version_cannot_drift_from_the_prompt_in_use():
     """The version written into research_plan.json is provenance, not a label."""
 
     assert EDAPlan.model_fields["planning_prompt_version"].default == PLANNING_PROMPT_VERSION
+
+
+def test_dialogue_can_see_selected_but_unparsed_data_without_widening_its_domain():
+    gateway = CaptureGateway()
+
+    with pytest.raises(RuntimeError, match="captured DialogueDecision"):
+        ModelResearchDialogue(gateway=gateway).decide(
+            question="你好，先介绍一下你能讨论什么",
+            status="idle",
+            config=None,
+            has_executable_data=True,
+            plan=None,
+            data_profile=None,
+            quality_report=None,
+            summary=None,
+            evaluation=None,
+            history=[],
+            available_skills=[],
+        )
+
+    payload = _payload(gateway.calls[0])
+    assert payload["has_executable_data"] is True
+    assert payload["study"]["target"] is None
+    assert payload["skill_contract"]["uploaded_data_without_execution_request"] == "discussion"
+    for phrase in (
+        "对问候简短回应",
+        "概念、方法、分析想法",
+        "明确无关的问题",
+        "只有用户明确要求对实际数据进行计算或研究",
+    ):
+        assert phrase in DIALOGUE_SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        ("为什么会出现负电价？", "discussion"),
+        ("想研究一下负荷与电价的关系，可以怎么做？", "discussion"),
+        ("请分析当前数据中的负荷与电价关系", "new_plan"),
+        ("分析这批数据的电价季节性", "new_plan"),
+    ],
+)
+def test_new_plan_requires_an_explicit_current_turn_execution_request(
+    question: str,
+    expected: str,
+):
+    decision = guard_dialogue_route(
+        DialogueDecision(intent="new_plan", skill_name="price-exogenous-eda"),
+        question,
+    )
+
+    assert decision.intent == expected
 
 
 def test_capability_context_locates_methods_and_report_content(synthetic_study: Path):
@@ -416,6 +452,7 @@ def test_dialogue_prompt_names_the_evidence_keys_the_payload_actually_carries(sy
     assert "evaluation" not in payload
     assert payload["evidence"]["evaluation"]["decision"] == "accept"
     assert "evidence.evaluation" in DIALOGUE_SYSTEM_PROMPT
+    assert gateway.purposes == [ModelRequestPurpose.RESULT_EXPLANATION]
 
 
 def test_model_facing_domain_text_uses_the_analysis_vocabulary(synthetic_study: Path):
@@ -426,24 +463,26 @@ def test_model_facing_domain_text_uses_the_analysis_vocabulary(synthetic_study: 
     skill = load_skill(Path("app/research/skills/price-exogenous-eda/SKILL.md"), source="builtin")
     gateway = CaptureGateway()
 
-    with pytest.raises(RuntimeError, match="captured EDAPlanDraft"):
+    with pytest.raises(RuntimeError, match="captured EDAPlanIntent"):
         ModelEDAPlanner(gateway=gateway).propose("分析电价分布", config, prepared.quality, skill=skill)
 
     payload = _payload(gateway.calls[0])
     assert "门禁" not in json.dumps(payload, ensure_ascii=False)
 
 
-def test_a_data_only_skill_still_gets_the_agenda_function(synthetic_study: Path):
-    """Without the agenda call there is no way to answer 'can this data be used at all'."""
+def test_a_data_only_skill_uses_the_compact_intent_without_analysis_functions(
+    synthetic_study: Path,
+):
 
     config = load_study_config(synthetic_study)
     prepared = prepare_research_data(config)
     skill = load_skill(Path("app/research/skills/price-exogenous-eda/SKILL.md"), source="builtin")
     data_only = skill.model_copy(update={"allowed_functions": ["data_quality"]})
-    gateway = ToolCallCaptureGateway()
+    gateway = CaptureGateway()
 
-    with pytest.raises(RuntimeError, match="captured tool calls"):
+    with pytest.raises(RuntimeError, match="captured EDAPlanIntent"):
         ModelEDAPlanner(gateway=gateway).propose("这批数据能用吗", config, prepared.quality, skill=data_only)
 
-    offered = [tool["function"]["name"] for tool in gateway.tools[0]]
-    assert offered == [AGENDA_FUNCTION_NAME]
+    payload = _payload(gateway.calls[0])
+    assert payload["allowed_functions"] == []
+    assert "data_quality" not in json.dumps(payload["allowed_functions"], ensure_ascii=False)

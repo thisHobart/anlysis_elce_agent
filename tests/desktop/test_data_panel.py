@@ -421,13 +421,14 @@ def test_exploring_panel_lights_up_what_is_settled_and_says_nothing_is_taken_yet
         window.close()
 
 
-def test_asking_a_question_lights_up_what_is_already_known(
+@pytest.mark.functional
+def test_asking_a_question_keeps_an_existing_data_snapshot_ready(
     qt_app: QApplication,
     desktop_study: Path,
     model_agent: ResearchCoordinator,
     tmp_path: Path,
 ):
-    """§9.2: the card fills in as the exploration learns, instead of staying blank."""
+    """Chat progress must not relabel a settled data snapshot as a new fetch."""
 
     window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
     select_desktop_data(window, desktop_study)
@@ -435,25 +436,30 @@ def test_asking_a_question_lights_up_what_is_already_known(
         workspace = window.workspace
         panel = workspace.context.data_panel
 
-        # The work runs on a worker thread, so reading the panel straight after the
-        # call catches it mid-exploration, before any answer comes back.
+        settled = build_summary(
+            market="山东电网",
+            target_name="rt_price",
+            exogenous_names=["load"],
+            start_time="2026-01-01T00:00:00",
+            end_time="2026-09-13T23:45:00",
+            frequency="15min",
+        )
+        workspace._set_data_state("ready", settled)
+        ready_summary = workspace.current_session.data_summary
         workspace.submit_question("分析电价分布")
-        exploring_state = panel.state
-        exploring = {
+        state_during_chat = panel.state
+        summary_during_chat = workspace.current_session.data_summary
+        ready_rows = {
             key: (row.value_label.text(), row.mark.text(), row.sub_label.text())
-            for key, row in panel.exploring_card.rows.items()
+            for key, row in panel.ready_card.rows.items()
         }
         wait_until(qt_app, lambda: not workspace.is_busy)
 
-        assert exploring_state == "exploring"
-        # The price is named the same way before and after the data is read.
-        assert exploring["电价"] == (panel.ready_card.rows["电价"].value_label.text(), "✓", "")
-        assert exploring["电价"][0] == "实时电价"
-        assert exploring["影响因素"][0].startswith("正在核对：")
-        assert "统调负荷" in exploring["影响因素"][0]
-        assert exploring["时间范围"][:2] == ("待定", "○")
-        assert exploring["时间范围"][2] == "每小时一个点"
-
+        assert state_during_chat == "ready"
+        assert ready_rows["电价"][0] == "山东电网 实时电价"
+        assert ready_rows["影响因素"][0]
+        assert ready_rows["时间范围"][0] != "待定"
+        assert summary_during_chat == ready_summary
         assert workspace.current_session.data_state == "ready"
         assert panel.ready_card.rows["时间范围"].value_label.text() != "待定"
     finally:

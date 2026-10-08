@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -9,7 +10,20 @@ from app.llm.context_safety import (
     is_output_truncation_error,
     structured_request_budget,
 )
-from app.llm.gateway import ModelContextLimitError, ModelMessage, ModelOutputTruncatedError
+from app.llm.gateway import (
+    ModelContextLimitError,
+    ModelMessage,
+    ModelOutputTruncatedError,
+    ModelResponseError,
+    ModelTransientError,
+)
+from app.research.agent.errors import (
+    ResearchModelContextLimitError,
+    ResearchModelOutputTruncatedError,
+    ResearchModelSchemaError,
+    ResearchModelTransientError,
+)
+from app.research.agent.orchestrator import DialogueDecision, ModelResearchDialogue
 
 
 class _Schema(BaseModel):
@@ -75,3 +89,80 @@ def test_sdk_length_exception_is_recognized_before_a_response_envelope_exists() 
         LengthFinishReasonError("Could not parse response content as the length limit was reached")
     )
     assert not is_output_truncation_error(RuntimeError("connection reset"))
+
+
+def _dialogue_kwargs() -> dict[str, object]:
+    return {
+        "question": "继续分析",
+        "status": "awaiting_user",
+        "config": None,
+        "plan": None,
+        "data_profile": None,
+        "quality_report": None,
+        "summary": None,
+        "evaluation": None,
+        "history": [],
+        "available_skills": [],
+    }
+
+
+@pytest.mark.parametrize(
+    ("gateway_error", "research_error"),
+    [
+        (ModelContextLimitError("too large"), ResearchModelContextLimitError),
+        (ModelResponseError("bad schema"), ResearchModelSchemaError),
+        (ModelTransientError("try later"), ResearchModelTransientError),
+    ],
+)
+def test_dialogue_preserves_model_failure_categories(gateway_error, research_error) -> None:
+    class Gateway:
+        enabled = True
+        model_name = "test"
+
+        def invoke_structured(self, **_kwargs):
+            raise gateway_error
+
+    dialogue = ModelResearchDialogue(gateway=Gateway())
+
+    with pytest.raises(research_error):
+        dialogue.decide(**_dialogue_kwargs())
+
+
+def test_dialogue_retries_a_truncated_response_once_with_changed_bounded_context() -> None:
+    requests: list[dict[str, object]] = []
+
+    class Gateway:
+        enabled = True
+        model_name = "test"
+
+        def invoke_structured(self, *, messages, schema):
+            assert schema is DialogueDecision
+            requests.append(json.loads(messages[-1].content))
+            if len(requests) == 1:
+                raise ModelOutputTruncatedError("length")
+            return DialogueDecision(intent="discussion", response="可以继续。")
+
+    dialogue = ModelResearchDialogue(gateway=Gateway())
+    result = dialogue.decide(**_dialogue_kwargs())
+
+    assert result.response == "可以继续。"
+    assert len(requests) == 2
+    assert "retry_reason" not in requests[0]
+    assert "retry_reason" in requests[1]
+    assert "allowed_functions" in requests[0]
+    assert "allowed_functions" not in requests[1]
+    assert "allowed_function_names" in requests[1]
+
+
+def test_dialogue_reports_truncation_after_its_single_changed_retry() -> None:
+    class Gateway:
+        enabled = True
+        model_name = "test"
+
+        def invoke_structured(self, **_kwargs):
+            raise ModelOutputTruncatedError("length")
+
+    dialogue = ModelResearchDialogue(gateway=Gateway())
+
+    with pytest.raises(ResearchModelOutputTruncatedError):
+        dialogue.decide(**_dialogue_kwargs())

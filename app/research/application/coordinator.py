@@ -13,12 +13,14 @@ from langgraph.types import Command
 
 from app.llm.factory import build_model_gateway
 from app.research.agent.context import MAX_PERSISTED_CONVERSATION_MESSAGES
-from app.research.agent.orchestrator import MainResearchAgent, ModelResearchDialogue
+from app.research.agent.dynamic import DynamicAnalysisAgent
+from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent, ModelResearchDialogue
 from app.research.agent.retrieval import select_persisted_conversation_history
 from app.research.agent.schemas import (
     AgentRunResult,
     ConversationMessage,
     EDAPlan,
+    EDAResearchScope,
     ResearchProposal,
     ResearchTurnResult,
 )
@@ -39,24 +41,39 @@ from app.research.graph.migrations import safe_incompatible_state
 from app.research.graph.narration import (
     HUMAN_GATE_NODES,
     SILENT_NODES,
+    ThinkingStep,
     narrate_event,
     narrate_node,
     progress_message,
 )
+from app.research.graph.process_events import ProcessEvent, process_event_message
 from app.research.graph.tool_result_store import FileToolResultStore, InMemoryToolResultStore, ToolResultStore
-from app.research.graph.workflow import build_research_workflow
-from app.research.schemas.study import StudyConfig
+from app.research.graph.workflow import build_research_workflow, validate_analysis_message_protocol
+from app.research.schemas.study import StudyConfig, StudyInputDescriptor
 from app.research.skills.registry import SkillRegistry
 from app.research.tools.eda.functions import build_eda_tool_registry
 from app.research.tools.registry import ToolRegistry
 
-GRAPH_SCHEMA_VERSION = 11
+GRAPH_SCHEMA_VERSION = 13
 GRAPH_RECURSION_LIMIT = 1000
 MAX_RECALLED_CONVERSATION_MESSAGES = max(1, MAX_PERSISTED_CONVERSATION_MESSAGES - 2)
 
 
 def _conversation_payloads(history: list[Any]) -> list[dict[str, Any]]:
     return [ConversationMessage.model_validate(item).model_dump(mode="json") for item in history]
+
+
+def build_default_agent_roles(
+    tools: ToolRegistry,
+) -> tuple[MainResearchAgent, EDASubagent, DynamicAnalysisAgent]:
+    """Build the three production model roles with one explicit shared gateway."""
+
+    gateway = build_model_gateway()
+    return (
+        MainResearchAgent(model_dialogue=ModelResearchDialogue(gateway=gateway)),
+        EDASubagent(model_planner=ModelEDAPlanner(gateway=gateway, tools=tools)),
+        DynamicAnalysisAgent(gateway=gateway, tools=tools),
+    )
 
 
 class ResearchCoordinator:
@@ -73,18 +90,26 @@ class ResearchCoordinator:
         checkpoint_path: str | Path | None = None,
         checkpointer_handle: CheckpointerHandle | None = None,
         result_store: ToolResultStore | None = None,
+        dynamic_agent: DynamicAnalysisAgent | None = None,
     ) -> None:
         self.skills = skills or SkillRegistry.default()
         self.skill_load_errors = list(self.skills.load_errors)
         self.tools = tools or build_eda_tool_registry()
-        if main_agent is None or eda_subagent is None:
+        if main_agent is None and eda_subagent is None:
+            default_main, default_eda, default_dynamic = build_default_agent_roles(self.tools)
+            main_agent = default_main
+            eda_subagent = default_eda
+            dynamic_agent = dynamic_agent or default_dynamic
+        elif main_agent is None or eda_subagent is None:
             gateway = build_model_gateway()
             main_agent = main_agent or MainResearchAgent(model_dialogue=ModelResearchDialogue(gateway=gateway))
             eda_subagent = eda_subagent or EDASubagent(
                 model_planner=ModelEDAPlanner(gateway=gateway, tools=self.tools)
             )
+            dynamic_agent = dynamic_agent or DynamicAnalysisAgent(gateway=gateway, tools=self.tools)
         self.main_agent = main_agent
         self.eda_subagent = eda_subagent
+        self.dynamic_agent = dynamic_agent
         self.planning = EDAPlanningService(eda_subagent)
         self.execution = execution or EDAExecutionService(registry=self.tools, skills=self.skills)
         self.checkpointer_handle = checkpointer_handle or (
@@ -103,6 +128,7 @@ class ResearchCoordinator:
             tools=self.tools,
             checkpointer=self.checkpointer_handle.saver,
             result_store=self.result_store,
+            dynamic_agent=self.dynamic_agent,
         )
         self.workflow = self.graph
         self._lock = RLock()
@@ -123,12 +149,30 @@ class ResearchCoordinator:
         thread_id: str,
         progress: Callable[[int, str], None] | None = None,
     ) -> None:
-        for update in self.graph.stream(
+        existing = self.graph.get_state(self._config(thread_id))
+        emitted_process_events: set[str] = {
+            str(item.get("event_id"))
+            for item in (existing.values or {}).get("process_events", [])
+            if isinstance(item, dict) and item.get("event_id")
+        }
+        for chunk in self.graph.stream(
             graph_input,
             config=self._config(thread_id),
-            stream_mode="updates",
+            stream_mode=["updates", "custom"],
         ):
-            if not progress or not isinstance(update, dict):
+            if not progress or not isinstance(chunk, tuple) or len(chunk) != 2:
+                continue
+            mode, update = chunk
+            if mode == "custom":
+                try:
+                    event = ProcessEvent.model_validate(update)
+                except (TypeError, ValueError):
+                    continue
+                if event.event_id not in emitted_process_events:
+                    progress(min(99, max(1, event.sequence)), process_event_message(event))
+                    emitted_process_events.add(event.event_id)
+                continue
+            if mode != "updates" or not isinstance(update, dict):
                 continue
             for node_name in update:
                 if str(node_name).startswith("__"):
@@ -141,6 +185,20 @@ class ResearchCoordinator:
                     continue
                 value, step = narrate_node(str(node_name))
                 node_update = update.get(node_name)
+                emitted_for_node = False
+                if isinstance(node_update, dict):
+                    for payload in node_update.get("process_events", []):
+                        try:
+                            event = ProcessEvent.model_validate(payload)
+                        except (TypeError, ValueError):
+                            continue
+                        if event.event_id in emitted_process_events:
+                            continue
+                        progress(min(99, max(1, event.sequence)), process_event_message(event))
+                        emitted_process_events.add(event.event_id)
+                        emitted_for_node = True
+                if emitted_for_node:
+                    continue
                 source_event = ""
                 if isinstance(node_update, dict):
                     events = node_update.get("events")
@@ -162,7 +220,9 @@ class ResearchCoordinator:
         conversation: list[ConversationMessage | dict[str, Any]] | None,
         approval_timeout_seconds: int,
         automatic_approval_enabled: bool,
+        study_input: StudyInputDescriptor | None = None,
         imported: dict[str, Any] | None = None,
+        routed_decision: DialogueDecision | None = None,
     ) -> dict[str, Any]:
         base = {
             "graph_schema_version": GRAPH_SCHEMA_VERSION,
@@ -191,11 +251,16 @@ class ResearchCoordinator:
                 )
             ),
             "study_config": study_config.model_dump(mode="json") if study_config is not None else None,
+            "study_input": study_input.model_dump(mode="json") if study_input is not None else None,
+            "has_executable_data": study_config is not None or study_input is not None,
+            "pending_research_action": None,
             "data_profile": None,
             "quality_report": None,
             "active_skill": None,
             "decision": None,
+            "routed_decision": routed_decision.model_dump(mode="json") if routed_decision else None,
             "current_plan": None,
+            "research_scope": None,
             "plan_history": [],
             "plan_fingerprints": [],
             "planning_failure_fingerprints": [],
@@ -213,6 +278,16 @@ class ResearchCoordinator:
             "tool_result_cache": {},
             "tool_results": [],
             "pending_tool_result": None,
+            "analysis_messages": [],
+            "model_round": 0,
+            "tool_calls_used": 0,
+            "current_tool_batch": [],
+            "provider_call_groups": {},
+            "call_evidence": [],
+            "pending_analysis_text": "",
+            "process_events": [],
+            "process_call_steps": {},
+            "post_analysis_action": None,
             "evaluation": None,
             "eda_summary": None,
             "feedback_packets": [],
@@ -246,6 +321,8 @@ class ResearchCoordinator:
             base.setdefault("episode_history", [])
             base.setdefault("episode_summaries", [])
             base.setdefault("agenda_fingerprints", [])
+            base.setdefault("process_events", [])
+            base.setdefault("process_call_steps", {})
             base.setdefault("automatic_approval_enabled", False)
             base["pending_user_message"] = message
             base["pending_message_id"] = message_id
@@ -253,6 +330,10 @@ class ResearchCoordinator:
             base["study_config"] = study_config.model_dump(mode="json") if study_config is not None else base.get(
                 "study_config"
             )
+            if study_input is not None:
+                base["study_input"] = study_input.model_dump(mode="json")
+            base["has_executable_data"] = bool(base.get("study_config") or base.get("study_input"))
+            base["routed_decision"] = routed_decision.model_dump(mode="json") if routed_decision else None
             base["messages"] = _conversation_payloads(
                 select_persisted_conversation_history(
                     base.get("messages", []),
@@ -262,6 +343,107 @@ class ResearchCoordinator:
                 )
             )
         return base
+
+    def _route_initial_turn(
+        self,
+        *,
+        question: str,
+        study_config: StudyConfig | None,
+        study_input: StudyInputDescriptor | None,
+        history: list[ConversationMessage | dict[str, Any]],
+        imported: dict[str, Any] | None,
+        current_turn_id: str,
+    ) -> DialogueDecision:
+        """Route a new conversation before allocating a persistent research Graph."""
+
+        source = imported or {}
+        config = study_config
+        if config is None and source.get("study_config"):
+            config = StudyConfig.model_validate(source["study_config"])
+        plan = EDAPlan.model_validate(source["current_plan"]) if source.get("current_plan") else None
+        scope = (
+            EDAResearchScope.model_validate(source["research_scope"])
+            if source.get("research_scope")
+            else None
+        )
+        cursor = source.get("loop_cursor") or {}
+        decision, _ = self.main_agent.decide(
+            question=question,
+            status=str(source.get("phase") or "idle"),
+            config=config,
+            plan=plan,
+            scope=scope,
+            data_profile=source.get("data_profile"),
+            quality_report=source.get("quality_report"),
+            summary=source.get("eda_summary"),
+            evaluation=source.get("evaluation"),
+            history=[ConversationMessage.model_validate(item) for item in history],
+            available_skills=self.skills.metadata(),
+            episode_summaries=list(source.get("episode_summaries") or []),
+            active_gate=source.get("user_interrupt_kind") or source.get("return_to_gate"),
+            episode_goal=str(cursor.get("episode_goal") or "") or None,
+            latest_run=source.get("latest_run"),
+            current_turn_id=current_turn_id,
+            has_executable_data=bool(config or study_input or source.get("study_input")),
+        )
+        return decision
+
+    @staticmethod
+    def _direct_dialogue_snapshot(
+        *,
+        thread_id: str,
+        decision: DialogueDecision,
+        history: list[ConversationMessage | dict[str, Any]],
+        turn_id: str,
+        source: dict[str, Any] | None,
+        study_config: StudyConfig | None,
+        study_input: StudyInputDescriptor | None,
+    ) -> ResearchLoopSnapshot:
+        """Return a desktop-compatible reply without creating a research checkpoint."""
+
+        answer = decision.response.strip()
+        if not answer:
+            raise ValueError("直接对话路由没有返回可展示回复")
+        assistant = ConversationMessage(role="assistant", content=answer, turn_id=turn_id)
+        previous = [ConversationMessage.model_validate(item).model_dump(mode="json") for item in history]
+        original = source or {}
+        values = {
+            **original,
+            "phase": "awaiting_user",
+            "control": "reply",
+            "decision": decision.model_dump(mode="json"),
+            "direct_dialogue": True,
+            "assistant_message": answer,
+            "messages": [*previous, assistant.model_dump(mode="json")],
+            "study_config": (
+                study_config.model_dump(mode="json")
+                if study_config is not None
+                else original.get("study_config")
+            ),
+            "study_input": (
+                study_input.model_dump(mode="json")
+                if study_input is not None
+                else original.get("study_input")
+            ),
+            "has_executable_data": bool(
+                study_config or study_input or original.get("study_config") or original.get("study_input")
+            ),
+        }
+        interrupt = InterruptPayload(
+            kind="result",
+            interrupt_id=uuid4().hex,
+            state_revision=0,
+            phase="awaiting_user",
+            message=answer,
+            choices=["followup", "next_round", "stop"],
+        )
+        return ResearchLoopSnapshot(
+            thread_id=thread_id,
+            phase="awaiting_user",
+            values=values,
+            interrupt=interrupt,
+            events=[],
+        )
 
     @staticmethod
     def _interrupt_from_state(snapshot: Any) -> InterruptPayload | None:
@@ -345,10 +527,12 @@ class ResearchCoordinator:
         message_id: str | None = None,
         turn_id: str | None = None,
         study_config: StudyConfig | None = None,
+        study_input: StudyInputDescriptor | None = None,
         conversation: list[ConversationMessage | dict[str, Any]] | None = None,
         approval_timeout_seconds: int = 30,
         automatic_approval_enabled: bool = False,
         imported_state: dict[str, Any] | None = None,
+        route_before_graph: bool = False,
         progress: Callable[[int, str], None] | None = None,
     ) -> ResearchLoopSnapshot:
         text = message.strip()
@@ -368,6 +552,60 @@ class ResearchCoordinator:
                 existing = self.get_snapshot(session_id)
                 if existing.values.get("graph_schema_version") != GRAPH_SCHEMA_VERSION:
                     return existing
+            if not has_compatible_thread and route_before_graph:
+                if progress:
+                    progress(
+                        5,
+                        progress_message(
+                            ThinkingStep(
+                                "route",
+                                "判断处理方式",
+                                "根据当前问题、会话状态和可用数据选择直接回答或研究流程",
+                                "running",
+                            ),
+                            "桌面入口路由",
+                        ),
+                    )
+                routed_decision = self._route_initial_turn(
+                    question=text,
+                    study_config=study_config,
+                    study_input=study_input,
+                    history=recalled_conversation,
+                    imported=imported_state,
+                    current_turn_id=resolved_turn_id,
+                )
+                if progress:
+                    route_detail = (
+                        "直接回答，不启动研究"
+                        if routed_decision.intent in {"discussion", "explain_result"}
+                        else "进入研究流程并继续生成可确认方案"
+                    )
+                    progress(
+                        9,
+                        progress_message(
+                            ThinkingStep(
+                                "answer" if routed_decision.intent in {"discussion", "explain_result"} else "route",
+                                "整理直接回复"
+                                if routed_decision.intent in {"discussion", "explain_result"}
+                                else "进入研究流程",
+                                route_detail,
+                                "running",
+                            ),
+                            "桌面入口路由完成",
+                        ),
+                    )
+                if routed_decision.intent in {"discussion", "explain_result"}:
+                    return self._direct_dialogue_snapshot(
+                        thread_id=session_id,
+                        decision=routed_decision,
+                        history=recalled_conversation,
+                        turn_id=resolved_turn_id,
+                        source=imported_state,
+                        study_config=study_config,
+                        study_input=study_input,
+                    )
+            else:
+                routed_decision = None
             if not has_compatible_thread:
                 payload = self._initial_state(
                     thread_id=session_id,
@@ -375,10 +613,12 @@ class ResearchCoordinator:
                     message_id=resolved_message_id,
                     turn_id=resolved_turn_id,
                     study_config=study_config,
+                    study_input=study_input,
                     conversation=recalled_conversation,
                     approval_timeout_seconds=approval_timeout_seconds,
                     automatic_approval_enabled=automatic_approval_enabled,
                     imported=imported_state,
+                    routed_decision=routed_decision,
                 )
                 self._run_graph(payload, thread_id=session_id, progress=progress)
             else:
@@ -411,7 +651,15 @@ class ResearchCoordinator:
                         "pending_user_message": text,
                         "pending_message_id": resolved_message_id,
                         "pending_turn_id": resolved_turn_id,
-                        "study_config": study_config.model_dump(mode="json") if study_config else None,
+                        "study_config": study_config.model_dump(mode="json") if study_config else snapshot.values.get(
+                            "study_config"
+                        ),
+                        "study_input": study_input.model_dump(mode="json") if study_input else snapshot.values.get(
+                            "study_input"
+                        ),
+                        "has_executable_data": bool(
+                            study_config or study_input or snapshot.values.get("study_config") or snapshot.values.get("study_input")
+                        ),
                     }
                     if conversation is not None:
                         update["messages"] = _conversation_payloads(recalled_conversation)
@@ -489,6 +737,11 @@ class ResearchCoordinator:
             values = dict(raw.values or {})
             if values.get("graph_schema_version") != GRAPH_SCHEMA_VERSION:
                 raise ValueError("旧版本研究循环已失效，请新建对话并重新提交研究问题。")
+            validate_analysis_message_protocol(
+                values.get("analysis_messages", []),
+                values.get("provider_call_groups", {}),
+                allow_pending_current_batch=True,
+            )
             if "execute_tool" in getattr(raw, "next", ()):
                 cursor = int(values.get("tool_cursor", 0))
                 queue = values.get("tool_queue", [])

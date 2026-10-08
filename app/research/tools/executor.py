@@ -7,6 +7,8 @@ import json
 from datetime import UTC, datetime
 from time import perf_counter
 
+from app.research.agent.errors import RepairablePlanError, ResearchPlanValidationError
+from app.research.tools.catalog import FUNCTION_CATALOG
 from app.research.tools.contracts import ToolCall, ToolContext, ToolOutput, ToolResult
 from app.research.tools.policy import ToolPolicy
 from app.research.tools.registry import ToolRegistry, ToolRegistryError
@@ -27,6 +29,31 @@ def output_fingerprint(output: ToolOutput) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def validate_tool_result(
+    call: ToolCall,
+    result: ToolResult,
+    *,
+    registry: ToolRegistry,
+    expected_data_fingerprint: str,
+) -> None:
+    """Validate a fresh, cached, or restored result at one shared trust boundary."""
+
+    if result.call != call:
+        raise ResearchPlanValidationError("工具结果与调用身份不匹配")
+    expected = registry.get(call.name)
+    if result.output.result_key != expected.result_key:
+        raise RepairablePlanError(f"工具 {call.name} 返回了错误结果键：{result.output.result_key}")
+    if result.tool_version != call.version or result.tool_version != expected.version:
+        raise ResearchPlanValidationError("工具结果版本与锁定调用不匹配")
+    if result.data_fingerprint != expected_data_fingerprint:
+        raise ResearchPlanValidationError("工具结果数据指纹与锁定输入不匹配")
+    if output_fingerprint(result.output) != result.output_hash:
+        raise ResearchPlanValidationError(f"工具 {call.name} 的结果与记录的 output_hash 不一致")
+    evidence_field = FUNCTION_CATALOG[call.name].evidence_field
+    if evidence_field is not None and evidence_field not in result.output.value:
+        raise RepairablePlanError(f"工具 {call.name} 的结果缺少证据字段 {evidence_field}")
 
 
 class ToolExecutor:

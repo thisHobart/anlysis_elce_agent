@@ -40,6 +40,8 @@ INTENT_LABELS: dict[str, str] = {
     "new_plan": "生成新的分析方案",
     "revise_plan": "按反馈修订现有方案",
     "execute_plan": "执行当前方案",
+    "new_forecast_plan": "生成山东次日预测方案",
+    "execute_forecast_plan": "执行已冻结的预测方案",
     "discussion": "讨论研究方法",
     "reply": "直接回复",
     "explain_result": "解释已有结果",

@@ -25,7 +25,6 @@ from app.research.agent.retrieval import (
 from app.research.agent.schemas import ConversationMessage
 from app.research.agent.subagents.eda import EDASubagent, ModelEDAPlanner
 from app.research.application.coordinator import ResearchCoordinator
-from app.research.planning.contracts import EDAPlanDraft
 from app.research.schemas.study import load_study_config
 
 
@@ -58,11 +57,7 @@ def test_selector_stays_bounded_through_one_thousand_messages(turn_count: int) -
         for index in range(1, turn_count + 1)
         for message in _turn(
             index,
-            (
-                "请记住压力测试目标 stress-anchor-0001"
-                if index == 1
-                else f"普通压力记录 filler-{index:04d}"
-            ),
+            ("请记住压力测试目标 stress-anchor-0001" if index == 1 else f"普通压力记录 filler-{index:04d}"),
             "stress-anchor-0001 的值是 48" if index == 1 else f"普通回答 {index}",
         )
     ]
@@ -181,10 +176,21 @@ class _CapturingPlannerGateway:
         self.payloads: list[dict] = []
 
     def invoke_structured(self, *, messages, schema):
-        del schema
         payload = json.loads(next(item.content for item in messages if item.role == "user"))
         self.payloads.append(payload)
-        return EDAPlanDraft(objective=payload["question"])
+        return schema.model_validate(
+            {
+                "objective": payload["question"],
+                "variable_selection_mode": "explicit",
+                "selected_variable_ids": ["v2"],
+                "functions": [
+                    {
+                        "function": "relationship_pearson_positive_lead_scan",
+                        "max_lag": 24,
+                    }
+                ],
+            }
+        )
 
 
 def test_graph_planning_path_receives_recent_and_retrieved_memory(
@@ -206,11 +212,7 @@ def test_graph_planning_path_receives_recent_and_retrieved_memory(
     )
     history = [
         *_turn(1, "wind 的 max_lag 不超过 24", "已经记录历史参数。"),
-        *[
-            item
-            for index in range(2, 7)
-            for item in _turn(index, f"普通天气记录 {index}", "普通回答。")
-        ],
+        *[item for index in range(2, 7) for item in _turn(index, f"普通天气记录 {index}", "普通回答。")],
     ]
     try:
         snapshot = coordinator.submit_user_message(
@@ -230,9 +232,7 @@ def test_graph_planning_path_receives_recent_and_retrieved_memory(
     for payload in (dialogue_gateway.payloads[0], planner_gateway.payloads[0]):
         assert len({item["turn_id"] for item in payload["conversation_history"]}) == 4
         assert payload["earlier_related_turns"][0]["turn_id"] == "boundary-turn-0001"
-        assert [
-            item["role"] for item in payload["earlier_related_turns"][0]["messages"]
-        ] == ["user", "assistant"]
+        assert [item["role"] for item in payload["earlier_related_turns"][0]["messages"]] == ["user", "assistant"]
         assert "继续按 max_lag 分析 wind 的滞后关系" not in {
             item["content"] for item in payload["conversation_history"]
         }
@@ -324,11 +324,7 @@ def test_graph_never_injects_an_incomplete_retrieved_turn(graph_boundary_observa
 def test_semantic_paraphrase_without_lexical_overlap_is_recalled() -> None:
     history = [
         *_turn(1, "把图表导出到报告目录", "输出保存为 HTML。"),
-        *[
-            item
-            for index in range(2, 8)
-            for item in _turn(index, f"普通天气记录 {index}", "普通回答。")
-        ],
+        *[item for index in range(2, 8) for item in _turn(index, f"普通天气记录 {index}", "普通回答。")],
     ]
 
     retrieved = retrieve_related(history, question="将可视化写入产物文件夹", exclude=history[-8:])
@@ -339,11 +335,7 @@ def test_semantic_paraphrase_without_lexical_overlap_is_recalled() -> None:
 def test_pronoun_only_reference_beyond_recent_window_is_recalled() -> None:
     history = [
         *_turn(1, "蓝鲸调度窗口设为 48 小时", "已经记录这个参数。"),
-        *[
-            item
-            for index in range(2, 7)
-            for item in _turn(index, f"普通天气记录 {index}", "普通回答。")
-        ],
+        *[item for index in range(2, 7) for item in _turn(index, f"普通天气记录 {index}", "普通回答。")],
     ]
 
     _recent, retrieved = select_conversation_context(history, question="继续按刚才那个做")

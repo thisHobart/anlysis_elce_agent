@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -26,10 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=root / "artifacts" / "research")
     parser.add_argument(
         "--question",
-        default=(
-            "分析 actual_load、forecast_total_generation 与实时电价的同期和领先滞后关系，"
-            "同时检查电价季节性。"
-        ),
+        default=("分析 actual_load、forecast_total_generation 与实时电价的同期和领先滞后关系，同时检查电价季节性。"),
     )
     parser.add_argument(
         "--revision",
@@ -40,10 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--target-only-question",
-        default=(
-            "只基于目标电价序列评估可预测性、平稳性、季节结构和朴素基线误差，"
-            "不要使用任何外生变量。"
-        ),
+        default=("只基于目标电价序列评估可预测性、平稳性、季节结构和朴素基线误差，不要使用任何外生变量。"),
     )
     parser.add_argument(
         "--minimum-request-timeout",
@@ -77,9 +70,7 @@ def validation_settings(minimum_timeout_seconds: float) -> Settings:
     minimum = max(1.0, float(minimum_timeout_seconds))
     if configured.llm_timeout_seconds >= minimum:
         return configured
-    os.environ["VPP_LLM_TIMEOUT_SECONDS"] = str(minimum)
-    get_settings.cache_clear()
-    return get_settings()
+    return configured.model_copy(update={"llm_timeout_seconds": minimum})
 
 
 def _require_interrupt(
@@ -150,9 +141,7 @@ def _finish_result_flow(
 
     stopped = coordinator.resume(session_id=session_id, action="stop", progress=progress)
     if stopped.phase != "stopped" or stopped.interrupt is not None:
-        raise RuntimeError(
-            "Stopping after a limited result did not preserve a legal stopped terminal state."
-        )
+        raise RuntimeError("Stopping after a limited result did not preserve a legal stopped terminal state.")
     if not stopped.values.get("latest_run"):
         raise RuntimeError("Stopping after a limited result discarded the completed run.")
     return stopped, answer, "limited"
@@ -199,9 +188,7 @@ def _run_real_scenario(
 
     plan = planned.values["current_plan"]
     if plan["skill_name"] != expected_skill:
-        raise RuntimeError(
-            f"Expected Skill {expected_skill!r}, got {plan['skill_name']!r}."
-        )
+        raise RuntimeError(f"Expected Skill {expected_skill!r}, got {plan['skill_name']!r}.")
     if expected_skill == "price-forecastability-audit" and plan["selected_variables"]:
         raise RuntimeError("The target-only Skill selected exogenous variables.")
     if revision and int(plan["revision"]) < 2:
@@ -293,10 +280,7 @@ def main() -> int:
         evidence_path.write_text(json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8")
         printable = {
             **evidence,
-            "scenarios": [
-                {**scenario, "explanation": scenario["explanation"][:200]}
-                for scenario in scenarios
-            ],
+            "scenarios": [{**scenario, "explanation": scenario["explanation"][:200]} for scenario in scenarios],
         }
         print(json.dumps(printable, ensure_ascii=True, indent=2))
         return 0

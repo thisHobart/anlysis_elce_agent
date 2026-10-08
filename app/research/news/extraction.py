@@ -126,6 +126,12 @@ _RULES = (
         (re.compile(r"需求激增"), re.compile(r"需求预计增加")),
     ),
     _EventRule(
+        "storage_dispatch",
+        "short_term",
+        "down",
+        (re.compile(r"储能(?:电站)?.{0,12}(?:启动|集中)?放电"), re.compile(r"储能放电")),
+    ),
+    _EventRule(
         "renewable_supply_change",
         "short_term",
         "down",

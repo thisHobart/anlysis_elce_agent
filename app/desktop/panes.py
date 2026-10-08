@@ -35,15 +35,19 @@ from PySide6.QtWidgets import (
 
 from app.desktop.message_widgets import (
     DataPlanMessageWidget,
+    ForecastPlanMessageWidget,
+    ForecastResultMessageWidget,
     NoticeMessageWidget,
+    P2ReviewMessageWidget,
     ResultMessageWidget,
     TextMessageWidget,
     ThinkingMessageWidget,
     ToolMessageWidget,
 )
 from app.desktop.session import DataPanelState, ResearchSession, SessionMessage, TraceEvent
-from app.research.agent.schemas import EDAPlan
+from app.research.agent.schemas import EDAPlan, EDAResearchScope
 from app.research.data.sources.summary import DataSummary, VariableLabel
+from app.research.forecasting.contracts import ForecastPlan
 from app.research.graph.narration import narrate_event
 
 STATUS_LABELS = {
@@ -199,6 +203,8 @@ class ConversationPane(QFrame):
     data_details_requested = Signal()
     end_research_requested = Signal()
     draft_changed = Signal(bool)
+    p2_review_open_requested = Signal()
+    p2_revalidate_requested = Signal(str)
 
     DEFAULT_INPUT_PLACEHOLDER = (
         "说说你想研究什么，例如“负荷对实时电价的影响有多大”“峰谷价差在夏天有什么不同”…"
@@ -211,9 +217,10 @@ class ConversationPane(QFrame):
         super().__init__()
         self.setObjectName("conversationPane")
         self._running = False
+        self._read_only = False
         self._interaction_kind: str | None = None
         self._message_widgets: dict[str, QWidget] = {}
-        self.current_plan_widget: DataPlanMessageWidget | None = None
+        self.current_plan_widget: DataPlanMessageWidget | ForecastPlanMessageWidget | None = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -274,6 +281,7 @@ class ConversationPane(QFrame):
         QShortcut(QKeySequence("Ctrl+Return"), self.input, activated=self._submit_or_cancel)
 
     def set_session(self, session: ResearchSession) -> None:
+        self._read_only = session.read_only
         self.set_interaction_context(None)
         self.title_label.setText(session.title)
         self.status_label.setText(STATUS_LABELS.get(session.status, session.status))
@@ -281,6 +289,7 @@ class ConversationPane(QFrame):
         for message in session.messages:
             self.render_message(message)
         self.scroll_to_bottom()
+        self._refresh_interaction_controls()
 
     def set_status(self, status: str) -> None:
         self.status_label.setText(STATUS_LABELS.get(status, status))
@@ -289,7 +298,6 @@ class ConversationPane(QFrame):
         self._running = running
         self.send_button.setText("停止" if running else "发送")
         self.send_button.setToolTip("停止当前分析" if running else "发送消息（Ctrl+Enter）")
-        self.input.setEnabled(not running)
         self._refresh_interaction_controls()
 
     def set_interaction_context(self, kind: str | None) -> None:
@@ -300,10 +308,13 @@ class ConversationPane(QFrame):
 
     def _refresh_interaction_controls(self) -> None:
         continue_research = self._interaction_kind == "result_limitations"
-        self.input.setPlaceholderText(
-            self.CONTINUE_RESEARCH_PLACEHOLDER if continue_research else self.DEFAULT_INPUT_PLACEHOLDER
-        )
-        self.end_research_button.setVisible(continue_research and not self._running)
+        placeholder = self.CONTINUE_RESEARCH_PLACEHOLDER if continue_research else self.DEFAULT_INPUT_PLACEHOLDER
+        if self._read_only:
+            placeholder = "历史会话仅供查看；请使用“新的研究”继续。"
+        self.input.setPlaceholderText(placeholder)
+        self.input.setEnabled(not self._running and not self._read_only)
+        self.send_button.setEnabled(not self._read_only)
+        self.end_research_button.setVisible(continue_research and not self._running and not self._read_only)
 
     def clear_messages(self) -> None:
         while self.timeline_layout.count() > 1:
@@ -326,8 +337,12 @@ class ConversationPane(QFrame):
                 message.payload.get("detail", message.content),
                 status=message.payload.get("status", "running"),
             )
-        elif message.kind in {"plan", "data_plan"} and message.payload.get("plan"):
-            plan = EDAPlan.model_validate(message.payload["plan"])
+        elif message.kind in {"plan", "data_plan"} and (message.payload.get("plan") or message.payload.get("scope")):
+            plan = (
+                EDAResearchScope.model_validate(message.payload["scope"])
+                if message.payload.get("scope")
+                else EDAPlan.model_validate(message.payload["plan"])
+            )
             # A conversation saved before data and analysis were confirmed together
             # has no stored dataset description, so those rows read 「待定」.
             widget = DataPlanMessageWidget(plan, summary=message.payload.get("data_summary"))
@@ -341,9 +356,36 @@ class ConversationPane(QFrame):
             elif plan_state in {"completed", "failed", "stopped", "stale"}:
                 labels = {"completed": "已完成", "failed": "执行失败", "stopped": "已停止", "stale": "已作废"}
                 widget.set_finished(labels[plan_state])
+            if self._read_only:
+                widget.set_finished("历史记录")
+            self.current_plan_widget = widget
+        elif message.kind == "forecast_plan" and message.payload.get("plan"):
+            plan = ForecastPlan.model_validate(message.payload["plan"])
+            widget = ForecastPlanMessageWidget(plan)
+            widget.run_requested.connect(self.plan_run_requested)
+            widget.reject_requested.connect(self.plan_reject_requested)
+            plan_state = message.payload.get("state", "awaiting")
+            if plan_state == "running":
+                widget.set_running()
+            elif plan_state in {"completed", "failed", "stopped", "stale"}:
+                labels = {
+                    "completed": "已完成",
+                    "failed": "执行失败",
+                    "stopped": "已停止",
+                    "stale": "已作废",
+                }
+                widget.set_finished(labels[plan_state])
+            if self._read_only:
+                widget.set_finished("历史记录")
             self.current_plan_widget = widget
         elif message.kind == "result":
             widget = ResultMessageWidget.from_payload(message.payload)
+        elif message.kind == "forecast_result":
+            widget = ForecastResultMessageWidget(message.payload)
+        elif message.kind == "p2_review":
+            widget = P2ReviewMessageWidget(message.payload, read_only=self._read_only)
+            widget.open_requested.connect(self.p2_review_open_requested)
+            widget.continue_requested.connect(self.p2_revalidate_requested)
         else:
             widget = NoticeMessageWidget(message.content, error=message.kind == "error")
         self._add_timeline_widget(widget, user_aligned=message.role == "user")
@@ -632,13 +674,19 @@ class DataPanel(QFrame):
     region_selected = Signal(str)
 
     EMPTY_TEXT = "还没取数。请从上方选择地区；也可以直接提问讨论研究方法。"
+    SELECTED_TEXT = "数据已选择，尚未检查。只有进入实际数据分析后才会读取。"
     EXPLORING_TEXT = "正在看有哪些数据能用…"
     EXPLORING_NOTE = "现在只是在看有什么数据，还没开始取。找完会先给你确认。"
     UNAVAILABLE_TITLE = "现在取不到数据"
     UNAVAILABLE_BODY = "和数据服务器连不上。稍等一下再试；一直不行就找运维看看，或者先用本地文件继续。"
     UNAVAILABLE_HISTORY_TITLE = "上次用的数据"
     UNAVAILABLE_NOTE = "上次取的数据还在，可以直接接着分析，只是不是最新的。"
-    STATUS_TEXT: ClassVar[dict[str, str]] = {"ready": "已就绪", "exploring": "正在找数据", "unavailable": "取不到"}
+    STATUS_TEXT: ClassVar[dict[str, str]] = {
+        "selected": "待检查",
+        "ready": "已就绪",
+        "exploring": "正在找数据",
+        "unavailable": "取不到",
+    }
     SPINNER_FRAMES = ("◐", "◓", "◑", "◒")
 
     def __init__(self) -> None:
@@ -669,10 +717,11 @@ class DataPanel(QFrame):
         layout.addLayout(header)
 
         self.empty_view = self._build_empty_view()
+        self.selected_view = self._build_selected_view()
         self.exploring_view = self._build_exploring_view()
         self.ready_view = self._build_ready_view()
         self.unavailable_view = self._build_unavailable_view()
-        for view in (self.empty_view, self.exploring_view, self.ready_view, self.unavailable_view):
+        for view in (self.empty_view, self.selected_view, self.exploring_view, self.ready_view, self.unavailable_view):
             layout.addWidget(view)
         layout.addStretch(1)
 
@@ -712,6 +761,16 @@ class DataPanel(QFrame):
         note.setObjectName("dataSub")
         note.setWordWrap(True)
         layout.addWidget(note)
+        return view
+
+    def _build_selected_view(self) -> QWidget:
+        view = QWidget(self)
+        layout = QVBoxLayout(view)
+        layout.setContentsMargins(2, 4, 2, 0)
+        label = QLabel(self.SELECTED_TEXT)
+        label.setObjectName("dataSub")
+        label.setWordWrap(True)
+        layout.addWidget(label)
         return view
 
     def _build_ready_view(self) -> QWidget:
@@ -812,6 +871,7 @@ class DataPanel(QFrame):
         self._state = state
         self._summary = summary
         self.empty_view.setVisible(state == "empty")
+        self.selected_view.setVisible(state == "selected")
         self.exploring_view.setVisible(state == "exploring")
         self.ready_view.setVisible(state == "ready")
         self.unavailable_view.setVisible(state == "unavailable")
@@ -891,7 +951,12 @@ class DataPanel(QFrame):
         self._refresh_status()
 
     def _refresh_status(self) -> None:
-        marks = {"ready": "✓", "exploring": self.SPINNER_FRAMES[self._spinner_index], "unavailable": "⚠"}
+        marks = {
+            "selected": "○",
+            "ready": "✓",
+            "exploring": self.SPINNER_FRAMES[self._spinner_index],
+            "unavailable": "⚠",
+        }
         text = self.STATUS_TEXT.get(self._state, "")
         self.status_label.setText(f"{marks[self._state]} {text}" if text else "")
         self.status_label.setProperty("dataState", self._state)

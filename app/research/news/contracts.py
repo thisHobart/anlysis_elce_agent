@@ -17,6 +17,7 @@ NewsEventType = Literal[
     "generation_restore",
     "transmission_constraint",
     "demand_shock",
+    "storage_dispatch",
     "renewable_supply_change",
     "fuel_supply_change",
     "policy_long_horizon",
@@ -384,7 +385,7 @@ class EventRecord(EntityFields):
     extraction_trace: ExtractionTrace | None = None
     confidence: float | None = Field(default=None, ge=0, le=1)
     analysis_eligibility: Literal[
-        "eligible", "needs_time_review", "needs_coverage_review"
+        "eligible", "needs_time_review", "needs_coverage_review", "background_only"
     ] = "eligible"
     review_status: ReviewStatus = "unreviewed"
     evidence: tuple[EvidenceSpan, ...] = ()
@@ -571,7 +572,7 @@ class EventStateRevision(EntityFields):
     physical_effect: PhysicalEffect = "unknown"
     review_status: ReviewStatus = "unreviewed"
     analysis_eligibility: Literal[
-        "eligible", "needs_time_review", "needs_coverage_review"
+        "eligible", "needs_time_review", "needs_coverage_review", "background_only"
     ] = "eligible"
 
     @property
@@ -636,7 +637,7 @@ class MergedEvent(EntityFields):
     revision_count: int = Field(ge=1)
     review_status: ReviewStatus = "unreviewed"
     analysis_eligibility: Literal[
-        "eligible", "needs_time_review", "needs_coverage_review"
+        "eligible", "needs_time_review", "needs_coverage_review", "background_only"
     ] = "eligible"
     confidence: float | None = Field(default=None, ge=0, le=1)
     time_resolution: TimeResolution | None = None

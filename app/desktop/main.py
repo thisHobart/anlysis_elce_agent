@@ -13,6 +13,8 @@ from PySide6.QtWidgets import QApplication
 
 from app.desktop.main_window import MainWindow
 from app.desktop.theme import APP_STYLE
+from app.llm.model_profiles import builtin_model_profiles_path, load_model_profile_catalog
+from app.runtime_paths import default_p2_news_path
 
 
 def _smoke_result_argument(argv: Sequence[str]) -> tuple[list[str], Path | None]:
@@ -61,6 +63,23 @@ def _desktop_smoke_payload(window: MainWindow) -> dict[str, Any]:
         raise RuntimeError(f"Built desktop is missing builtin Skills: {', '.join(missing)}")
     if len(function_names) != 30:
         raise RuntimeError(f"Built desktop loaded {len(function_names)} research functions instead of 30")
+    from app.research.forecasting.contracts import CTMTrainingConfig
+    from app.research.forecasting.model import LightweightCTM
+
+    forecast_model = LightweightCTM(3, CTMTrainingConfig(hidden_size=4, internal_ticks=2))
+    forecast_runtime = {
+        "model": type(forecast_model).__name__,
+        "device": str(next(forecast_model.parameters()).device),
+        "torch_available": True,
+        "sklearn_available": True,
+    }
+    p2_news_path = default_p2_news_path()
+    if p2_news_path is None:
+        raise RuntimeError("Built desktop is missing the audited P2 news corpus")
+    model_profiles_path = builtin_model_profiles_path()
+    model_profiles = load_model_profile_catalog(model_profiles_path)
+    if not model_profiles.profiles:
+        raise RuntimeError("Built desktop is missing the builtin model profile catalog")
     return {
         "status": "passed",
         "window_constructed": True,
@@ -70,6 +89,10 @@ def _desktop_smoke_payload(window: MainWindow) -> dict[str, Any]:
         "skill_load_errors": list(window.workspace.agent.skill_load_errors),
         "session_store_path": str(window.workspace.store.path.resolve()),
         "research_output_directory": str(window.workspace.research_output_directory.resolve()),
+        "forecast_runtime": forecast_runtime,
+        "p2_news_path": str(p2_news_path),
+        "model_profiles_path": str(model_profiles_path),
+        "model_profile_count": len(model_profiles.profiles),
     }
 
 

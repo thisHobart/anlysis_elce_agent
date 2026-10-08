@@ -14,14 +14,14 @@ import numpy as np
 import pandas as pd
 import pytest
 import yaml
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QTextDocument
 from PySide6.QtWidgets import QApplication, QFileDialog, QLabel
 
 from app.config import Settings
 from app.desktop.input_config import build_runtime_study, parse_chat_time_range
 from app.desktop.main_window import MainWindow
-from app.desktop.message_widgets import ResultMessageWidget, ThinkingMessageWidget
+from app.desktop.message_widgets import DataPlanMessageWidget, ResultMessageWidget, ThinkingMessageWidget
 from app.desktop.panes import ConversationPane, TracePanel
 from app.desktop.report_view import ReportBrowser, ReportWindow
 from app.desktop.session import (
@@ -34,10 +34,12 @@ from app.desktop.session import (
     TraceEvent,
 )
 from app.research.agent.orchestrator import DialogueDecision, MainResearchAgent
+from app.research.agent.schemas import EDAResearchScope
 from app.research.agent.subagents.eda import EDASubagent
 from app.research.application.coordinator import ResearchCoordinator
 from app.research.data.inference import infer_study_context
 from app.research.graph.narration import STAGE_LABELS
+from app.research.graph.process_events import ProcessEvent
 from app.research.skills.registry import SkillRegistry
 from app.research.tools.catalog import FUNCTION_CATALOG
 
@@ -156,7 +158,7 @@ class DesktopModelDialogue:
                 intent="explain_result",
                 response="已有确定性证据只支持描述性关系，不构成因果结论。",
             )
-        if kwargs.get("config") is None:
+        if not kwargs.get("has_executable_data"):
             return DialogueDecision(intent="discussion", response="先检查时间轴和季节性，再选择具体 EDA 方法。")
         return DialogueDecision(intent="new_plan", skill_name="price-exogenous-eda")
 
@@ -165,6 +167,34 @@ SAMPLE_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" width="760" height="300">'
     '<rect width="760" height="300" fill="#EEF0FB"/></svg>'
 )
+
+
+def test_dynamic_scope_card_shows_tools_variables_and_budget(qt_app: QApplication):
+    scope = EDAResearchScope(
+        question="分析电价与负荷",
+        objective="识别电价结构及负荷关系",
+        study_name="scope-ui-test",
+        data_fingerprint="a" * 12,
+        skill_name="price-exogenous-eda",
+        skill_version="1.0.0",
+        authorized_functions=[
+            "price_descriptive_distribution",
+            "relationship_scipy_pearson_pairwise",
+        ],
+        authorized_variables=["load", "wind"],
+        initial_strategy=["先建立电价画像，再根据证据判断是否分析负荷关系。"],
+    )
+
+    widget = DataPlanMessageWidget(scope)
+    texts = [label.text() for label in widget.findChildren(QLabel)]
+
+    assert widget.approved_plan() == scope
+    assert any("研究目标" in text and scope.objective in text for text in texts)
+    assert any("最多 8 轮决策、16 次基础调用" in text for text in texts)
+    assert any("每次最多尝试 2 次" in text for text in texts)
+    assert any("变量范围" in text and "load" in text and "wind" in text for text in texts)
+    widget.deleteLater()
+    qt_app.processEvents()
 
 
 def test_report_reader_renders_markdown_figures_inside_the_app(qt_app: QApplication, tmp_path: Path):
@@ -431,6 +461,32 @@ def select_desktop_data(window: MainWindow, desktop_study: Path) -> None:
     )
 
 
+def test_selecting_local_files_does_not_parse_or_fingerprint_them(
+    qt_app: QApplication,
+    desktop_study: Path,
+    model_agent: ResearchCoordinator,
+    tmp_path: Path,
+):
+    window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
+    try:
+        with patch.object(
+            window.workspace,
+            "_current_dataset_fingerprint",
+            side_effect=AssertionError("file contents must not be read while selecting inputs"),
+        ):
+            select_desktop_data(window, desktop_study)
+        qt_app.processEvents()
+
+        assert window.workspace.current_session.data_state == "selected"
+        assert window.workspace.current_session.data_summary is None
+        assert all(
+            item.status == "selected"
+            for item in window.workspace.current_session.inputs.values()
+        )
+    finally:
+        window.close()
+
+
 def test_trace_keeps_every_loaded_data_file_visible(
     qt_app: QApplication,
     desktop_study: Path,
@@ -514,6 +570,84 @@ def test_conversation_follows_the_bottom_while_a_sent_question_progresses(
         window.close()
 
 
+def test_grouped_process_timeline_keeps_current_step_open(qt_app: QApplication):
+    widget = ThinkingMessageWidget()
+    try:
+        base = {
+            "session_id": "session-1",
+            "flow_id": "flow-1",
+            "phase": "analysis",
+            "source": "model",
+        }
+        events = [
+            ProcessEvent(
+                **base,
+                round=1,
+                step_id="round-1",
+                sequence=1,
+                event_type="thinking_started",
+                content="正在分析已有证据",
+            ),
+            ProcessEvent(
+                **base,
+                round=1,
+                step_id="round-1",
+                sequence=2,
+                event_type="thinking_ready",
+                title="思考过程",
+                content="先检查数据质量，再决定后续方法。",
+            ),
+            ProcessEvent(
+                **base,
+                round=1,
+                step_id="round-1",
+                sequence=3,
+                event_type="action_started",
+                action_id="call-1",
+                tool_name="data_quality",
+                title="数据质量检查",
+            ),
+            ProcessEvent(
+                **base,
+                round=1,
+                step_id="round-1",
+                sequence=4,
+                event_type="action_completed",
+                action_id="call-1",
+                tool_name="data_quality",
+                title="数据质量检查",
+                result="时间轴和缺失率检查通过",
+            ),
+            ProcessEvent(
+                **base,
+                round=1,
+                step_id="round-1",
+                sequence=5,
+                event_type="step_completed",
+                result="1 个行动已完成",
+            ),
+            ProcessEvent(
+                **base,
+                round=2,
+                step_id="round-2",
+                sequence=6,
+                event_type="thinking_started",
+                content="根据质量结果选择规律分析方法",
+            ),
+        ]
+        for event in events:
+            assert widget.apply_process_event(event)
+        assert not widget.apply_process_event(events[-1])
+        first, second = widget.process_rows.values()
+        assert first.body.isHidden()
+        assert not second.body.isHidden()
+        assert first.thought_heading.text() == "思考过程"
+        assert first.actions["call-1"].result.text() == "时间轴和缺失率检查通过"
+        assert second.spinner._timer.isActive()
+    finally:
+        widget.close()
+
+
 def test_main_window_uses_one_three_pane_workspace(qt_app: QApplication, tmp_path: Path):
     window = MainWindow(session_store=SessionStore(tmp_path / "sessions.json"))
     try:
@@ -568,6 +702,11 @@ def test_conversation_does_not_require_files_until_analysis(
         assert workspace.current_session.messages[-1].role == "assistant"
         assert "时间轴" in workspace.current_session.messages[-1].content
         assert "季节性" in workspace.current_session.messages[-1].content
+        assert not any(
+            message.kind in {"thinking", "plan", "data_plan"}
+            for message in workspace.current_session.messages
+        )
+        assert not model_agent.has_thread(workspace.current_session.session_id)
     finally:
         window.close()
 
@@ -748,6 +887,53 @@ def test_session_history_persists_across_window_restart(
         assert persisted.can_analyze
     finally:
         second.close()
+
+
+def test_selecting_sessions_does_not_reorder_history_when_state_is_reconciled(
+    qt_app: QApplication,
+    model_agent: ResearchCoordinator,
+    tmp_path: Path,
+):
+    window = MainWindow(agent=model_agent, session_store=SessionStore(tmp_path / "sessions.json"))
+    try:
+        workspace = window.workspace
+        older = workspace.current_session
+        older.title = "较早会话"
+        older.updated_at = "2026-09-11T08:00:00+00:00"
+        workspace.create_session()
+        newer = workspace.current_session
+        newer.title = "较新会话"
+        newer.updated_at = "2026-09-12T08:00:00+00:00"
+        workspace.history.set_sessions(workspace.sessions, newer.session_id)
+
+        def history_session_ids() -> list[str]:
+            return [
+                session_id
+                for index in range(workspace.history.list.count())
+                if (session_id := str(workspace.history.list.item(index).data(Qt.ItemDataRole.UserRole) or ""))
+            ]
+
+        expected_order = [newer.session_id, older.session_id]
+        assert history_session_ids() == expected_order
+
+        # Restoring a Graph snapshot currently persists via _persist_and_render,
+        # which touches the selected session unless select_session preserves its
+        # activity timestamp.
+        with (
+            patch.object(model_agent, "has_thread", return_value=True),
+            patch.object(model_agent, "get_snapshot", return_value=object()),
+            patch.object(
+                workspace,
+                "_loop_completed",
+                side_effect=lambda _snapshot: workspace._persist_and_render(keep_timeline=True),
+            ),
+        ):
+            workspace.select_session(older.session_id)
+
+        assert older.updated_at == "2026-09-11T08:00:00+00:00"
+        assert history_session_ids() == expected_order
+    finally:
+        window.close()
 
 
 def _session_with_plan(plan: dict) -> ResearchSession:
@@ -1140,9 +1326,10 @@ def test_continuous_conversation_runs_plan_and_answers_followup(
                 and session.messages[-1].kind == "text"
             ),
         )
-        assert len(session.messages) == before + 3
+        assert len(session.messages) == before + 2
         assert session.messages[-1].role == "assistant"
         assert "描述性" in session.messages[-1].content
+        assert all(message.kind != "thinking" for message in session.messages[before:])
         assert session.latest_eda_summary is not None
         assert session.latest_evaluation is not None
         assert len(session.runs) == 1
@@ -1235,29 +1422,26 @@ def test_thinking_process_is_visible_and_survives_a_restart(
         wait_until(qt_app, lambda: not workspace.is_busy)
         session = workspace.current_session
 
-        planning_card = next(message for message in session.messages if message.kind == "thinking")
-        stages = [step["stage"] for step in planning_card.payload["steps"]]
-        titles = [step["title"] for step in planning_card.payload["steps"]]
-        assert planning_card.payload["state"] == "completed"
-        assert len(titles) >= 4
-        assert "解析问题" in stages and "生成方案" in stages
-        assert titles[0] == "解析研究问题"
-        assert titles == list(dict.fromkeys(titles))
-        assert not any(title in {"等待方案确认", "等待用户决策"} for title in titles)
-        assert all(step["status"] != "running" for step in planning_card.payload["steps"])
+        assert not any(message.kind == "thinking" for message in session.messages)
 
         workspace.run_plan(workspace.conversation.current_plan_widget.approved_plan())
         wait_until(qt_app, lambda: not workspace.is_busy)
 
         execution_card = [message for message in session.messages if message.kind == "thinking"][-1]
-        steps = execution_card.payload["steps"]
-        computed = [step for step in steps if step["stage"] == "执行分析"]
+        events = execution_card.payload["process_events"]
         assert execution_card.payload["state"] == "completed"
-        assert len(computed) == len(workspace.current_session.current_plan["steps"])
-        assert all(step["title"].startswith("已完成 · ") for step in computed)
-        assert all(step["function_name"] for step in computed)
-        assert any(step["stage"] == "评估结果" for step in steps)
-        assert not any(step["title"] == "等待用户决策" for step in steps)
+        step_ids = list(dict.fromkeys(event["step_id"] for event in events))
+        assert len(step_ids) >= len(workspace.current_session.current_plan["steps"])
+        for step_id in step_ids[: len(workspace.current_session.current_plan["steps"])]:
+            types = [event["event_type"] for event in events if event["step_id"] == step_id]
+            assert types[:2] == ["thinking_ready", "action_started"]
+            assert "action_completed" in types
+            assert "step_completed" in types
+        assert all(
+            event["source"] == "system"
+            for event in events
+            if event["event_type"] == "thinking_ready"
+        )
 
         window.close()
         restored = MainWindow(agent=model_agent, session_store=store)
@@ -1268,11 +1452,15 @@ def test_thinking_process_is_visible_and_survives_a_restart(
                 for widget in restored.workspace.conversation._message_widgets.values()
                 if isinstance(widget, ThinkingMessageWidget)
             ]
-            assert len(widgets) == 2
-            assert widgets[-1].steps == steps
-            assert not widgets[-1].steps_container.isVisible()
-            widgets[-1].toggle_button.click()
+            assert len(widgets) == 1
+            assert widgets[-1].process_events == events
+            rows = list(widgets[-1].process_rows.values())
+            assert rows
+            assert all(row.body.isHidden() for row in rows[:-1])
+            assert not rows[-1].body.isHidden()
             assert widgets[-1].steps_container.isVisibleTo(widgets[-1])
+            widgets[-1].toggle_button.click()
+            assert not widgets[-1].steps_container.isVisible()
         finally:
             restored.close()
     finally:

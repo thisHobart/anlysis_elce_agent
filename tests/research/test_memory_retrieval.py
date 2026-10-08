@@ -66,11 +66,7 @@ def test_chinese_text_is_tokenized_without_a_segmentation_dictionary():
 def test_retrieval_reaches_a_turn_the_recent_window_dropped():
     history = [
         *_turn(1, "先看电价的日内周期性", "周期分析需要按小时分组。"),
-        *[
-            message
-            for index in range(2, 10)
-            for message in _turn(index, f"无关的天气记录 {index}", "已记录。")
-        ],
+        *[message for index in range(2, 10) for message in _turn(index, f"无关的天气记录 {index}", "已记录。")],
     ]
     window = bounded_recent_history(history, max_messages=8)
 
@@ -84,11 +80,7 @@ def test_retrieval_reaches_a_turn_the_recent_window_dropped():
 def test_matching_question_brings_the_answer_from_the_same_turn():
     history = [
         *_turn(1, "蓝鲸调度采用哪种方案？", "窗口设成48小时。"),
-        *[
-            message
-            for index in range(2, 7)
-            for message in _turn(index, f"普通天气记录 {index}", "普通回答。")
-        ],
+        *[message for index in range(2, 7) for message in _turn(index, f"普通天气记录 {index}", "普通回答。")],
     ]
 
     retrieved = retrieve_related(
@@ -141,11 +133,7 @@ def test_reference_only_query_stays_unresolved_when_two_topics_are_equally_salie
     history = [
         *_turn(1, "蓝鲸调度窗口设为 48 小时", "已经记录这个参数。"),
         *_turn(2, "海豚备用容量设为百分之十五", "已经记录这项约束。"),
-        *[
-            message
-            for index in range(3, 8)
-            for message in _turn(index, f"普通天气记录 {index}", "普通回答。")
-        ],
+        *[message for index in range(3, 8) for message in _turn(index, f"普通天气记录 {index}", "普通回答。")],
     ]
 
     _recent, retrieved = select_conversation_context(history, question="继续按刚才那个做")
@@ -156,11 +144,7 @@ def test_reference_only_query_stays_unresolved_when_two_topics_are_equally_salie
 def test_exact_identifier_is_a_strong_match_by_itself():
     history = [
         *_turn(1, "把 max_lag 调整为多少？", "建议设为 48。"),
-        *[
-            message
-            for index in range(2, 8)
-            for message in _turn(index, f"普通记录 {index}", "已记录。")
-        ],
+        *[message for index in range(2, 8) for message in _turn(index, f"普通记录 {index}", "已记录。")],
     ]
 
     retrieved = retrieve_related(history, question="max_lag 的值是什么", exclude=history[-8:])
@@ -217,11 +201,7 @@ def test_dialogue_prompt_carries_retrieved_turns_beside_the_window(synthetic_stu
     gateway = CaptureGateway()
     history = [
         *_turn(1, "重点关注电价的日内周期性", "需要比较每个小时。"),
-        *[
-            message
-            for index in range(2, 10)
-            for message in _turn(index, f"第 {index} 条天气记录", "已记录天气信息。")
-        ],
+        *[message for index in range(2, 10) for message in _turn(index, f"第 {index} 条天气记录", "已记录天气信息。")],
     ]
 
     with pytest.raises(RuntimeError, match="captured DialogueDecision"):
@@ -246,11 +226,7 @@ def test_dialogue_prompt_carries_retrieved_turns_beside_the_window(synthetic_stu
         "assistant",
     ]
     window_ids = {item["message_id"] for item in payload["conversation_history"]}
-    retrieved_ids = {
-        message["message_id"]
-        for turn in payload["earlier_related_turns"]
-        for message in turn["messages"]
-    }
+    retrieved_ids = {message["message_id"] for turn in payload["earlier_related_turns"] for message in turn["messages"]}
     assert not retrieved_ids.intersection(window_ids)
 
 
@@ -275,7 +251,7 @@ def test_planning_service_passes_complete_retrieved_turns_to_the_planner(synthet
         ),
     ]
 
-    with pytest.raises(RuntimeError, match="captured EDAPlanDraft"):
+    with pytest.raises(RuntimeError, match="captured EDAPlanIntent"):
         service.propose(
             question="继续按 max_lag 分析 wind 的滞后关系",
             study_config=config,
@@ -284,8 +260,6 @@ def test_planning_service_passes_complete_retrieved_turns_to_the_planner(synthet
         )
 
     payload = _payload(gateway.calls[0])
-    assert "继续按 max_lag 分析 wind 的滞后关系" not in {
-        item["content"] for item in payload["conversation_history"]
-    }
+    assert "继续按 max_lag 分析 wind 的滞后关系" not in {item["content"] for item in payload["conversation_history"]}
     assert [item["turn_id"] for item in payload["earlier_related_turns"]] == ["turn-1"]
     assert "max_lag 不超过 24" in payload["earlier_related_turns"][0]["messages"][0]["content"]

@@ -3,19 +3,22 @@
 from types import SimpleNamespace
 
 import pytest
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from pydantic import BaseModel
 
 from app.config import Settings
 from app.llm import compat
+from app.llm.budget import ModelRequestPurpose
 from app.llm.gateway import (
     ModelConfigurationError,
     ModelMessage,
     ModelOutputTruncatedError,
     ModelProtocolError,
     ModelResponseError,
+    ModelToolCall,
     ModelTransientError,
 )
+from app.llm.langchain_support import transport_messages
 from app.llm.openai_compatible import ResearchModelGateway
 
 TOOLS = [
@@ -115,6 +118,16 @@ class RecordingModel:
         return ProposedCalls()
 
 
+class BindableRecordingModel(RecordingModel):
+    def __init__(self, *, content: str) -> None:
+        super().__init__(content=content)
+        self.bound_options: list[dict[str, int]] = []
+
+    def bind(self, **options):
+        self.bound_options.append(options)
+        return self
+
+
 def test_structured_output_uses_native_function_calling_and_typed_messages():
     gateway = ResearchModelGateway(_settings())
     model = RecordingModel()
@@ -136,6 +149,55 @@ def test_parseable_structured_output_is_rejected_when_provider_reports_truncatio
 
     with pytest.raises(ModelOutputTruncatedError, match="响应不完整"):
         gateway.invoke_structured(messages=_messages(), schema=StructuredAnswer)
+
+
+def test_text_output_is_rejected_when_provider_reports_truncation():
+    gateway = ResearchModelGateway(_settings())
+    model = RecordingModel(content="partial answer")
+    model.response.response_metadata = {"finish_reason": "length"}
+    gateway._model = model
+
+    with pytest.raises(ModelOutputTruncatedError, match="响应不完整"):
+        gateway.invoke_text(messages=_messages())
+
+
+def test_text_output_limit_is_bound_per_request_purpose() -> None:
+    gateway = ResearchModelGateway(_settings())
+    model = BindableRecordingModel(content="ok")
+    gateway._model = model
+
+    result = gateway.invoke_text(
+        messages=_messages(),
+        purpose=ModelRequestPurpose.DIALOGUE,
+    )
+
+    assert result == "ok"
+    assert model.bound_options == [{"max_tokens": 1024}]
+    assert "max_tokens" not in gateway._model_options()
+
+
+def test_selector_purpose_overrides_enabled_qwen_reasoning_per_request() -> None:
+    gateway = ResearchModelGateway(_settings(llm_provider="qwen", llm_reasoning_effort="high"))
+    model = BindableRecordingModel(content="ok")
+    gateway._model = model
+
+    gateway.invoke_text(
+        messages=_messages(),
+        purpose=ModelRequestPurpose.EDA_PLANNING,
+    )
+
+    assert gateway._model_options()["extra_body"] == {"enable_thinking": True}
+    assert model.bound_options == [{"max_tokens": 2048, "extra_body": {"enable_thinking": False}}]
+
+
+def test_tool_calls_are_rejected_as_a_batch_when_provider_reports_truncation():
+    gateway = ResearchModelGateway(_settings())
+    model = RecordingModel()
+    model.response.response_metadata = {"finish_reason": "length"}
+    gateway._model = model
+
+    with pytest.raises(ModelOutputTruncatedError, match="响应不完整"):
+        gateway.invoke_tool_calls(messages=_messages(), tools=TOOLS)
 
 
 def test_sdk_length_exception_is_exposed_as_output_truncation() -> None:
@@ -210,9 +272,7 @@ def test_structured_output_observer_receives_function_arguments_without_reasonin
 
 
 def test_prompt_json_injects_schema_and_uses_json_mode_for_cherry_compatibility():
-    gateway = ResearchModelGateway(
-        _settings(llm_structured_output_method="prompt_json")
-    )
+    gateway = ResearchModelGateway(_settings(llm_structured_output_method="prompt_json"))
     model = RecordingModel()
     gateway._model = model
 
@@ -246,9 +306,7 @@ def test_prompt_json_schema_failure_is_repairable_response_error_not_protocol_er
 
             return Bound()
 
-    gateway = ResearchModelGateway(
-        _settings(llm_structured_output_method="prompt_json")
-    )
+    gateway = ResearchModelGateway(_settings(llm_structured_output_method="prompt_json"))
     model = InvalidJsonShapeModel()
     gateway._model = model
 
@@ -271,6 +329,186 @@ def test_research_function_calls_are_proposed_without_execution():
     assert model.parallel_tool_calls is True
 
 
+def test_optional_tool_turn_preserves_call_id_without_forcing_a_call():
+    gateway = ResearchModelGateway(_settings())
+    model = RecordingModel()
+    gateway._model = model
+
+    turn = gateway.invoke_tool_turn(messages=_messages(), tools=TOOLS)
+
+    assert turn.content == ""
+    assert turn.tool_calls[0].call_id == "call-1"
+    assert model.tool_choice is None
+    assert model.parallel_tool_calls is True
+
+
+def test_optional_tool_turn_can_finish_with_text_and_no_call():
+    gateway = ResearchModelGateway(_settings())
+    model = RecordingModel(content="证据已经足够。")
+    model.response.tool_calls = []
+    gateway._model = model
+
+    turn = gateway.invoke_tool_turn(messages=_messages(), tools=TOOLS)
+
+    assert turn.content == "证据已经足够。"
+    assert turn.tool_calls == []
+    assert model.tool_choice is None
+
+
+def test_assistant_tool_calls_and_tool_results_round_trip_to_transport_messages():
+    messages = [
+        ModelMessage(
+            role="assistant",
+            tool_calls=[
+                ModelToolCall(
+                    name="price_descriptive_distribution",
+                    arguments={},
+                    call_id="provider-call-7",
+                )
+            ],
+        ),
+        ModelMessage(role="tool", content='{"status":"completed"}', tool_call_id="provider-call-7"),
+    ]
+
+    converted = transport_messages(messages)
+
+    assert isinstance(converted[0], AIMessage)
+    assert converted[0].tool_calls[0]["id"] == "provider-call-7"
+    assert isinstance(converted[1], ToolMessage)
+    assert converted[1].tool_call_id == "provider-call-7"
+
+
+def test_non_assistant_messages_cannot_carry_tool_calls():
+    with pytest.raises(ValueError, match="assistant"):
+        ModelMessage(
+            role="user",
+            content="test",
+            tool_calls=[
+                ModelToolCall(
+                    name="price_descriptive_distribution",
+                    arguments={},
+                    call_id="provider-call-8",
+                )
+            ],
+        )
+
+
+def test_prompt_json_applies_local_schema_and_whitelist_to_research_function_selection():
+    class PromptToolModel(RecordingModel):
+        def with_structured_output(self, schema, *, method, include_raw):
+            self.method = method
+            self.include_raw = include_raw
+
+            class Bound:
+                def invoke(_self, messages):
+                    self.last_messages = messages
+                    return {
+                        "raw": SimpleNamespace(
+                            content=('{"calls":[{"name":"price_descriptive_distribution","arguments":{}}]}'),
+                            additional_kwargs={},
+                            tool_calls=[],
+                            response_metadata={},
+                        ),
+                        "parsed": schema.model_validate(
+                            {
+                                "calls": [
+                                    {
+                                        "name": "price_descriptive_distribution",
+                                        "arguments": {},
+                                    }
+                                ]
+                            }
+                        ),
+                        "parsing_error": None,
+                    }
+
+            return Bound()
+
+    gateway = ResearchModelGateway(_settings(llm_structured_output_method="prompt_json"))
+    model = PromptToolModel()
+    gateway._model = model
+
+    calls = gateway.invoke_tool_calls(messages=_messages("分析电价分布"), tools=TOOLS)
+
+    assert [call.name for call in calls] == ["price_descriptive_distribution"]
+    assert calls[0].call_id == "prompt-json-1"
+    assert model.bound_tools is None
+    assert model.method == "json_mode"
+    assert isinstance(model.last_messages[0], SystemMessage)
+    assert "研究函数选择兼容协议" in model.last_messages[0].content
+    assert "price_descriptive_distribution" in model.last_messages[0].content
+
+
+def test_prompt_json_optional_tool_turn_is_locally_validated_and_ids_are_turn_scoped():
+    class PromptTurnModel(RecordingModel):
+        def with_structured_output(self, schema, *, method, include_raw):
+            self.method = method
+            self.include_raw = include_raw
+
+            class Bound:
+                def invoke(_self, messages):
+                    self.last_messages = messages
+                    payload = {
+                        "content": "",
+                        "calls": [
+                            {
+                                "name": "price_descriptive_distribution",
+                                "arguments": {},
+                            }
+                        ],
+                    }
+                    return {
+                        "raw": SimpleNamespace(
+                            content='{"content":"","calls":[{"name":"price_descriptive_distribution","arguments":{}}]}',
+                            additional_kwargs={},
+                            tool_calls=[],
+                            response_metadata={},
+                        ),
+                        "parsed": schema.model_validate(payload),
+                        "parsing_error": None,
+                    }
+
+            return Bound()
+
+    gateway = ResearchModelGateway(_settings(llm_structured_output_method="prompt_json"))
+    model = PromptTurnModel()
+    gateway._model = model
+
+    first = gateway.invoke_tool_turn(messages=_messages("first"), tools=TOOLS)
+    second = gateway.invoke_tool_turn(messages=_messages("second"), tools=TOOLS)
+
+    assert first.finish_reason == "prompt_json"
+    assert first.tool_calls[0].name == "price_descriptive_distribution"
+    assert first.tool_calls[0].call_id.startswith("prompt-json-")
+    assert first.tool_calls[0].call_id != second.tool_calls[0].call_id
+    assert model.bound_tools is None
+
+
+def test_prompt_json_research_function_selection_rejects_names_outside_whitelist():
+    class UnknownPromptToolModel(RecordingModel):
+        def with_structured_output(self, schema, *, method, include_raw):
+            class Bound:
+                def invoke(_self, messages):
+                    return {
+                        "raw": SimpleNamespace(
+                            content='{"calls":[{"name":"delete_database","arguments":{}}]}',
+                            additional_kwargs={},
+                            tool_calls=[],
+                            response_metadata={},
+                        ),
+                        "parsed": schema.model_validate({"calls": [{"name": "delete_database", "arguments": {}}]}),
+                        "parsing_error": None,
+                    }
+
+            return Bound()
+
+    gateway = ResearchModelGateway(_settings(llm_structured_output_method="prompt_json"))
+    gateway._model = UnknownPromptToolModel()
+
+    with pytest.raises(ModelResponseError, match="未提供的研究函数"):
+        gateway.invoke_tool_calls(messages=_messages("分析电价分布"), tools=TOOLS)
+
+
 def test_custom_endpoint_sends_no_reasoning_control_by_default():
     gateway = ResearchModelGateway(_settings())
 
@@ -283,9 +521,7 @@ def test_custom_endpoint_sends_no_reasoning_control_by_default():
 
 @pytest.mark.parametrize("model_name", ["deepseek-chat", "deepseek-reasoner", "future-deepseek-model"])
 def test_all_deepseek_models_disable_thinking_with_request_parameter(model_name: str):
-    gateway = ResearchModelGateway(
-        _settings(llm_provider="deepseek", llm_model=model_name)
-    )
+    gateway = ResearchModelGateway(_settings(llm_provider="deepseek", llm_model=model_name))
 
     assert gateway._model_options()["extra_body"] == {"thinking": {"type": "disabled"}}
 
@@ -298,9 +534,7 @@ def test_qwen_chat_uses_its_documented_thinking_toggle():
 
 @pytest.mark.parametrize("provider", ["deepseek", "qwen"])
 def test_provider_responses_api_uses_reasoning_effort(provider: str):
-    gateway = ResearchModelGateway(
-        _settings(llm_provider=provider, llm_api_style="responses")
-    )
+    gateway = ResearchModelGateway(_settings(llm_provider=provider, llm_api_style="responses"))
 
     options = gateway._model_options()
     assert options["use_responses_api"] is True
